@@ -1,0 +1,19 @@
+[package]
+name = "oxideav-h261"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-h261"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust ITU-T H.261 video decoder for oxideav"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-h261"
+keywords = ["multimedia", "video", "h261", "codec", "pure-rust"]
+categories = ["multimedia::encoding", "multimedia::video"]
+
+[dependencies]
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
+oxideav-pixfmt = "0.1"
