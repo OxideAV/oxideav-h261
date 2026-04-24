@@ -526,6 +526,141 @@ pub const ZIGZAG: [usize; 64] = [
     53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
+// ============================================================================
+// Encoder-side lookups
+// ============================================================================
+
+/// Look up the (bits, code) pair for `MbaSym::Diff(diff)` in the MBA table.
+/// Stuffing is intentionally excluded; encoders emit stuffing only via
+/// the dedicated helper when needed.
+pub fn encode_mba_diff(diff: u8) -> (u8, u32) {
+    debug_assert!((1..=33).contains(&diff), "MBA diff out of range: {diff}");
+    for e in MBA_TABLE {
+        if let MbaSym::Diff(d) = e.value {
+            if d == diff {
+                return (e.bits, e.code);
+            }
+        }
+    }
+    unreachable!("MBA_TABLE missing entry for diff={diff}");
+}
+
+/// VLC for MBA stuffing — `0000 0001 111` (11 bits).
+pub const MBA_STUFFING: (u8, u32) = (11, 0b0000_0001_111);
+
+/// Look up the (bits, code) pair for a CBP value `1..=63`.
+pub fn encode_cbp(cbp: u8) -> (u8, u32) {
+    debug_assert!((1..=63).contains(&cbp), "CBP out of range: {cbp}");
+    for e in CBP_TABLE {
+        if e.value == cbp {
+            return (e.bits, e.code);
+        }
+    }
+    unreachable!("CBP_TABLE missing entry for cbp={cbp}");
+}
+
+/// Pre-shaped MTYPE VLCs by mode name. These are the subset we use for
+/// intra-only encoding. For full parity with the decoder's table we'd
+/// need all 10 rows, but the encoder currently only emits these three.
+pub const MTYPE_INTRA: (u8, u32) = (4, 0b0001);
+pub const MTYPE_INTRA_MQUANT: (u8, u32) = (7, 0b0000_001);
+
+/// Canonical (prefix_bits, prefix_code, run, abs_level) table for every
+/// entry in Table 5/H.261 *except* EOB, (0,1), and Escape (those three are
+/// handled specially). Prefixes omit the trailing sign bit `s`; each
+/// emitted code is `prefix_bits + 1` bits total.
+#[rustfmt::skip]
+pub const TCOEFF_ENCODE: &[(u8, u32, u8, u8)] = &[
+    // Run = 0 (level 2..=15). Run=0,Level=1 handled separately ("1s"/"11s").
+    ( 4, 0b0100,                   0,  2),
+    ( 5, 0b0010_1,                 0,  3),
+    ( 7, 0b0000_110,               0,  4),
+    ( 8, 0b0010_0110,              0,  5),
+    ( 8, 0b0010_0001,              0,  6),
+    (10, 0b0000_0010_10,           0,  7),
+    (12, 0b0000_0001_1101,         0,  8),
+    (12, 0b0000_0001_1000,         0,  9),
+    (12, 0b0000_0001_0011,         0, 10),
+    (12, 0b0000_0001_0000,         0, 11),
+    (13, 0b0_0000_0000_1101_0,     0, 12),
+    (13, 0b0_0000_0000_1100_1,     0, 13),
+    (13, 0b0_0000_0000_1100_0,     0, 14),
+    (13, 0b0_0000_0000_1011_1,     0, 15),
+    // Run = 1.
+    ( 3, 0b011,                    1,  1),
+    ( 6, 0b0001_10,                1,  2),
+    ( 8, 0b0010_0101,              1,  3),
+    (10, 0b0000_0011_00,           1,  4),
+    (12, 0b0000_0001_1011,         1,  5),
+    (13, 0b0_0000_0000_1011_0,     1,  6),
+    (13, 0b0_0000_0000_1010_1,     1,  7),
+    // Run = 2.
+    ( 4, 0b0101,                   2,  1),
+    ( 7, 0b0000_100,               2,  2),
+    (10, 0b0000_0010_11,           2,  3),
+    (12, 0b0000_0001_0100,         2,  4),
+    (13, 0b0_0000_0000_1010_0,     2,  5),
+    // Run = 3.
+    ( 5, 0b0011_1,                 3,  1),
+    ( 8, 0b0010_0100,              3,  2),
+    (12, 0b0000_0001_1100,         3,  3),
+    (13, 0b0_0000_0000_1001_1,     3,  4),
+    // Run = 4.
+    ( 5, 0b0011_0,                 4,  1),
+    (10, 0b0000_0011_11,           4,  2),
+    (12, 0b0000_0001_0010,         4,  3),
+    // Run = 5.
+    ( 6, 0b0001_11,                5,  1),
+    (10, 0b0000_0010_01,           5,  2),
+    (13, 0b0_0000_0000_1001_0,     5,  3),
+    // Run = 6.
+    ( 6, 0b0001_01,                6,  1),
+    (12, 0b0000_0001_1110,         6,  2),
+    // Run = 7.
+    ( 6, 0b0001_00,                7,  1),
+    (12, 0b0000_0001_0101,         7,  2),
+    // Run = 8.
+    ( 7, 0b0000_111,               8,  1),
+    (12, 0b0000_0001_0001,         8,  2),
+    // Run = 9.
+    ( 7, 0b0000_101,               9,  1),
+    (13, 0b0_0000_0000_1000_1,     9,  2),
+    // Run = 10.
+    ( 8, 0b0010_0111,             10,  1),
+    (13, 0b0_0000_0000_1000_0,    10,  2),
+    // Run = 11.
+    ( 8, 0b0010_0011,             11,  1),
+    // Run = 12.
+    ( 8, 0b0010_0010,             12,  1),
+    // Run = 13.
+    ( 8, 0b0010_0000,             13,  1),
+    // Run = 14..=26.
+    (10, 0b0000_0011_10,          14,  1),
+    (10, 0b0000_0011_01,          15,  1),
+    (10, 0b0000_0010_00,          16,  1),
+    (12, 0b0000_0001_1111,        17,  1),
+    (12, 0b0000_0001_1010,        18,  1),
+    (12, 0b0000_0001_1001,        19,  1),
+    (12, 0b0000_0001_0111,        20,  1),
+    (12, 0b0000_0001_0110,        21,  1),
+    (13, 0b0_0000_0000_1111_1,    22,  1),
+    (13, 0b0_0000_0000_1111_0,    23,  1),
+    (13, 0b0_0000_0000_1110_1,    24,  1),
+    (13, 0b0_0000_0000_1110_0,    25,  1),
+    (13, 0b0_0000_0000_1101_1,    26,  1),
+];
+
+/// Look up a TCOEFF VLC entry for a given `(run, abs_level)`. Returns
+/// `None` if the pair requires an escape.
+pub fn lookup_tcoeff(run: u8, abs_level: u8) -> Option<(u8, u32)> {
+    for &(bits, code, r, l) in TCOEFF_ENCODE {
+        if r == run && l == abs_level {
+            return Some((bits, code));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

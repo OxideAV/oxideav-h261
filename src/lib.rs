@@ -31,10 +31,13 @@
 
 pub mod block;
 pub mod decoder;
+pub mod encoder;
+pub mod fdct;
 pub mod gob;
 pub mod idct;
 pub mod mb;
 pub mod picture;
+pub mod quant;
 pub mod start_code;
 pub mod tables;
 
