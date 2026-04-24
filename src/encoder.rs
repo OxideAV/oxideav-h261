@@ -258,12 +258,12 @@ fn encode_intra_block(bw: &mut BitWriter, pels: &[u8; 64], quant: u32) {
 
     // Walk the scan collecting (run, level) pairs.
     let mut run: u32 = 0;
-    for (idx, &lvl) in zz_levels.iter().enumerate() {
+    for &lvl in zz_levels.iter() {
         if lvl == 0 {
             run += 1;
             continue;
         }
-        emit_runlevel(bw, run as u8, lvl, /*is_first_inter=*/ false, /*is_intra_first=*/ idx == 0 && false);
+        emit_runlevel(bw, run as u8, lvl, /*is_first_inter=*/ false);
         run = 0;
     }
     // End of block — always `10`.
@@ -271,13 +271,10 @@ fn encode_intra_block(bw: &mut BitWriter, pels: &[u8; 64], quant: u32) {
 }
 
 /// Emit one (run, level) VLC entry. `is_first_inter` selects the special
-/// "1s" first-coefficient code for INTER blocks (not used for INTRA).
-/// `is_intra_first` is currently unused — INTRA's first AC coefficient
-/// uses the normal table entries, there is no "1s" shortcut for INTRA
-/// (Table 5 note (a): "Never used in INTRA macroblocks").
-fn emit_runlevel(bw: &mut BitWriter, run: u8, level: i32, is_first_inter: bool, is_intra_first: bool) {
+/// "1s" first-coefficient code for INTER blocks (not used for INTRA;
+/// Table 5 note (a): "Never used in INTRA macroblocks").
+fn emit_runlevel(bw: &mut BitWriter, run: u8, level: i32, is_first_inter: bool) {
     debug_assert_ne!(level, 0);
-    let _ = is_intra_first; // reserved for future use
     let abs = level.unsigned_abs() as u8;
     let sign = if level < 0 { 1 } else { 0 };
 
