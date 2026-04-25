@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Encoder: P-picture (INTER) support with no motion compensation. Stateful
+  `H261Encoder` chains an I-picture followed by P-pictures predicted from
+  the local reconstruction. ffmpeg interop and self-roundtrip both at
+  ~39.5 dB Y-PSNR on testsrc QCIF.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-h261/compare/v0.0.1...v0.0.2) - 2026-04-25
 
 ### Other

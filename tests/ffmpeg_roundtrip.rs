@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use oxideav_h261::encoder::encode_intra_picture;
+use oxideav_h261::encoder::{encode_intra_picture, H261Encoder};
 use oxideav_h261::picture::SourceFormat;
 
 fn have_ffmpeg() -> bool {
@@ -120,4 +120,110 @@ fn ffmpeg_decodes_our_qcif_intra_picture() {
         mean_err < 15.0,
         "mean Y error {mean_err:.2} too large (should be <15 for QUANT=8)"
     );
+}
+
+/// Encode a 3-frame I+P+P sequence with our encoder and have ffmpeg decode
+/// it. Validates that the P-picture bitstream we emit is at least
+/// syntactically conformant — ffmpeg's H.261 demuxer has a real picture
+/// scanner so it requires PSC-anchored pictures.
+#[test]
+fn ffmpeg_decodes_our_qcif_ipp_sequence() {
+    if !have_ffmpeg() {
+        eprintln!("ffmpeg not on PATH — skipping");
+        return;
+    }
+    let (y0, cb0, cr0) = gradient_qcif_source();
+    // Frame 1: shift a small region.
+    let mut y1 = y0.clone();
+    for j in 32..64 {
+        for i in 32..96 {
+            y1[j * 176 + i] = y1[j * 176 + i].saturating_add(20);
+        }
+    }
+    // Frame 2: shift another region.
+    let mut y2 = y1.clone();
+    for j in 80..112 {
+        for i in 64..128 {
+            y2[j * 176 + i] = y2[j * 176 + i].saturating_sub(15);
+        }
+    }
+
+    let mut enc = H261Encoder::new(SourceFormat::Qcif, 8);
+    let p0 = enc.encode_frame(&y0, 176, &cb0, 88, &cr0, 88).expect("f0");
+    let p1 = enc.encode_frame(&y1, 176, &cb0, 88, &cr0, 88).expect("f1");
+    let p2 = enc.encode_frame(&y2, 176, &cb0, 88, &cr0, 88).expect("f2");
+
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&p0);
+    stream.extend_from_slice(&p1);
+    stream.extend_from_slice(&p2);
+
+    let dir = tmpdir();
+    let es_path = dir.join("ipp.h261");
+    let yuv_path = dir.join("ipp.yuv");
+    std::fs::write(&es_path, &stream).unwrap();
+
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "h261",
+            "-i",
+        ])
+        .arg(&es_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+
+    if !status.success() {
+        let err = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-f", "h261", "-i"])
+            .arg(&es_path)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .arg(&yuv_path)
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn ffmpeg diag");
+        let msg = String::from_utf8_lossy(&err.stderr);
+        let mut h = std::io::stderr();
+        writeln!(h, "stream length = {} bytes", stream.len()).ok();
+        writeln!(
+            h,
+            "first 32 bytes: {:02x?}",
+            &stream[..32.min(stream.len())]
+        )
+        .ok();
+        writeln!(h, "ffmpeg stderr: {msg}").ok();
+        panic!("ffmpeg failed to decode our IPP sequence");
+    }
+
+    let decoded = std::fs::read(&yuv_path).expect("read yuv");
+    let frame_size = 176 * 144 * 3 / 2;
+    // ffmpeg should emit at least our 3 frames (it sometimes pads on EOF).
+    assert!(
+        decoded.len() >= 3 * frame_size,
+        "ffmpeg produced too few bytes: {}",
+        decoded.len()
+    );
+
+    // Compare each Y plane against the source — generous tolerance because
+    // we drift through ffmpeg's IDCT vs ours, plus quantisation.
+    let inputs = [&y0, &y1, &y2];
+    for (i, input) in inputs.iter().enumerate() {
+        let y_out = &decoded[i * frame_size..i * frame_size + 176 * 144];
+        let mut err_sum: u64 = 0;
+        for (a, b) in input.iter().zip(y_out.iter()) {
+            err_sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let mean_err = err_sum as f64 / (176.0 * 144.0);
+        // 25 is a loose bar — we just want to confirm it's not garbage.
+        assert!(
+            mean_err < 25.0,
+            "frame {i}: mean Y error {mean_err:.2} too large"
+        );
+    }
 }

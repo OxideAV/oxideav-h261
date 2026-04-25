@@ -1,9 +1,10 @@
 # oxideav-h261
 
-Pure-Rust **ITU-T H.261** video decoder — the original 1990/1993 videoconferencing
+Pure-Rust **ITU-T H.261** video codec — the original 1990/1993 videoconferencing
 codec. Decodes both I-pictures (INTRA macroblocks) and P-pictures (INTER with
-integer-pel motion compensation + optional loop filter). QCIF (176×144) and CIF
-(352×288) source formats. Output is YUV 4:2:0. Zero C dependencies.
+integer-pel motion compensation + optional loop filter), and now encodes Baseline
+I + P pictures (no MC). QCIF (176×144) and CIF (352×288) source formats. Output
+is YUV 4:2:0. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -19,18 +20,19 @@ oxideav-h261 = "0.0"
 
 ## Feature matrix
 
-| Feature                                          | Decode |
-|--------------------------------------------------|:------:|
-| Picture header (PSC / TR / PTYPE / PEI / PSPARE) | yes    |
-| GOB layer (GBSC / GN / GQUANT / GEI / GSPARE)    | yes    |
-| Source formats QCIF (176×144), CIF (352×288)     | yes    |
-| Macroblock layer (MBA / MTYPE / CBP / MVD)       | yes    |
-| TCOEFF VLC + escape                              | yes    |
-| 8×8 IDCT, dequantisation (Table 5/H.261)         | yes    |
-| INTRA and INTER prediction                       | yes    |
-| Integer-pel motion compensation (MC)             | yes    |
-| Loop filter (FIL, §3.2.3)                        | yes    |
-| BCH forward error correction (§5.4)              | no     |
+| Feature                                          | Decode | Encode |
+|--------------------------------------------------|:------:|:------:|
+| Picture header (PSC / TR / PTYPE / PEI / PSPARE) | yes    | yes    |
+| GOB layer (GBSC / GN / GQUANT / GEI / GSPARE)    | yes    | yes    |
+| Source formats QCIF (176×144), CIF (352×288)     | yes    | yes    |
+| Macroblock layer (MBA / MTYPE / CBP / MVD)       | yes    | yes    |
+| TCOEFF VLC + escape                              | yes    | yes    |
+| 8×8 (I)DCT, (de)quantisation (Table 5/H.261)     | yes    | yes    |
+| INTRA prediction (I-pictures)                    | yes    | yes    |
+| INTER prediction (P-pictures, no MC)             | yes    | yes    |
+| Integer-pel motion compensation (MC)             | yes    | no     |
+| Loop filter (FIL, §3.2.3)                        | yes    | no     |
+| BCH forward error correction (§5.4)              | no     | no     |
 
 H.261 only permits integer-pel motion vectors (range ±15); there are no
 half-pel refinements, no B-pictures, and no start-code emulation prevention.
