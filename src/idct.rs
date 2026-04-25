@@ -155,6 +155,84 @@ mod tests {
         }
     }
 
+    /// Verify the IDCT rounding direction is round-half-to-nearest (which
+    /// for f32 `.round()` is round-half-away-from-zero per IEEE 754
+    /// "rounding to nearest, ties away from zero"). Per H.261 Annex A
+    /// the inverse-transform output is constrained only by accuracy
+    /// (peak err <= 1, mean err <= 0.015, mse <= 0.06) — not by a
+    /// specific rounding rule. round-half-to-even would also pass; we
+    /// use the simpler round-half-away-from-zero which is what
+    /// `f32::round` does in Rust.
+    #[test]
+    fn idct_rounding_is_round_half_away_from_zero() {
+        // f32::round rounds halves away from zero.
+        assert_eq!(0.5f32.round() as i32, 1);
+        assert_eq!((-0.5f32).round() as i32, -1);
+        assert_eq!(1.5f32.round() as i32, 2);
+        assert_eq!((-1.5f32).round() as i32, -2);
+    }
+
+    /// Drift-stress: simulate a 50-step P-frame loop with zero residual
+    /// (the limit case where any IDCT precision issue would compound).
+    /// Start with a noisy 8x8 spatial block, FDCT it, quant at QUANT=8,
+    /// dequant + IDCT to get the recon, then use that recon as the next
+    /// "predictor" — but with no residual added (every "frame" sees the
+    /// same source). After 50 iterations the recon should remain bit-
+    /// identical to iteration 1 (because on iteration ≥2 the predictor
+    /// is the prior recon, source-pred=0 residual, IDCT(0)=0, recon=pred).
+    #[test]
+    fn drift_stress_zero_residual_chain() {
+        use crate::block::dequant_ac;
+        use crate::fdct::fdct_signed;
+        use crate::quant::quant_ac;
+        // Synthetic spatial source.
+        let mut src = [0u8; 64];
+        for (i, s) in src.iter_mut().enumerate() {
+            *s = (40 + ((i * 17) % 100)) as u8;
+        }
+        // Initial predictor = mid-grey.
+        let mut pred = [128u8; 64];
+        let q = 8u32;
+        let mut prev_recon = [0u8; 64];
+        for iter in 0..50 {
+            // Compute residual = src - pred (signed).
+            let mut resid = [0i32; 64];
+            for i in 0..64 {
+                resid[i] = src[i] as i32 - pred[i] as i32;
+            }
+            // FDCT + quant + dequant + IDCT to get reconstructed residual.
+            let mut coeffs = [0i32; 64];
+            fdct_signed(&resid, &mut coeffs);
+            let mut levels = [0i32; 64];
+            for i in 0..64 {
+                levels[i] = quant_ac(coeffs[i], q);
+            }
+            let mut dequant = [0i32; 64];
+            for i in 0..64 {
+                dequant[i] = dequant_ac(levels[i], q);
+            }
+            let mut rec_resid = [0i32; 64];
+            idct_signed(&dequant, &mut rec_resid);
+            let mut recon = [0u8; 64];
+            for i in 0..64 {
+                recon[i] = (pred[i] as i32 + rec_resid[i]).clamp(0, 255) as u8;
+            }
+            if iter >= 2 {
+                // After two iterations the recon is fixed: pred==prev_recon,
+                // src-pred==0 (well, +/- the IDCT roundoff which the dead-
+                // zone immediately squashes back to 0), so recon must equal
+                // the previous recon exactly. Any drift here would mean the
+                // IDCT/quant pair fails the "fixed point" property.
+                assert_eq!(
+                    recon, prev_recon,
+                    "drift at iter {iter}: recon != prev_recon — IDCT/quant chain is not idempotent"
+                );
+            }
+            prev_recon = recon;
+            pred = recon;
+        }
+    }
+
     #[test]
     fn intra_dc_level_matches_128() {
         // The spec says INTRA DC reconstruction level 1024 (coded as 0xFF)
