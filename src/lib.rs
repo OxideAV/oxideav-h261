@@ -41,8 +41,8 @@ pub mod quant;
 pub mod start_code;
 pub mod tables;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 /// The canonical oxideav codec id for ITU-T H.261 video.
 ///

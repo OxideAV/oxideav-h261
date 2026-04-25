@@ -18,8 +18,8 @@
 
 use std::path::Path;
 
-use oxideav_codec::Decoder;
 use oxideav_core::packet::PacketFlags;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h261::decoder::H261Decoder;
 

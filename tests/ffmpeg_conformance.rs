@@ -20,8 +20,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use oxideav_codec::Decoder;
 use oxideav_core::packet::PacketFlags;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h261::decoder::H261Decoder;
 
@@ -80,12 +80,7 @@ fn ffmpeg_encode(dir: &Path, source: &str, duration: f32) -> Option<PathBuf> {
     ffmpeg_encode_cmd(dir, source, duration, &[])
 }
 
-fn ffmpeg_encode_with_q(
-    dir: &Path,
-    source: &str,
-    duration: f32,
-    qscale: u32,
-) -> Option<PathBuf> {
+fn ffmpeg_encode_with_q(dir: &Path, source: &str, duration: f32, qscale: u32) -> Option<PathBuf> {
     let q = qscale.to_string();
     ffmpeg_encode_cmd(dir, source, duration, &["-qscale:v", &q])
 }
@@ -232,14 +227,12 @@ fn run_case_with_encoder(
         assert_eq!(our.len(), frame_size, "{tag}: frame {i} wrong size");
         let ref_frame = &ref_data[i * frame_size..(i + 1) * frame_size];
         let y_psnr = psnr(&our[..y_size], &ref_frame[..y_size]);
-        let cb_psnr = psnr(&our[y_size..y_size + c_size], &ref_frame[y_size..y_size + c_size]);
-        let cr_psnr = psnr(
-            &our[y_size + c_size..],
-            &ref_frame[y_size + c_size..],
+        let cb_psnr = psnr(
+            &our[y_size..y_size + c_size],
+            &ref_frame[y_size..y_size + c_size],
         );
-        eprintln!(
-            "{tag}: frame {i}: Y={y_psnr:.2} dB, Cb={cb_psnr:.2} dB, Cr={cr_psnr:.2} dB"
-        );
+        let cr_psnr = psnr(&our[y_size + c_size..], &ref_frame[y_size + c_size..]);
+        eprintln!("{tag}: frame {i}: Y={y_psnr:.2} dB, Cb={cb_psnr:.2} dB, Cr={cr_psnr:.2} dB");
         min_y_psnr = min_y_psnr.min(y_psnr);
         min_cb_psnr = min_cb_psnr.min(cb_psnr);
         min_cr_psnr = min_cr_psnr.min(cr_psnr);

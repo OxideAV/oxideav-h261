@@ -51,18 +51,8 @@ fn ffmpeg_decodes_our_qcif_intra_picture() {
         return;
     }
     let (y, cb, cr) = gradient_qcif_source();
-    let bytes = encode_intra_picture(
-        SourceFormat::Qcif,
-        &y,
-        176,
-        &cb,
-        88,
-        &cr,
-        88,
-        8,
-        0,
-    )
-    .expect("encode");
+    let bytes =
+        encode_intra_picture(SourceFormat::Qcif, &y, 176, &cb, 88, &cr, 88, 8, 0).expect("encode");
 
     let dir = tmpdir();
     let es_path = dir.join("q.h261");

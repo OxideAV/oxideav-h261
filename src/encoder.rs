@@ -93,10 +93,7 @@ pub fn encode_intra_picture(
     }
     let (_w, h) = fmt.dimensions();
     let h = h as usize;
-    if y.len() < y_stride * h
-        || cb.len() < cb_stride * (h / 2)
-        || cr.len() < cr_stride * (h / 2)
-    {
+    if y.len() < y_stride * h || cb.len() < cb_stride * (h / 2) || cr.len() < cr_stride * (h / 2) {
         return Err(Error::invalid("h261 encode: input plane too short"));
     }
 
@@ -121,8 +118,8 @@ pub fn encode_intra_picture(
 pub fn write_picture_header(bw: &mut BitWriter, fmt: SourceFormat, tr: u8) {
     bw.write_u32(0x00010, 20); // PSC
     bw.write_u32(tr as u32, 5); // TR
-    // PTYPE — six single-bit flags, MSB first.
-    // bit1 split-screen indicator off
+                                // PTYPE — six single-bit flags, MSB first.
+                                // bit1 split-screen indicator off
     bw.write_u32(0, 1);
     // bit2 document-camera indicator off
     bw.write_u32(0, 1);
@@ -321,9 +318,9 @@ mod tests {
     use super::*;
     use crate::decoder::{decode_picture_body, pic_to_video_frame, H261Decoder};
     use crate::picture::parse_picture_header;
-    use oxideav_codec::Decoder;
     use oxideav_core::bits::BitReader;
     use oxideav_core::packet::PacketFlags;
+    use oxideav_core::Decoder;
     use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 
     /// Build a neutral-grey QCIF YUV420 source (Y=128, Cb=Cr=128).
@@ -421,18 +418,8 @@ mod tests {
         let y = vec![128u8; 352 * 288];
         let cb = vec![128u8; 176 * 144];
         let cr = vec![128u8; 176 * 144];
-        let bytes = encode_intra_picture(
-            SourceFormat::Cif,
-            &y,
-            352,
-            &cb,
-            176,
-            &cr,
-            176,
-            8,
-            0,
-        )
-        .expect("encode cif");
+        let bytes = encode_intra_picture(SourceFormat::Cif, &y, 352, &cb, 176, &cr, 176, 8, 0)
+            .expect("encode cif");
         assert!(!bytes.is_empty());
 
         // Also parse the body with our low-level helper to confirm all 12 GOBs present.
@@ -460,18 +447,8 @@ mod tests {
         }
         let cb = vec![128u8; (w / 2) * (h / 2)];
         let cr = vec![128u8; (w / 2) * (h / 2)];
-        let bytes = encode_intra_picture(
-            SourceFormat::Qcif,
-            &y,
-            w,
-            &cb,
-            w / 2,
-            &cr,
-            w / 2,
-            8,
-            0,
-        )
-        .expect("encode gradient");
+        let bytes = encode_intra_picture(SourceFormat::Qcif, &y, w, &cb, w / 2, &cr, w / 2, 8, 0)
+            .expect("encode gradient");
 
         let mut decoder = H261Decoder::new(CodecId::new(crate::CODEC_ID_STR));
         let pkt = Packet {

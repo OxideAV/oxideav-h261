@@ -189,7 +189,12 @@ mod tests {
         crate::idct::idct_intra(&coeffs, &mut back);
         for i in 0..64 {
             let err = (back[i] as i32 - pels[i] as i32).abs();
-            assert!(err <= 2, "roundtrip err at {i}: got {} want {}", back[i], pels[i]);
+            assert!(
+                err <= 2,
+                "roundtrip err at {i}: got {} want {}",
+                back[i],
+                pels[i]
+            );
         }
     }
 }
