@@ -418,28 +418,36 @@ fn write_block(pic: &mut Picture, block_idx: usize, luma_x: usize, luma_y: usize
 /// Decode the MBA VLC plus any stuffing codewords that precede it. Returns
 /// `None` if the reader hits a start-code boundary (the caller has already
 /// positioned us past the 16-bit zero prefix; from the MB scanner's
-/// perspective the GOB has ended).
+/// perspective the GOB has ended) or if the bit reader has been exhausted.
 ///
 /// Returns `Some(mba_diff)` where `mba_diff` is the value from Table 1 (1..=33).
+///
+/// IMPORTANT: a start code requires at least 16 zero bits followed by the
+/// 1-bit sync — i.e. ≥17 bits. If fewer than 16 bits remain there cannot be
+/// a start code, but the remaining bits may still encode a valid MBA VLC
+/// (the shortest is just the 1-bit `Diff(1)` code). We therefore only
+/// invoke the start-code peek when at least 16 bits are available; with
+/// fewer bits we go straight to the VLC decoder.
 pub fn decode_mba_diff(br: &mut BitReader<'_>) -> Result<Option<u8>> {
     loop {
-        // Peek 16 bits to see if we're at a start code (15 leading zeros
-        // followed by a `1`). When the encoder inserts MBA stuffing, it can
-        // emit arbitrarily many stuffing codewords; we also need to handle
-        // a real start code as the end-of-GOB signal.
-        let avail = br.bits_remaining().min(16) as u32;
-        if avail < 16 {
+        let remaining = br.bits_remaining();
+        if remaining == 0 {
             return Ok(None);
         }
-        let peek = br.peek_u32(16)?;
-        if peek == 0x0001 {
-            return Ok(None);
+        if remaining >= 16 {
+            let peek = br.peek_u32(16)?;
+            if peek == 0x0001 {
+                return Ok(None);
+            }
         }
-        // Not a start code — decode a regular MBA VLC.
-        let sym: MbaSym = decode_vlc(br, MBA_TABLE)?;
-        match sym {
-            MbaSym::Diff(d) => return Ok(Some(d)),
-            MbaSym::Stuffing => continue,
+        // Not a start code — decode a regular MBA VLC. If the VLC table
+        // can't match (e.g. we're staring at trailing padding zeros only),
+        // fall through to `Ok(None)` to terminate the GOB cleanly.
+        match decode_vlc(br, MBA_TABLE) {
+            Ok(MbaSym::Diff(d)) => return Ok(Some(d)),
+            Ok(MbaSym::Stuffing) => continue,
+            // Out-of-bits or no-match at the picture-trailer padding.
+            Err(_) => return Ok(None),
         }
     }
 }

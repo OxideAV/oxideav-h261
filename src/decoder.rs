@@ -151,14 +151,28 @@ pub fn decode_picture_body(
 
         loop {
             // Stop when we hit the next start code. The 16-bit prefix is
-            // 15 zeros + a `1` at any bit position.
+            // `0000 0000 0000 0001` — 15 zeros + a `1` at any bit position.
+            //
+            // §4.2.2: the start code can only appear after a complete MB
+            // (the encoder always byte-aligns the picture, and the next
+            // picture's PSC begins on that byte boundary). If we have fewer
+            // than 16 bits remaining we cannot be at a start code (it would
+            // need ≥16 bits) — but we may still have a valid MB to decode
+            // followed by padding zeros, so do NOT break early on
+            // `bits_remaining < 16`; let the MB decoder consume what's there
+            // and fall out via `decode_mba_diff` returning `None`.
+            //
+            // For the start-code check itself we need at least 16 bits.
+            // Without 16 bits there can't be a start code, so skip the test.
             let remaining_bits = br.bits_remaining();
-            if remaining_bits < 16 {
+            if remaining_bits == 0 {
                 break;
             }
-            let peek16 = br.peek_u32(16)?;
-            if peek16 == 0x0001 {
-                break;
+            if remaining_bits >= 16 {
+                let peek16 = br.peek_u32(16)?;
+                if peek16 == 0x0001 {
+                    break;
+                }
             }
             let diff = match decode_mba_diff(br)? {
                 Some(d) => d as i32,

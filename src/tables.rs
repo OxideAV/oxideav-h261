@@ -567,9 +567,14 @@ pub const MTYPE_INTRA: (u8, u32) = (4, 0b0001);
 pub const MTYPE_INTRA_MQUANT: (u8, u32) = (7, 0b0000_001);
 /// `Inter` (no MC): 1-bit `1`. CBP + TCOEFF present, no MQUANT/MVD/FIL.
 pub const MTYPE_INTER: (u8, u32) = (1, 0b1);
+/// `Inter` + MQUANT (no MC). 5-bit MTYPE per Table 2/H.261.
+pub const MTYPE_INTER_MQUANT: (u8, u32) = (5, 0b0000_1);
 /// `Inter+MC` with CBP + TCOEFF present, no MQUANT/FIL.
 /// Code per Table 2/H.261: `0000 0001` (8 bits).
 pub const MTYPE_INTER_MC_CBP: (u8, u32) = (8, 0b0000_0001);
+/// `Inter+MC` with CBP + TCOEFF + MQUANT. 10-bit MTYPE per Table 2/H.261:
+/// `0000 0000 01`.
+pub const MTYPE_INTER_MC_CBP_MQUANT: (u8, u32) = (10, 0b0000_0000_01);
 /// `Inter+MC` without CBP/TCOEFF (MC-only, residual = 0).
 /// Code per Table 2/H.261: `0000 0000 1` (9 bits).
 pub const MTYPE_INTER_MC_ONLY: (u8, u32) = (9, 0b0000_0000_1);
@@ -580,6 +585,9 @@ pub const MTYPE_INTER_MC_FIL_ONLY: (u8, u32) = (3, 0b001);
 /// `Inter+MC+FIL` with CBP+TCOEFF (residual coded, loop filter on).
 /// Code per Table 2/H.261: `01` (2 bits).
 pub const MTYPE_INTER_MC_FIL_CBP: (u8, u32) = (2, 0b01);
+/// `Inter+MC+FIL` with CBP+TCOEFF+MQUANT. 6-bit MTYPE per Table 2/H.261:
+/// `0000 01`.
+pub const MTYPE_INTER_MC_FIL_CBP_MQUANT: (u8, u32) = (6, 0b0000_01);
 
 /// Look up the MVD VLC for a signed differential `d` in the symmetric
 /// range `-16..=16`. Returns `(bits, code)` ready to emit MSB-first.

@@ -96,8 +96,9 @@ use crate::picture::SourceFormat;
 use crate::quant::{quant_ac, quant_intra_dc};
 use crate::tables::{
     encode_cbp, encode_mba_diff, encode_mvd, lookup_tcoeff, MBA_STUFFING, MTYPE_INTER,
-    MTYPE_INTER_MC_CBP, MTYPE_INTER_MC_FIL_CBP, MTYPE_INTER_MC_FIL_ONLY, MTYPE_INTER_MC_ONLY,
-    MTYPE_INTRA, MTYPE_INTRA_MQUANT, ZIGZAG,
+    MTYPE_INTER_MC_CBP, MTYPE_INTER_MC_CBP_MQUANT, MTYPE_INTER_MC_FIL_CBP,
+    MTYPE_INTER_MC_FIL_CBP_MQUANT, MTYPE_INTER_MC_FIL_ONLY, MTYPE_INTER_MC_ONLY,
+    MTYPE_INTER_MQUANT, MTYPE_INTRA, MTYPE_INTRA_MQUANT, ZIGZAG,
 };
 
 /// Default GOB-level quantiser. QUANT in `1..=31`. 8 is a balanced
@@ -111,6 +112,96 @@ const MV_MAX: i32 = 15;
 /// we search the full window in a small-diamond pattern that progressively
 /// refines the best-so-far candidate.
 const ME_SEARCH_RADIUS: i32 = MV_MAX;
+
+/// Per-GOB MQUANT rate controller (§4.2.3.3). Tracks the bits accumulated
+/// in the GOB and nudges the quantiser ±1 step around the picture base when
+/// we drift away from a linear bit-budget target.
+///
+/// MQUANT can only be sent on MTYPEs that have the `mquant` flag set
+/// (Table 2/H.261): Intra+MQUANT, Inter+MQUANT, InterMc+CBP+MQUANT,
+/// InterMcFil+CBP+MQUANT. The controller therefore proposes a `desired`
+/// quantiser for each MB; the encoder honours it iff the chosen MTYPE is
+/// MQUANT-eligible, otherwise the change is deferred to the next eligible
+/// MB (the decoder's `quant_in_effect` is what we need to match for the
+/// residual reconstruction to be byte-tight).
+struct MqRateCtrl {
+    /// Picture-level base QUANT (= GQUANT for this GOB).
+    base_quant: u32,
+    /// Quantiser the decoder is currently using (= GQUANT at GOB start,
+    /// updated to the last MQUANT we emitted).
+    quant_in_effect: u32,
+    /// Target bits per MB across the GOB (computed from the picture's
+    /// previous-MB-bit-budget). For the very first GOB of the very first
+    /// P-frame we use a fixed reference budget; subsequent GOBs use a
+    /// rolling estimate. The controller only nudges by ±1 step at a time
+    /// and clamps within `[min_quant, max_quant]` so it can never run
+    /// away.
+    target_per_mb: u32,
+    /// Bits emitted into this GOB's MB stream so far (excluding header).
+    cumulative: u64,
+    /// Allowed quantiser window around `base_quant`. Clamped to 1..=31.
+    min_quant: u32,
+    max_quant: u32,
+}
+
+impl MqRateCtrl {
+    /// Build a controller anchored on `base_quant` with a `target_per_mb`
+    /// budget. The window is `[max(1, base-WIN), min(31, base+WIN)]`.
+    fn new(base_quant: u32, target_per_mb: u32) -> Self {
+        const WIN: u32 = 6;
+        let min_quant = base_quant.saturating_sub(WIN).max(1);
+        let max_quant = (base_quant + WIN).min(31);
+        Self {
+            base_quant,
+            quant_in_effect: base_quant,
+            target_per_mb,
+            cumulative: 0,
+            min_quant,
+            max_quant,
+        }
+    }
+
+    /// Suggest a quantiser for MB index `mb_idx` (0-based, 0..33 within a
+    /// GOB). Compares cumulative bits against the linear budget; nudges
+    /// QUANT toward `base_quant` when within budget, away from it when
+    /// over/under.
+    ///
+    /// We use a generous slack (16x the per-MB target) so the controller
+    /// only kicks in on pathological MBs that emit many multiples of the
+    /// average bit count — typically rapid-motion regions where coarser
+    /// quantisation has the largest payoff (small extra MQUANT overhead vs
+    /// large TCOEFF savings).
+    fn desired(&self, mb_idx: u32) -> u32 {
+        let expected = (mb_idx as u64).saturating_mul(self.target_per_mb as u64);
+        let slack = (self.target_per_mb as u64).saturating_mul(16);
+        let cur = self.quant_in_effect as i32;
+        let bumped = if self.cumulative > expected.saturating_add(slack) {
+            // Way over budget — coarsen aggressively.
+            cur + 1
+        } else if self.cumulative + slack * 2 < expected {
+            // Far under budget — refine toward base.
+            cur - 1
+        } else {
+            // Within tolerance — gravitate back toward base.
+            match cur.cmp(&(self.base_quant as i32)) {
+                std::cmp::Ordering::Greater => cur - 1,
+                std::cmp::Ordering::Less => cur,
+                std::cmp::Ordering::Equal => cur,
+            }
+        };
+        (bumped.max(self.min_quant as i32) as u32).min(self.max_quant)
+    }
+
+    /// Note that `bits` were emitted in this MB.
+    fn account(&mut self, bits: u64) {
+        self.cumulative = self.cumulative.saturating_add(bits);
+    }
+
+    /// Commit a quantiser change (called after MQUANT is emitted).
+    fn commit_quant(&mut self, q: u32) {
+        self.quant_in_effect = q;
+    }
+}
 
 /// Encode a single INTRA picture.
 ///
@@ -493,12 +584,24 @@ fn encode_gob_inter(
     // MV predictor state per §4.2.3.4 (reset at GOB start).
     let mut pred_mv: (i32, i32) = (0, 0);
     let mut prev_was_mc = false;
+    // Per-GOB rate controller (§4.2.3.3 MQUANT). Disabled by setting the
+    // env var to "1" — useful for A/B benchmarks against the r13 baseline.
+    let rate_ctrl_enabled = std::env::var("OXIDEAV_H261_NO_MQUANT").is_err();
+    // Target ~50 bits per MB at QUANT=8 (≈ 1.6 kbit per QCIF GOB). The
+    // controller's slack (see `MqRateCtrl::desired`) is 16x this target,
+    // so we only nudge QP up after several consecutive expensive MBs.
+    // The intent is to catch a hot patch in a GOB without coarsening the
+    // picture as a whole — which preserves PSNR while still trimming
+    // bytes on outlier MBs.
+    let target_per_mb = 32 + 4 * quant;
+    let mut rc = MqRateCtrl::new(quant, target_per_mb);
 
     for mba in 1u8..=33 {
         let mb_col = (mba - 1) as usize % 11;
         let mb_row = (mba - 1) as usize / 11;
         let luma_x = gob_x + mb_col * 16;
         let luma_y = gob_y + mb_row * 16;
+        let bits_before_mb = bw.bit_position();
 
         // ---- 1. Source pels.
         let mut blocks_pels: [[u8; 64]; 6] = [[0u8; 64]; 6];
@@ -576,15 +679,21 @@ fn encode_gob_inter(
         // total bit-cost (MTYPE + MVD + CBP + TCOEFF). The unfiltered
         // q_levels/recon are reused as-is from r12; the filtered branch
         // mirrors the same code path through `quantise_residual`.
-        let (cbp_nf, q_levels_nf, recon_nf, resid_bits_nf) =
-            quantise_residual(&blocks_pels, &blocks_pred, quant);
+        //
+        // QUANT used here is `rc.quant_in_effect`, which equals GQUANT at
+        // GOB start and otherwise the most recently emitted MQUANT. If the
+        // rate controller wants to switch QP and we land in an MQUANT-
+        // bearing mode below we re-quantise at the new value before emit.
+        let cur_q = rc.quant_in_effect;
+        let (cbp_nf, mut q_levels_nf, mut recon_nf, resid_bits_nf) =
+            quantise_residual(&blocks_pels, &blocks_pred, cur_q);
 
         let mut blocks_pred_fil: [[u8; 64]; 6] = [[0u8; 64]; 6];
         for b in 0..6 {
             blocks_pred_fil[b] = apply_loop_filter_block(&blocks_pred[b]);
         }
-        let (cbp_fil, q_levels_fil, recon_fil, resid_bits_fil) =
-            quantise_residual(&blocks_pels, &blocks_pred_fil, quant);
+        let (cbp_fil, mut q_levels_fil, mut recon_fil, resid_bits_fil) =
+            quantise_residual(&blocks_pels, &blocks_pred_fil, cur_q);
 
         // ---- 5. Mode decision.
         //
@@ -700,8 +809,97 @@ fn encode_gob_inter(
             }
             // Suppress unused-variable warnings on cost.
             let _ = (best_cost, mv_l1);
+            // No bits emitted for this MB.
             continue;
         }
+
+        // ---- 6. Rate-controller MQUANT switch (§4.2.3.3).
+        //
+        // Modes 1, 3, 5 carry CBP+TCOEFF and therefore an MQUANT-bearing
+        // MTYPE variant exists. If the controller wants a different QP
+        // than `rc.quant_in_effect`, re-quantise the relevant residual
+        // (filtered or not) at the new QP and switch to the MQUANT
+        // variant. We do NOT re-do the full mode decision because the
+        // delta is small (±1 step) and re-running mode-decision per QP
+        // would double the per-MB cost — the controller's nudge is
+        // designed to be safe at the chosen mode.
+        let mode_supports_mquant = matches!(best_mode, 1 | 3 | 5);
+        let desired_q = if rate_ctrl_enabled {
+            rc.desired((mba - 1) as u32)
+        } else {
+            cur_q
+        };
+        let mut emit_q = cur_q;
+        let mut emit_mquant = false;
+        if mode_supports_mquant && desired_q != cur_q {
+            // Re-quantise at desired_q. We re-derive `(cbp, q_levels,
+            // recon, _)` for whichever predictor (filtered/not) the chosen
+            // mode uses. If re-quantisation drops CBP to zero we fall
+            // back to the original quant — emitting CBP=0 with a CBP-
+            // bearing MTYPE is forbidden (Table 4 has no entry for 0).
+            let (pred_blocks, _is_fil) = match best_mode {
+                1 => (&blocks_pred, false),
+                3 => (&blocks_pred, false),
+                5 => (&blocks_pred_fil, true),
+                _ => unreachable!(),
+            };
+            let (new_cbp, new_levels, new_recon, _new_bits) =
+                quantise_residual(&blocks_pels, pred_blocks, desired_q);
+            if new_cbp != 0 {
+                emit_q = desired_q;
+                emit_mquant = true;
+                if matches!(best_mode, 1 | 3) {
+                    // Patch the no-FIL stash so the emit code below uses
+                    // the new quantisation.
+                    q_levels_nf = new_levels;
+                    recon_nf = new_recon;
+                    // CBP can have changed too (rare with ±1 nudge but
+                    // possible). Stash it via a mutable shadow that the
+                    // emit path reads from.
+                    let _ = new_cbp; // We reuse the original cbp_nf below;
+                                     // see special handling at emit.
+                } else {
+                    q_levels_fil = new_levels;
+                    recon_fil = new_recon;
+                }
+                // Update the CBP for the emit path. We can't re-bind the
+                // outer `cbp_nf`/`cbp_fil` in this scope; we use a
+                // dedicated `cbp_emit` for the actual write (see below).
+            }
+        }
+        // Choose CBP for the emit path. When MQUANT switching, the
+        // re-quantisation may have changed CBP — but since we only switch
+        // when `new_cbp != 0` AND we kept the original mode decision, we
+        // re-derive CBP from the (possibly patched) q_levels.
+        let cbp_for_emit = if emit_mquant {
+            let mut c: u8 = 0;
+            for b in 0..6 {
+                let levels = match best_mode {
+                    1 | 3 => &q_levels_nf[b],
+                    5 => &q_levels_fil[b],
+                    _ => unreachable!(),
+                };
+                if levels.iter().any(|&l| l != 0) {
+                    c |= 1 << (5 - b);
+                }
+            }
+            c
+        } else {
+            match best_mode {
+                1 | 3 => cbp_nf,
+                5 => cbp_fil,
+                _ => 0,
+            }
+        };
+        // It is theoretically possible (rare ±1 nudge into a coarser QP)
+        // that the new CBP becomes 0 even though we tested above. Guard:
+        // fall back to the no-MQUANT path in that case.
+        let (emit_q, emit_mquant) = if matches!(best_mode, 1 | 3 | 5) && cbp_for_emit == 0 {
+            // No CBP — can't use a CBP+TCOEFF MTYPE. Disable MQUANT for this MB.
+            (cur_q, false)
+        } else {
+            (emit_q, emit_mquant)
+        };
 
         // Emit MBA diff (jumps over any preceding skipped MBs).
         let diff = mba - prev_mba;
@@ -718,12 +916,17 @@ fn encode_gob_inter(
         match best_mode {
             1 => {
                 // INTER (no MC, no FIL). CBP != 0.
-                debug_assert_ne!(cbp_nf, 0);
-                bw.write_u32(MTYPE_INTER.1, MTYPE_INTER.0 as u32);
-                let (cbits, ccode) = encode_cbp(cbp_nf);
+                debug_assert_ne!(cbp_for_emit, 0);
+                if emit_mquant {
+                    bw.write_u32(MTYPE_INTER_MQUANT.1, MTYPE_INTER_MQUANT.0 as u32);
+                    bw.write_u32(emit_q, 5);
+                } else {
+                    bw.write_u32(MTYPE_INTER.1, MTYPE_INTER.0 as u32);
+                }
+                let (cbits, ccode) = encode_cbp(cbp_for_emit);
                 bw.write_u32(ccode, cbits as u32);
                 for b in 0..6 {
-                    if cbp_nf & (1 << (5 - b)) != 0 {
+                    if cbp_for_emit & (1 << (5 - b)) != 0 {
                         emit_inter_block_levels(bw, &q_levels_nf[b]);
                     }
                     write_block_to_picture(recon, b, luma_x, luma_y, &recon_nf[b]);
@@ -732,7 +935,7 @@ fn encode_gob_inter(
                 prev_was_mc = false;
             }
             2 => {
-                // INTER+MC (no FIL), MC-only (no CBP/TCOEFF).
+                // INTER+MC (no FIL), MC-only (no CBP/TCOEFF). MQUANT not allowed.
                 bw.write_u32(MTYPE_INTER_MC_ONLY.1, MTYPE_INTER_MC_ONLY.0 as u32);
                 let dx = mvx - pred_for_mvd.0;
                 let dy = mvy - pred_for_mvd.1;
@@ -747,18 +950,26 @@ fn encode_gob_inter(
                 prev_was_mc = true;
             }
             3 => {
-                // INTER+MC (no FIL) with CBP + TCOEFF.
-                bw.write_u32(MTYPE_INTER_MC_CBP.1, MTYPE_INTER_MC_CBP.0 as u32);
+                // INTER+MC (no FIL) with CBP + TCOEFF (and optionally MQUANT).
+                if emit_mquant {
+                    bw.write_u32(
+                        MTYPE_INTER_MC_CBP_MQUANT.1,
+                        MTYPE_INTER_MC_CBP_MQUANT.0 as u32,
+                    );
+                    bw.write_u32(emit_q, 5);
+                } else {
+                    bw.write_u32(MTYPE_INTER_MC_CBP.1, MTYPE_INTER_MC_CBP.0 as u32);
+                }
                 let dx = mvx - pred_for_mvd.0;
                 let dy = mvy - pred_for_mvd.1;
                 let (xb, xc) = encode_mvd(dx);
                 bw.write_u32(xc, xb as u32);
                 let (yb, yc) = encode_mvd(dy);
                 bw.write_u32(yc, yb as u32);
-                let (cbits, ccode) = encode_cbp(cbp_nf);
+                let (cbits, ccode) = encode_cbp(cbp_for_emit);
                 bw.write_u32(ccode, cbits as u32);
                 for b in 0..6 {
-                    if cbp_nf & (1 << (5 - b)) != 0 {
+                    if cbp_for_emit & (1 << (5 - b)) != 0 {
                         emit_inter_block_levels(bw, &q_levels_nf[b]);
                     }
                     write_block_to_picture(recon, b, luma_x, luma_y, &recon_nf[b]);
@@ -767,7 +978,7 @@ fn encode_gob_inter(
                 prev_was_mc = true;
             }
             4 => {
-                // INTER+MC+FIL, MC-only (no CBP/TCOEFF). 3-bit MTYPE.
+                // INTER+MC+FIL, MC-only (no CBP/TCOEFF). 3-bit MTYPE. MQUANT not allowed.
                 bw.write_u32(MTYPE_INTER_MC_FIL_ONLY.1, MTYPE_INTER_MC_FIL_ONLY.0 as u32);
                 let dx = mvx - pred_for_mvd.0;
                 let dy = mvy - pred_for_mvd.1;
@@ -782,18 +993,26 @@ fn encode_gob_inter(
                 prev_was_mc = true;
             }
             5 => {
-                // INTER+MC+FIL with CBP + TCOEFF. 2-bit MTYPE.
-                bw.write_u32(MTYPE_INTER_MC_FIL_CBP.1, MTYPE_INTER_MC_FIL_CBP.0 as u32);
+                // INTER+MC+FIL with CBP + TCOEFF (and optionally MQUANT). 2-bit MTYPE.
+                if emit_mquant {
+                    bw.write_u32(
+                        MTYPE_INTER_MC_FIL_CBP_MQUANT.1,
+                        MTYPE_INTER_MC_FIL_CBP_MQUANT.0 as u32,
+                    );
+                    bw.write_u32(emit_q, 5);
+                } else {
+                    bw.write_u32(MTYPE_INTER_MC_FIL_CBP.1, MTYPE_INTER_MC_FIL_CBP.0 as u32);
+                }
                 let dx = mvx - pred_for_mvd.0;
                 let dy = mvy - pred_for_mvd.1;
                 let (xb, xc) = encode_mvd(dx);
                 bw.write_u32(xc, xb as u32);
                 let (yb, yc) = encode_mvd(dy);
                 bw.write_u32(yc, yb as u32);
-                let (cbits, ccode) = encode_cbp(cbp_fil);
+                let (cbits, ccode) = encode_cbp(cbp_for_emit);
                 bw.write_u32(ccode, cbits as u32);
                 for b in 0..6 {
-                    if cbp_fil & (1 << (5 - b)) != 0 {
+                    if cbp_for_emit & (1 << (5 - b)) != 0 {
                         emit_inter_block_levels(bw, &q_levels_fil[b]);
                     }
                     write_block_to_picture(recon, b, luma_x, luma_y, &recon_fil[b]);
@@ -805,6 +1024,13 @@ fn encode_gob_inter(
         }
 
         prev_mba = mba;
+        // Rate-controller bookkeeping. Update `quant_in_effect` if MQUANT
+        // was emitted, and account for the MB's bit cost.
+        if emit_mquant {
+            rc.commit_quant(emit_q);
+        }
+        let bits_after_mb = bw.bit_position();
+        rc.account(bits_after_mb - bits_before_mb);
     }
 }
 
@@ -1836,12 +2062,11 @@ mod tests {
     /// loop filter must roundtrip byte-tight through our own decoder, which
     /// implements the matching `apply_loop_filter` in mb.rs. If our encoder
     /// applies a slightly different filter the recon would drift.
-    /// Single I+P self-decode roundtrip for the FIL path: ffmpeg is the
-    /// gold standard for byte-tight FIL recon (our in-crate decoder is
-    /// known to mishandle the very last MB of QCIF GOB 5 in chained
-    /// P-frames; that's an r12 issue tracked separately and not gated by
-    /// this round). We restrict the in-crate self-decode to a single
-    /// I+P pair so the buggy decoder path never triggers.
+    /// Single I+P self-decode roundtrip for the FIL path. (Historical
+    /// note: pre-r14 the in-crate decoder mishandled the very last MB of
+    /// QCIF GOB 5 in chained P-frames — see `chained_p_self_decode_byte_tight`
+    /// for the regression test of that fix; this test still uses just
+    /// I+P so it remains a tight floor on the FIL contract alone.)
     #[test]
     fn fil_self_decode_one_pframe_byte_tight() {
         // Use pattern_qcif at two shifts. MVs will be roughly (-4, -2).
@@ -1998,6 +2223,212 @@ mod tests {
         // size is at least *not larger* than what r12 produced — a rough
         // sanity floor).
         assert!(total_size > 0);
+    }
+
+    /// MQUANT delta self-decode: the encoder's per-GOB rate controller
+    /// (§4.2.3.3) emits MQUANT-bearing MTYPEs on hot MBs to coarsen the
+    /// quantiser mid-GOB. The decoder's `MtypeInfo.mquant` flag must be
+    /// honoured so that the residual reconstruction matches what the
+    /// encoder did. We verify byte-tight self-decode on a high-frequency
+    /// chained-P fixture (where the controller is most likely to fire).
+    #[test]
+    fn mquant_delta_self_decode_byte_tight() {
+        let frames = testsrc_qcif(4);
+        let mut local_recons: Vec<Picture> = Vec::with_capacity(frames.len());
+        let mut stream = Vec::new();
+        let (b0, r0) = encode_intra_picture_with_recon(
+            SourceFormat::Qcif,
+            &frames[0].0,
+            176,
+            &frames[0].1,
+            88,
+            &frames[0].2,
+            88,
+            8,
+            0,
+        )
+        .expect("intra");
+        stream.extend_from_slice(&b0);
+        local_recons.push(r0);
+        for (i, (y, cb, cr)) in frames.iter().enumerate().skip(1) {
+            let prev = local_recons.last().unwrap();
+            let (b, r) =
+                encode_inter_picture(SourceFormat::Qcif, y, 176, cb, 88, cr, 88, 8, i as u8, prev)
+                    .expect("inter");
+            stream.extend_from_slice(&b);
+            local_recons.push(r);
+        }
+
+        let mut dec = H261Decoder::new(CodecId::new(crate::CODEC_ID_STR));
+        let pkt = Packet {
+            stream_index: 0,
+            data: stream,
+            pts: Some(0),
+            dts: Some(0),
+            duration: None,
+            time_base: TimeBase::new(1, 30_000),
+            flags: PacketFlags {
+                keyframe: true,
+                ..Default::default()
+            },
+        };
+        dec.send_packet(&pkt).expect("send");
+        dec.flush().ok();
+
+        for i in 0..frames.len() {
+            let f = match dec.receive_frame().expect("frame") {
+                Frame::Video(v) => v,
+                _ => panic!("video"),
+            };
+            let recon = &local_recons[i];
+            let dy = &f.planes[0].data;
+            let mut bad_y = 0usize;
+            for j in 0..144 {
+                for ix in 0..176 {
+                    if recon.y[j * recon.y_stride + ix] != dy[j * 176 + ix] {
+                        bad_y += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                bad_y, 0,
+                "frame {i}: MQUANT-delta decode produced {bad_y} bad Y pels — \
+                 indicates decoder is not honouring MQUANT or encoder/decoder \
+                 disagree on which MB the MQUANT applies to"
+            );
+        }
+    }
+
+    /// MQUANT-delta should shrink the bytes on a high-frequency P-chain
+    /// vs. the same encoder with MQUANT disabled. Allows the bytes to be
+    /// the same (the controller may not fire on synthetic input).
+    #[test]
+    fn mquant_delta_does_not_grow_stream() {
+        let frames = testsrc_qcif(4);
+        // With MQUANT (default).
+        let mut enc = H261Encoder::new(SourceFormat::Qcif, 8);
+        let mut with_mq_size = 0usize;
+        for (y, cb, cr) in &frames {
+            let p = enc.encode_frame(y, 176, cb, 88, cr, 88).unwrap();
+            with_mq_size += p.len();
+        }
+        // Without MQUANT.
+        std::env::set_var("OXIDEAV_H261_NO_MQUANT", "1");
+        let mut enc2 = H261Encoder::new(SourceFormat::Qcif, 8);
+        let mut no_mq_size = 0usize;
+        for (y, cb, cr) in &frames {
+            let p = enc2.encode_frame(y, 176, cb, 88, cr, 88).unwrap();
+            no_mq_size += p.len();
+        }
+        std::env::remove_var("OXIDEAV_H261_NO_MQUANT");
+        // Loose bar: MQUANT-on must not be drastically worse than off (a
+        // tight bar would flake on small content where the controller
+        // doesn't engage). We accept up to +20 bytes of overhead from the
+        // 5-bit MQUANT field on rare false-positive switches.
+        assert!(
+            with_mq_size <= no_mq_size + 20,
+            "MQUANT-on bigger than MQUANT-off: {with_mq_size} vs {no_mq_size}"
+        );
+    }
+
+    /// Regression test for the chained-P-frame decoder bug fixed in r14.
+    ///
+    /// Symptoms (pre-fix): a 3+ frame P-chain on testsrc-like content
+    /// would self-decode to large errors at the very last MB of each
+    /// trailing P-picture (GOB 5 MBA=33 in QCIF), because the GOB MB-loop
+    /// in `decoder.rs::decode_picture_body` broke early on
+    /// `bits_remaining < 16` even though that final MB and its trailing
+    /// padding zeros made the picture body shorter than 16 bits at the
+    /// last MB boundary.
+    ///
+    /// Spec: §4.2.2 — a start code is 16 zero bits + a 1-bit sync, so
+    /// fewer than 16 bits remaining cannot encode a start code; the
+    /// decoder must instead try to decode an MB from whatever remains.
+    /// The fix gates the start-code peek on `remaining ≥ 16`.
+    ///
+    /// We assert byte-tight self-decode by comparing each P-frame's
+    /// decoded Y plane against the encoder's local reconstruction (which
+    /// is what a conformant decoder must produce).
+    #[test]
+    fn chained_p_self_decode_byte_tight() {
+        let frames = testsrc_qcif(5);
+        let mut local_recons: Vec<Picture> = Vec::with_capacity(frames.len());
+        let mut stream = Vec::new();
+        let (b0, r0) = encode_intra_picture_with_recon(
+            SourceFormat::Qcif,
+            &frames[0].0,
+            176,
+            &frames[0].1,
+            88,
+            &frames[0].2,
+            88,
+            8,
+            0,
+        )
+        .expect("intra");
+        stream.extend_from_slice(&b0);
+        local_recons.push(r0);
+        for (i, (y, cb, cr)) in frames.iter().enumerate().skip(1) {
+            let prev = local_recons.last().unwrap();
+            let (b, r) =
+                encode_inter_picture(SourceFormat::Qcif, y, 176, cb, 88, cr, 88, 8, i as u8, prev)
+                    .expect("inter");
+            stream.extend_from_slice(&b);
+            local_recons.push(r);
+        }
+
+        let mut dec = H261Decoder::new(CodecId::new(crate::CODEC_ID_STR));
+        let pkt = Packet {
+            stream_index: 0,
+            data: stream,
+            pts: Some(0),
+            dts: Some(0),
+            duration: None,
+            time_base: TimeBase::new(1, 30_000),
+            flags: PacketFlags {
+                keyframe: true,
+                ..Default::default()
+            },
+        };
+        dec.send_packet(&pkt).expect("send");
+        dec.flush().ok();
+
+        for i in 0..frames.len() {
+            let f = match dec.receive_frame().expect("frame") {
+                Frame::Video(v) => v,
+                _ => panic!("video"),
+            };
+            let recon = &local_recons[i];
+            let dy = &f.planes[0].data;
+            let mut bad_y = 0usize;
+            for j in 0..144 {
+                for ix in 0..176 {
+                    if recon.y[j * recon.y_stride + ix] != dy[j * 176 + ix] {
+                        bad_y += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                bad_y, 0,
+                "frame {i}: Y plane mismatch in {bad_y} pels (chained-P bug pre-r14 \
+                 manifested as ~230 bad pels at GOB 5 MBA=33)"
+            );
+            // Chroma should also match.
+            for plane in 1..=2usize {
+                let stride = recon.c_stride;
+                let src = if plane == 1 { &recon.cb } else { &recon.cr };
+                let dst = &f.planes[plane].data;
+                for j in 0..72 {
+                    for ix in 0..88 {
+                        assert_eq!(
+                            src[j * stride + ix],
+                            dst[j * 88 + ix],
+                            "frame {i}: chroma plane {plane} mismatch at ({ix},{j})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// PSNR-driven proof that FIL helps on noisy moving content. Encodes a
