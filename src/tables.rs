@@ -559,11 +559,48 @@ pub fn encode_cbp(cbp: u8) -> (u8, u32) {
     unreachable!("CBP_TABLE missing entry for cbp={cbp}");
 }
 
-/// Pre-shaped MTYPE VLCs by mode name. These are the subset we use for
-/// intra-only encoding. For full parity with the decoder's table we'd
-/// need all 10 rows, but the encoder currently only emits these three.
+/// Pre-shaped MTYPE VLCs by mode name. Encoder-side constants; the decoder
+/// uses [`MTYPE_TABLE`].
+///
+/// Each entry is `(bits, code)`. Codes are MSB-first per §4.1.
 pub const MTYPE_INTRA: (u8, u32) = (4, 0b0001);
 pub const MTYPE_INTRA_MQUANT: (u8, u32) = (7, 0b0000_001);
+/// `Inter` (no MC): 1-bit `1`. CBP + TCOEFF present, no MQUANT/MVD/FIL.
+pub const MTYPE_INTER: (u8, u32) = (1, 0b1);
+/// `Inter+MC` with CBP + TCOEFF present, no MQUANT/FIL.
+/// Code per Table 2/H.261: `0000 0001` (8 bits).
+pub const MTYPE_INTER_MC_CBP: (u8, u32) = (8, 0b0000_0001);
+/// `Inter+MC` without CBP/TCOEFF (MC-only, residual = 0).
+/// Code per Table 2/H.261: `0000 0000 1` (9 bits).
+pub const MTYPE_INTER_MC_ONLY: (u8, u32) = (9, 0b0000_0000_1);
+
+/// Look up the MVD VLC for a signed differential `d` in the symmetric
+/// range `-16..=16`. Returns `(bits, code)` ready to emit MSB-first.
+///
+/// Per Table 3/H.261 the codeword represents a *pair* `a & b` with
+/// `b = a ± 32`. The encoder is expected to choose `a` such that the
+/// reconstructed motion vector is in the legal `-15..=15` range; the
+/// decoder picks whichever of the pair keeps it in range. For our
+/// integer-pel ±15 search the picked differential `d = mv_new - mv_pred`
+/// is always in `-30..=30`. Whenever `|d| <= 16` we emit `a = d` directly;
+/// for `|d| > 16` we emit the codeword whose `b` representative equals `d`
+/// (i.e. `a = d - 32` for `d > 16` and `a = d + 32` for `d < -16`).
+pub fn encode_mvd(d: i32) -> (u8, u32) {
+    debug_assert!(
+        (-30..=30).contains(&d),
+        "MVD differential out of range: {d}"
+    );
+    // Search for an entry whose `a` or `b` representative equals `d`. The
+    // table has 32 entries and exactly one of `a`/`b` is `d` for any
+    // `d` in `-30..=30` (the union of `a-31..=15` ∪ `b` values covers
+    // the full ±31 range, with `d=0` using the unique `a=0` entry).
+    for e in MVD_TABLE {
+        if e.value.a as i32 == d || e.value.b as i32 == d {
+            return (e.bits, e.code);
+        }
+    }
+    unreachable!("MVD_TABLE missing entry for d={d}");
+}
 
 /// Canonical (prefix_bits, prefix_code, run, abs_level) table for every
 /// entry in Table 5/H.261 *except* EOB, (0,1), and Escape (those three are

@@ -12,6 +12,23 @@ use std::process::{Command, Stdio};
 use oxideav_h261::encoder::{encode_intra_picture, H261Encoder};
 use oxideav_h261::picture::SourceFormat;
 
+fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    if a.is_empty() {
+        return f64::INFINITY;
+    }
+    let mut sse = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let d = *x as f64 - *y as f64;
+        sse += d * d;
+    }
+    let mse = sse / a.len() as f64;
+    if mse <= 0.0 {
+        return f64::INFINITY;
+    }
+    10.0 * (255.0f64 * 255.0 / mse).log10()
+}
+
 fn have_ffmpeg() -> bool {
     Command::new("ffmpeg")
         .arg("-version")
@@ -226,4 +243,118 @@ fn ffmpeg_decodes_our_qcif_ipp_sequence() {
             "frame {i}: mean Y error {mean_err:.2} too large"
         );
     }
+}
+
+/// Build a translating QCIF source — a pattern of vertical stripes that
+/// scrolls horizontally one pel per frame for `n_frames` frames. Returns
+/// `(y_planes, cb_planes, cr_planes)` per-frame.
+fn translating_qcif(n_frames: usize) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let w = 176usize;
+    let h = 144usize;
+    let mut frames = Vec::with_capacity(n_frames);
+    for f in 0..n_frames {
+        let mut y = vec![0u8; w * h];
+        let shift = f as i32 * 2; // 2 pels/frame — well within ±15.
+        for j in 0..h {
+            for i in 0..w {
+                let xi = (i as i32 - shift).rem_euclid(w as i32);
+                // Stripe pattern with diagonal modulation — inseparable
+                // gradient so the encoder must use MC.
+                let stripe = if (xi / 8) % 2 == 0 { 60 } else { 200 };
+                let diag = (xi + j as i32) % 32;
+                y[j * w + i] = (stripe + diag).clamp(0, 255) as u8;
+            }
+        }
+        let cb = vec![128u8; (w / 2) * (h / 2)];
+        let cr = vec![128u8; (w / 2) * (h / 2)];
+        frames.push((y, cb, cr));
+    }
+    frames
+}
+
+/// End-to-end test of motion-compensated P-pictures: encode a 4-frame
+/// translating fixture, hand the bitstream to ffmpeg, and verify each
+/// decoded frame matches the source within a tight PSNR bound. Without MC
+/// the stripes would mispredict catastrophically; with MC the encoder
+/// should track the 2-pel/frame translation and decode at >=27 dB Y PSNR.
+#[test]
+fn ffmpeg_decodes_our_qcif_translating_sequence() {
+    if !have_ffmpeg() {
+        eprintln!("ffmpeg not on PATH — skipping");
+        return;
+    }
+    let frames = translating_qcif(4);
+
+    let mut enc = H261Encoder::new(SourceFormat::Qcif, 8);
+    let mut stream = Vec::new();
+    let mut sizes = Vec::new();
+    for (y, cb, cr) in &frames {
+        let p = enc.encode_frame(y, 176, cb, 88, cr, 88).expect("encode");
+        sizes.push(p.len());
+        stream.extend_from_slice(&p);
+    }
+
+    let dir = tmpdir();
+    let es_path = dir.join("scroll.h261");
+    let yuv_path = dir.join("scroll.yuv");
+    std::fs::write(&es_path, &stream).unwrap();
+
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "h261",
+            "-i",
+        ])
+        .arg(&es_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(
+        status.success(),
+        "ffmpeg failed to decode our scrolling H.261"
+    );
+
+    let decoded = std::fs::read(&yuv_path).expect("read yuv");
+    let frame_size = 176 * 144 * 3 / 2;
+    assert!(
+        decoded.len() >= frames.len() * frame_size,
+        "ffmpeg produced too few bytes: {}",
+        decoded.len()
+    );
+
+    // Each decoded frame's Y plane should match its source closely.
+    let mut psnrs = Vec::new();
+    for (i, (y, _, _)) in frames.iter().enumerate() {
+        let y_out = &decoded[i * frame_size..i * frame_size + 176 * 144];
+        let p = psnr(y, y_out);
+        psnrs.push(p);
+    }
+    // I-frame should always be high.
+    assert!(
+        psnrs[0] >= 27.0,
+        "I-frame PSNR {:.2} too low (PSNRs={psnrs:?} sizes={sizes:?})",
+        psnrs[0]
+    );
+    // P-frames track the 2-pel/frame translation through the MC machinery.
+    // 27 dB means ffmpeg is reconstructing the moved pels with high
+    // fidelity; a non-MC encoder would drop into the teens.
+    for i in 1..psnrs.len() {
+        assert!(
+            psnrs[i] >= 27.0,
+            "P-frame {i} PSNR {:.2} too low (PSNRs={psnrs:?} sizes={sizes:?})",
+            psnrs[i]
+        );
+    }
+    // Sanity: the I-frame should be the largest; subsequent P-frames smaller.
+    assert!(
+        sizes[1] < sizes[0],
+        "P-frame {} should be smaller than I-frame {} (sizes={sizes:?})",
+        sizes[1],
+        sizes[0]
+    );
 }
