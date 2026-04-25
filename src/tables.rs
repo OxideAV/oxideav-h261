@@ -573,6 +573,13 @@ pub const MTYPE_INTER_MC_CBP: (u8, u32) = (8, 0b0000_0001);
 /// `Inter+MC` without CBP/TCOEFF (MC-only, residual = 0).
 /// Code per Table 2/H.261: `0000 0000 1` (9 bits).
 pub const MTYPE_INTER_MC_ONLY: (u8, u32) = (9, 0b0000_0000_1);
+/// `Inter+MC+FIL` without CBP/TCOEFF (MC-only, residual = 0, loop filter on).
+/// Code per Table 2/H.261: `001` (3 bits). Per Table 2 Note 2 the MV may be
+/// zero (filter applied to a non-motion-compensated MB).
+pub const MTYPE_INTER_MC_FIL_ONLY: (u8, u32) = (3, 0b001);
+/// `Inter+MC+FIL` with CBP+TCOEFF (residual coded, loop filter on).
+/// Code per Table 2/H.261: `01` (2 bits).
+pub const MTYPE_INTER_MC_FIL_CBP: (u8, u32) = (2, 0b01);
 
 /// Look up the MVD VLC for a signed differential `d` in the symmetric
 /// range `-16..=16`. Returns `(bits, code)` ready to emit MSB-first.

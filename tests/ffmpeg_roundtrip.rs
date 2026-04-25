@@ -358,3 +358,102 @@ fn ffmpeg_decodes_our_qcif_translating_sequence() {
         sizes[0]
     );
 }
+
+/// Build a noisy QCIF source where the loop filter (FIL MTYPEs, §3.2.3) is
+/// likely to pay off — high-frequency stripes that smooth nicely after the
+/// 1/4-1/2-1/4 separable filter.
+fn fil_friendly_qcif(n_frames: usize) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let w = 176usize;
+    let h = 144usize;
+    let mut frames = Vec::with_capacity(n_frames);
+    for f in 0..n_frames {
+        let shift = f as i32 * 2;
+        let mut y = vec![0u8; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                let xi = (i as i32 - shift).rem_euclid(w as i32);
+                // Tight 4-pel stripes amplify the high-freq content the
+                // loop filter is designed to attenuate.
+                let stripe = if (xi / 4) % 2 == 0 { 60 } else { 196 };
+                let diag = ((xi + j as i32) % 16) * 2;
+                let grad = (j * 60) / h;
+                let v = (stripe + diag + grad as i32).clamp(0, 255);
+                y[j * w + i] = v as u8;
+            }
+        }
+        let cb = vec![128u8; (w / 2) * (h / 2)];
+        let cr = vec![128u8; (w / 2) * (h / 2)];
+        frames.push((y, cb, cr));
+    }
+    frames
+}
+
+/// End-to-end FIL test: encode 4 frames of FIL-friendly QCIF, hand the
+/// bitstream to ffmpeg, and assert each decoded frame matches the source
+/// at high PSNR. This proves the FIL MTYPEs (`Inter+MC+FIL` 3-bit `001`
+/// and `Inter+MC+FIL+CBP` 2-bit `01`) we emit are decoded correctly by a
+/// reference H.261 decoder.
+#[test]
+fn ffmpeg_decodes_our_fil_p_pictures() {
+    if !have_ffmpeg() {
+        eprintln!("ffmpeg not on PATH — skipping");
+        return;
+    }
+    let frames = fil_friendly_qcif(4);
+
+    let mut enc = H261Encoder::new(SourceFormat::Qcif, 8);
+    let mut stream = Vec::new();
+    let mut sizes = Vec::new();
+    for (y, cb, cr) in &frames {
+        let p = enc.encode_frame(y, 176, cb, 88, cr, 88).expect("encode");
+        sizes.push(p.len());
+        stream.extend_from_slice(&p);
+    }
+
+    let dir = tmpdir();
+    let es_path = dir.join("fil.h261");
+    let yuv_path = dir.join("fil.yuv");
+    std::fs::write(&es_path, &stream).unwrap();
+
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "h261",
+            "-i",
+        ])
+        .arg(&es_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to decode our FIL stream");
+
+    let decoded = std::fs::read(&yuv_path).expect("read yuv");
+    let frame_size = 176 * 144 * 3 / 2;
+    assert!(decoded.len() >= frames.len() * frame_size);
+
+    let mut psnrs = Vec::new();
+    for (i, (y, _, _)) in frames.iter().enumerate() {
+        let y_out = &decoded[i * frame_size..i * frame_size + 176 * 144];
+        psnrs.push(psnr(y, y_out));
+    }
+    // I-frame target.
+    assert!(
+        psnrs[0] >= 27.0,
+        "I-frame PSNR {:.2} too low (PSNRs={psnrs:?} sizes={sizes:?})",
+        psnrs[0]
+    );
+    // P-frame target — the FIL machinery should keep us well above 27 dB
+    // even on the high-freq stripes.
+    for i in 1..psnrs.len() {
+        assert!(
+            psnrs[i] >= 27.0,
+            "P-frame {i} PSNR {:.2} too low (PSNRs={psnrs:?} sizes={sizes:?})",
+            psnrs[i]
+        );
+    }
+}

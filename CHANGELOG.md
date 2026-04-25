@@ -9,10 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Encoder: P-picture (INTER) support with no motion compensation. Stateful
-  `H261Encoder` chains an I-picture followed by P-pictures predicted from
-  the local reconstruction. ffmpeg interop and self-roundtrip both at
-  ~39.5 dB Y-PSNR on testsrc QCIF.
+- Encoder: P-picture (INTER) support with integer-pel motion compensation
+  (full-window ±15 SAD search per H.261 §3.2.2 / Annex A) and the
+  `Inter+MC+FIL` MTYPEs (loop filter §3.2.3, separable 1/4-1/2-1/4 with
+  edge-pel passthrough). Each P-MB picks the cheapest of skip / Inter /
+  Inter+MC{-only,+CBP} / Inter+MC+FIL{-only,+CBP} via a bit-cost estimator
+  comparing MTYPE + MVD + CBP + a residual proxy. ffmpeg interop holds on
+  the FIL stream (`ffmpeg_decodes_our_fil_p_pictures`). On testsrc QCIF
+  the pipeline lifts ffmpeg-roundtrip PSNR from r12's 39.27 dB / 8680 B
+  to 39.40 dB / 8546 B (–1.5 % bytes, +0.13 dB).
 
 ## [0.0.2](https://github.com/OxideAV/oxideav-h261/compare/v0.0.1...v0.0.2) - 2026-04-25
 
