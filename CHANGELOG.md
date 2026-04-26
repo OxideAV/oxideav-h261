@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-h261/compare/v0.0.2...v0.0.3) - 2026-04-26
+
+### Other
+
+- adopt slim VideoFrame/AudioFrame shape
+- investigate r5/r6 long-clip drift, prove no IDCT precision loss
+- fix chained-P decoder bug at GOB end, add MQUANT-delta rate ctrl
+- add FIL (loop filter) MTYPEs to P-picture mode decision
+- integer-pel motion estimation + MC for P-pictures
+- add P-picture (INTER, no MC) Baseline encoder
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - Encoder: P-picture (INTER) support with integer-pel motion compensation
