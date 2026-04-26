@@ -1527,8 +1527,9 @@ mod tests {
             .expect("encode");
         assert!(!bytes.is_empty());
         let vf = decode_one(bytes);
-        assert_eq!(vf.width, 176);
-        assert_eq!(vf.height, 144);
+        // Stream-level dimensions live on CodecParameters; verify shape via planes.
+        assert_eq!(vf.planes[0].stride, 176);
+        assert_eq!(vf.planes[0].data.len(), 176 * 144);
         let y_plane = &vf.planes[0].data;
         let mut max_err = 0i32;
         for &p in y_plane {
@@ -1556,8 +1557,9 @@ mod tests {
         let hdr = parse_picture_header(&mut br).expect("pic header");
         let pic = decode_picture_body(&mut br, &hdr, &bytes, None).expect("body");
         let vf = pic_to_video_frame(&pic, Some(0), TimeBase::new(1, 30_000));
-        assert_eq!(vf.width, 352);
-        assert_eq!(vf.height, 288);
+        // Stream-level dimensions live on CodecParameters; verify shape via planes.
+        assert_eq!(vf.planes[0].stride, 352);
+        assert_eq!(vf.planes[0].data.len(), 352 * 288);
         for &p in &vf.planes[0].data {
             assert!((p as i32 - 128).abs() <= 2, "Y pel {p} too far from 128");
         }

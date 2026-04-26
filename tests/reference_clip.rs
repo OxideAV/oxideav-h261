@@ -57,8 +57,8 @@ fn decode_all_frames(es_path: &str, w: u32, h: u32) -> usize {
     loop {
         match decoder.receive_frame() {
             Ok(Frame::Video(vf)) => {
-                assert_eq!(vf.width, w, "width");
-                assert_eq!(vf.height, h, "height");
+                // Stream-level dimensions live on CodecParameters; verify
+                // shape via plane strides + lengths instead.
                 assert_eq!(vf.planes.len(), 3, "should have YUV 4:2:0 planes");
                 assert_eq!(vf.planes[0].stride, w as usize);
                 assert_eq!(vf.planes[0].data.len(), (w * h) as usize);
