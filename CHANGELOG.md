@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DoS-protection wiring (oxideav-core 0.1.8 framework).**
+  `H261Decoder` now honours [`oxideav_core::DecoderLimits`] at two
+  layers, sub-task #85's second proof-of-concept after the h263 port.
+  * **Construction.** `make_decoder(params)` reads `params.limits()` and
+    forwards to the new `H261Decoder::with_limits(codec_id, limits)`
+    constructor; `H261Decoder::new(codec_id)` is a thin wrapper that
+    uses `DecoderLimits::default()` (32 k × 32 k pixels, 1 GiB / arena,
+    8 arenas in flight). `with_limits` builds an
+    `Arc<oxideav_core::arena::ArenaPool>` sized at
+    `limits.max_arenas_in_flight` slots × `min(limits.max_alloc_bytes_per_frame,
+    160 KiB)` per arena (the 160 KiB cap is the H.261 worst-case CIF I420
+    frame plus alignment headroom — no real H.261 picture allocates more
+    than this regardless of the caller's `max_alloc_bytes_per_frame`).
+    Per-arena alloc-count cap is `limits.max_alloc_count_per_frame`
+    (default 1M).
+  * **Header-parse cap.** `decode_one_picture` checks
+    `(width × height) <= limits.max_pixels_per_frame` immediately after
+    `parse_picture_header` returns the QCIF / CIF dimensions and surfaces
+    a tighter-than-format mismatch as `Error::InvalidData` (NOT
+    `ResourceExhausted` — H.261's source format is fixed by a single
+    PTYPE bit, so the bitstream cannot declare an arbitrary size; a
+    failure here means "this codec's intrinsic frame size doesn't fit in
+    the caller's caps").
+  * **Arena pool.** Each picture decode leases one arena from the pool,
+    builds an `oxideav_core::arena::Frame` (refcounted handle to the
+    leased buffer + per-plane offset/length pairs + a `FrameHeader`),
+    materialises a `VideoFrame` from it for the public `Frame::Video`
+    enum, then drops the arena handle to return its buffer to the pool.
+    Pool exhaustion (every slot checked out) surfaces as
+    `Error::ResourceExhausted` from the lease call, which propagates up
+    through `decode_one_picture` and out of `send_packet` / `flush`.
+  * **Send-boundary trade-off.** The `oxideav_core::Decoder` trait
+    requires `Send`, but the new `oxideav_core::arena::Frame` is
+    `Rc<FrameInner>` and therefore `!Send`. The `Frame::Video(VideoFrame)`
+    enum returned by `Decoder::receive_frame` stays heap-backed so
+    downstream consumers (oxideav-pipeline, oxideplay, etc.) keep the
+    same shape — the arena `Frame` is a transient internal value that
+    backs each picture's allocation. When the workspace gains an
+    `Arc<FrameInner>` parallel-decoder variant the public API can be
+    migrated without disturbing this crate's pool wiring (the wiring
+    lives entirely inside `decode_one_picture`).
+  * **Public test surface.** `H261Decoder` exposes `limits()` and
+    `arena_pool() -> &Arc<ArenaPool>` for diagnostics and pool-aware
+    tests. Five new tests in `tests/dos_limits.rs`:
+    * `picture_header_too_large_returns_invalid_data` — QCIF header
+      against a 99×99 pixel cap → `InvalidData` mentioning
+      `max_pixels_per_frame`.
+    * `picture_header_within_cap_decodes_normally` — same QCIF header
+      against a 1024×1024 cap doesn't trip the dimension check.
+    * `pool_exhaustion_returns_resource_exhausted` — pool sized at 2,
+      third concurrent lease → `ResourceExhausted`.
+    * `default_limits_admit_qcif_and_cif` — sanity that the default
+      32 k × 32 k cap admits CIF.
+    * `pool_buffer_returns_after_decode` — pool sized at 1, lease/drop/
+      re-lease cycle works.
+  * Encoder is unchanged (no DoS surface — it consumes caller-owned
+    `VideoFrame`s and produces compressed packets).
 - Encoder: P-picture (INTER) support with integer-pel motion compensation
   (full-window ±15 SAD search per H.261 §3.2.2 / Annex A) and the
   `Inter+MC+FIL` MTYPEs (loop filter §3.2.3, separable 1/4-1/2-1/4 with
