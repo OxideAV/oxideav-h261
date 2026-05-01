@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`receive_arena_frame()` — zero-copy decode path.**
+  Overrides the new `oxideav_core::Decoder::receive_arena_frame()`
+  method (added in oxideav-core 0.2.0) to return an arena-backed
+  `oxideav_core::arena::sync::Frame` directly, skipping the per-plane
+  memcpy that the legacy `receive_frame() -> Frame::Video(VideoFrame)`
+  path requires for `Send`. Internal queueing was reorganised so the
+  arena lease happens at drain time rather than decode time:
+  decoded `Picture`s are queued raw and converted to either a
+  heap-backed `VideoFrame` (legacy path) or an arena `Frame` (new
+  path) on demand. This keeps the pool short-lived — pool
+  exhaustion in the typical send-many-then-drain pattern is no
+  longer possible because the pool only holds slots for the
+  duration of frames the caller has explicitly drained via
+  `receive_arena_frame`.
+
+### Changed
+
+- **Bumped `oxideav-core` dep from `0.1` to `0.2`** to pick up the
+  new `Decoder::receive_arena_frame` trait method (additive; default
+  impl preserves backwards compatibility for every other
+  `oxideav-h261` consumer).
+
 - **DoS-protection wiring (oxideav-core 0.1.8 framework).**
   `H261Decoder` now honours [`oxideav_core::DecoderLimits`] at two
   layers, sub-task #85's second proof-of-concept after the h263 port.

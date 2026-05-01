@@ -46,6 +46,7 @@ use crate::tables::{
 };
 
 /// Reconstructed H.261 picture: three pel planes (Y, Cb, Cr), stride = MB-aligned width.
+#[derive(Clone)]
 pub struct Picture {
     pub width: usize,
     pub height: usize,

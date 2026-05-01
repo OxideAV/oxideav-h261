@@ -3,7 +3,7 @@
 //!
 //! The decoder buffers incoming packets until a complete coded picture is
 //! identified by a pair of PSCs (or PSC + EOF). Each picture produces one
-//! `VideoFrame` of YUV 4:2:0 pels in an `oxideav_core::Frame::Video`.
+//! arena-backed [`oxideav_core::arena::sync::Frame`] of YUV 4:2:0 pels.
 //!
 //! H.261 has no explicit end-of-sequence marker — on flush we drain whatever
 //! is still buffered.
@@ -11,19 +11,21 @@
 //! # DoS protection
 //!
 //! Per [`oxideav_core::DecoderLimits`], the decoder owns an
-//! [`oxideav_core::arena::ArenaPool`] sized at construction. Each picture
-//! decode leases one arena, builds an [`oxideav_core::arena::Frame`]
-//! pinned to the leased buffer, materialises a [`VideoFrame`] from it
-//! for the public [`oxideav_core::Frame`] enum (which is `Send`; the
-//! arena `Frame` is `Rc`-backed so `!Send`), then drops the arena
-//! handle to return the buffer to the pool.
+//! [`oxideav_core::arena::sync::ArenaPool`] sized at construction.
+//! Each picture decode leases one arena, copies the YUV planes in,
+//! and freezes it into a [`oxideav_core::arena::sync::Frame`].
 //!
-//! The arena `Frame` is currently a transient internal value rather
-//! than the API surface — round 1 keeps the `Decoder` trait's
-//! `receive_frame -> Frame` enum signature compatible with downstream
-//! consumers. When the workspace gains an `Arc`-backed parallel-decoder
-//! variant, the public API can be migrated without disturbing this
-//! crate's pool wiring.
+//! Two surfaces consume that frame:
+//!
+//! - [`Decoder::receive_frame`] — for callers using the legacy
+//!   `Frame::Video(VideoFrame)` enum: the arena frame is materialised
+//!   into a heap-backed `VideoFrame` (one `to_vec()` per plane) and
+//!   the arena handle is dropped, returning its buffer to the pool.
+//!
+//! - [`Decoder::receive_arena_frame`] — for callers that want true
+//!   zero-copy: the arena frame is returned **directly**, with no
+//!   per-plane memcpy. The arena buffer stays out of the pool until
+//!   the last `Arc` clone of the returned `Frame` drops.
 //!
 //! Header parse honours [`DecoderLimits::max_pixels_per_frame`]; the
 //! arena pool honours [`DecoderLimits::max_arenas_in_flight`] /
@@ -33,7 +35,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use oxideav_core::arena::{ArenaPool, FrameHeader, FrameInner};
+use oxideav_core::arena::sync::{ArenaPool, FrameHeader, FrameInner};
 use oxideav_core::bits::BitReader;
 use oxideav_core::format::PixelFormat;
 use oxideav_core::frame::VideoPlane;
@@ -59,7 +61,19 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 pub struct H261Decoder {
     codec_id: CodecId,
     buffer: Vec<u8>,
-    ready_frames: VecDeque<VideoFrame>,
+    /// Decoded pictures awaiting `receive_frame` / `receive_arena_frame`.
+    /// Stored as raw `Picture`s (the codec's internal YUV-plane
+    /// representation) plus the pts the picture was tagged with. Each
+    /// drain materialises one of two output forms on demand:
+    /// `receive_frame` builds a heap-backed `VideoFrame` (no arena
+    /// involved); `receive_arena_frame` leases an arena from the pool
+    /// and builds an `arena::sync::Frame` whose plane bytes live
+    /// inside the leased buffer. This keeps the arena pool
+    /// short-lived (one slot held for at most the time between
+    /// `receive_arena_frame` and the caller dropping the last `Arc`
+    /// clone) so `send_packet` calls that decode multiple pictures
+    /// before the consumer drains don't exhaust the pool.
+    ready_frames: VecDeque<(Picture, Option<i64>)>,
     pending_pts: Option<i64>,
     pending_tb: TimeBase,
     eof: bool,
@@ -68,10 +82,11 @@ pub struct H261Decoder {
     reference: Option<Picture>,
     /// DoS-protection caps applied at header-parse and arena-lease time.
     limits: DecoderLimits,
-    /// Arena pool sized from `limits`. One arena is leased per decoded
-    /// picture and dropped at the end of the same `decode_one_picture`
-    /// call — its buffer returns to the pool immediately. Pool exhaustion
-    /// surfaces as [`Error::ResourceExhausted`].
+    /// Arena pool sized from `limits`. An arena is leased only when
+    /// `receive_arena_frame` is called, and held alive inside the
+    /// returned `arena::sync::Frame` until the last clone is dropped.
+    /// Pool exhaustion surfaces as [`Error::ResourceExhausted`] —
+    /// natural backpressure for a slow downstream consumer.
     pool: Arc<ArenaPool>,
 }
 
@@ -179,36 +194,30 @@ impl H261Decoder {
             )));
         }
         let pic = decode_picture_body(&mut br, &hdr, bytes, self.reference.as_ref())?;
-        // Lease one arena from the pool, build an `arena::Frame` pinned
-        // to the leased buffer, then materialise a `VideoFrame` from it
-        // for the public `Frame` enum (which is `Send`; the arena Frame
-        // is `Rc`-backed so `!Send`). The arena handle is dropped at end
-        // of scope, returning its buffer to the pool. Pool exhaustion
-        // surfaces as `Error::ResourceExhausted`.
-        let arena_frame = build_arena_frame(&self.pool, &pic, self.pending_pts)?;
-        let frame = arena_frame_to_video_frame(&arena_frame, self.pending_pts);
-        // Drop the arena Frame — its single Rc clone goes away here, the
-        // arena is dropped, and the buffer returns to the pool.
-        drop(arena_frame);
+        // Queue the raw decoded `Picture` for later draining. Arena
+        // leasing happens at `receive_arena_frame` time so the pool
+        // doesn't sit checked out across multiple decoded pictures
+        // when the caller drives the decoder send-many-then-drain
+        // (typical for ffmpeg-style elementary-stream tests).
+        self.ready_frames.push_back((pic.clone(), self.pending_pts));
         self.reference = Some(pic);
-        self.ready_frames.push_back(frame);
         Ok(())
     }
 }
 
-/// Build an arena-backed [`oxideav_core::arena::Frame`] from a decoded
-/// `Picture` by leasing one arena from `pool` and copying the three
-/// I420 planes into it. Returns [`Error::ResourceExhausted`] if the
-/// pool has no free slots.
+/// Build an arena-backed [`oxideav_core::arena::sync::Frame`] from a
+/// decoded `Picture` by leasing one arena from `pool` and copying the
+/// three I420 planes into it. Returns [`Error::ResourceExhausted`] if
+/// the pool has no free slots.
 ///
-/// The returned `Frame` keeps the arena alive via its single `Rc<FrameInner>`
-/// owner; drop the `Frame` (and any clones) to return the buffer to the
-/// pool.
+/// The returned `Frame` keeps the arena alive via its single
+/// `Arc<FrameInner>` owner; drop the `Frame` (and any clones) to
+/// return the buffer to the pool.
 fn build_arena_frame(
     pool: &Arc<ArenaPool>,
     pic: &Picture,
     pts: Option<i64>,
-) -> Result<oxideav_core::arena::Frame> {
+) -> Result<oxideav_core::arena::sync::Frame> {
     let arena = pool.lease()?;
     let w = pic.width;
     let h = pic.height;
@@ -243,39 +252,6 @@ fn build_arena_frame(
         &[(y_off, y_len), (cb_off, cb_len), (cr_off, cr_len)],
         header,
     )
-}
-
-/// Copy the three I420 planes out of an arena-backed `Frame` into a
-/// heap-allocated `VideoFrame` for the public `Frame` enum.
-///
-/// Round 1 keeps the public `Decoder::receive_frame -> Frame` enum
-/// signature compatible with downstream consumers — see the module
-/// docs for the rationale (the arena `Frame` is `!Send`, while
-/// `trait Decoder: Send` and `Frame::Video(VideoFrame)` is `Send`).
-fn arena_frame_to_video_frame(af: &oxideav_core::arena::Frame, pts: Option<i64>) -> VideoFrame {
-    let hdr = af.header();
-    let w = hdr.width as usize;
-    let cw = (hdr.width as usize).div_ceil(2);
-    let y_plane = af.plane(0).expect("plane 0 (Y) must exist");
-    let cb_plane = af.plane(1).expect("plane 1 (Cb) must exist");
-    let cr_plane = af.plane(2).expect("plane 2 (Cr) must exist");
-    VideoFrame {
-        pts,
-        planes: vec![
-            VideoPlane {
-                stride: w,
-                data: y_plane.to_vec(),
-            },
-            VideoPlane {
-                stride: cw,
-                data: cb_plane.to_vec(),
-            },
-            VideoPlane {
-                stride: cw,
-                data: cr_plane.to_vec(),
-            },
-        ],
-    }
 }
 
 /// Decode the body of a picture (everything after the picture header).
@@ -494,8 +470,29 @@ impl Decoder for H261Decoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(f) = self.ready_frames.pop_front() {
-            return Ok(Frame::Video(f));
+        if let Some((pic, pts)) = self.ready_frames.pop_front() {
+            // Build a heap-backed VideoFrame from the picture (the
+            // legacy `Frame::Video` API). No arena pool involved —
+            // straight Picture → Vec<u8> per plane.
+            let video = pic_to_video_frame(&pic, pts, self.pending_tb);
+            return Ok(Frame::Video(video));
+        }
+        if self.eof {
+            Err(Error::Eof)
+        } else {
+            Err(Error::NeedMore)
+        }
+    }
+
+    fn receive_arena_frame(&mut self) -> Result<oxideav_core::arena::sync::Frame> {
+        if let Some((pic, pts)) = self.ready_frames.pop_front() {
+            // Lease one arena from the pool, copy the YUV planes in,
+            // and freeze it into an `arena::sync::Frame`. The arena
+            // slot stays checked out until the caller drops the last
+            // `Arc` clone of the returned frame; pool exhaustion
+            // surfaces as `Error::ResourceExhausted` (natural
+            // backpressure).
+            return build_arena_frame(&self.pool, &pic, pts);
         }
         if self.eof {
             Err(Error::Eof)
