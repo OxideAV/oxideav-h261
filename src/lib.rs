@@ -42,7 +42,7 @@ pub mod start_code;
 pub mod tables;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
-use oxideav_core::{CodecInfo, CodecRegistry};
+use oxideav_core::{CodecInfo, CodecRegistry, RuntimeContext};
 
 /// The canonical oxideav codec id for ITU-T H.261 video.
 ///
@@ -51,7 +51,7 @@ use oxideav_core::{CodecInfo, CodecRegistry};
 pub const CODEC_ID_STR: &str = "h261";
 
 /// Register the H.261 decoder with a codec registry.
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("h261_sw")
         .with_lossy(true)
         .with_intra_only(false)
@@ -62,4 +62,32 @@ pub fn register(reg: &mut CodecRegistry) {
             .decoder(decoder::make_decoder)
             .tags([CodecTag::fourcc(b"H261"), CodecTag::fourcc(b"h261")]),
     );
+}
+
+/// Unified registration entry point: install the H.261 codec factories
+/// into the codec sub-registry of a [`RuntimeContext`].
+///
+/// This is the preferred entry point for new code — it matches the
+/// convention every sibling crate now follows. Direct callers that need
+/// only the codec sub-registry can keep using [`register_codecs`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+    use oxideav_core::{CodecId, CodecParameters, RuntimeContext};
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let dec = ctx
+            .codecs
+            .make_decoder(&params)
+            .expect("h261 decoder factory");
+        assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
+    }
 }
