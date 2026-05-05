@@ -1,4 +1,4 @@
-//! Pure-Rust ITU-T H.261 video decoder.
+//! Pure-Rust ITU-T H.261 video codec (decoder + encoder).
 //!
 //! Scope (ITU-T Rec. H.261 03/93):
 //! * Picture header — PSC (20 bits: `0000 0000 0000 0001 0000`), TR (5),
@@ -15,11 +15,12 @@
 //! * Loop filter (FIL bit of MTYPE) — separable 1/4, 1/2, 1/4 filter, §3.2.3.
 //! * Output is YUV 4:2:0 in an `oxideav_core::VideoFrame`. Two picture sizes:
 //!   QCIF 176x144 and CIF 352x288.
+//! * Encoder: I + P pictures, integer-pel MC (spiral+diamond ME), per-GOB
+//!   MQUANT rate control, FIL loop-filter RDO, full §4.2.3.4 MV-pred.
 //!
 //! Out of scope:
 //! * BCH (511,493) forward error correction framing (§5.4) — decoder is fed
 //!   already-extracted video bitstream.
-//! * Encoder — decode-only for now.
 //!
 //! No runtime dependencies beyond `oxideav-core`, `oxideav-codec`, and
 //! `oxideav-pixfmt`.
@@ -50,7 +51,7 @@ use oxideav_core::{CodecInfo, CodecRegistry, RuntimeContext};
 /// probe to it as well.
 pub const CODEC_ID_STR: &str = "h261";
 
-/// Register the H.261 decoder with a codec registry.
+/// Register the H.261 decoder and encoder with a codec registry.
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("h261_sw")
         .with_lossy(true)
@@ -60,6 +61,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(decoder::make_decoder)
+            .encoder(encoder::make_encoder)
             .tags([CodecTag::fourcc(b"H261"), CodecTag::fourcc(b"h261")]),
     );
 }
@@ -96,5 +98,64 @@ mod register_tests {
             .first_decoder(&params)
             .expect("h261 decoder factory");
         assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
+    }
+
+    #[test]
+    fn register_via_runtime_context_installs_encoder_factory() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let enc = ctx
+            .codecs
+            .first_encoder(&params)
+            .expect("h261 encoder factory");
+        assert_eq!(enc.codec_id().as_str(), CODEC_ID_STR);
+    }
+
+    #[test]
+    fn encoder_factory_qcif_defaults() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(176);
+        params.height = Some(144);
+        let enc = ctx
+            .codecs
+            .first_encoder(&params)
+            .expect("h261 encoder factory qcif");
+        assert_eq!(enc.codec_id().as_str(), CODEC_ID_STR);
+        let out = enc.output_params();
+        assert_eq!(out.width, Some(176));
+        assert_eq!(out.height, Some(144));
+    }
+
+    #[test]
+    fn encoder_factory_cif() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(352);
+        params.height = Some(288);
+        let enc = ctx
+            .codecs
+            .first_encoder(&params)
+            .expect("h261 encoder factory cif");
+        assert_eq!(enc.codec_id().as_str(), CODEC_ID_STR);
+        let out = enc.output_params();
+        assert_eq!(out.width, Some(352));
+        assert_eq!(out.height, Some(288));
+    }
+
+    #[test]
+    fn encoder_factory_rejects_bad_dimensions() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(320);
+        params.height = Some(240);
+        assert!(
+            ctx.codecs.first_encoder(&params).is_err(),
+            "should reject 320x240"
+        );
     }
 }

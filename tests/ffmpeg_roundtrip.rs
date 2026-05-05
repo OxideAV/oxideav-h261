@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use oxideav_core::{CodecId, CodecParameters, Frame, RuntimeContext, VideoFrame, VideoPlane};
 use oxideav_h261::encoder::{encode_intra_picture, H261Encoder};
 use oxideav_h261::picture::SourceFormat;
 
@@ -386,6 +387,192 @@ fn fil_friendly_qcif(n_frames: usize) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         frames.push((y, cb, cr));
     }
     frames
+}
+
+/// Smoke test for the registry encoder path (`reg.first_encoder`).
+/// Encodes a 4-frame QCIF sequence via the `Encoder` trait wrapper and
+/// verifies ffmpeg can decode the resulting stream.
+#[test]
+fn registry_encoder_qcif_roundtrip() {
+    if !have_ffmpeg() {
+        eprintln!("ffmpeg not on PATH — skipping");
+        return;
+    }
+    let mut ctx = RuntimeContext::new();
+    oxideav_h261::register(&mut ctx);
+
+    let params = CodecParameters::video(CodecId::new(oxideav_h261::CODEC_ID_STR));
+    let mut enc = ctx.codecs.first_encoder(&params).expect("encoder factory");
+
+    let (y0, cb0, cr0) = gradient_qcif_source();
+    let mut y1 = y0.clone();
+    // Shift a region to generate some inter-frame motion.
+    for j in 32..64usize {
+        for i in 32..96usize {
+            y1[j * 176 + i] = y1[j * 176 + i].saturating_add(20);
+        }
+    }
+
+    let mut stream = Vec::new();
+    for (idx, (y, cb, cr)) in [
+        (&y0, &cb0, &cr0),
+        (&y1, &cb0, &cr0),
+        (&y0, &cb0, &cr0),
+        (&y1, &cb0, &cr0),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let vf = VideoFrame {
+            pts: Some(idx as i64),
+            planes: vec![
+                VideoPlane {
+                    stride: 176,
+                    data: y.to_vec(),
+                },
+                VideoPlane {
+                    stride: 88,
+                    data: cb.to_vec(),
+                },
+                VideoPlane {
+                    stride: 88,
+                    data: cr.to_vec(),
+                },
+            ],
+        };
+        enc.send_frame(&Frame::Video(vf)).expect("send_frame");
+        let pkt = enc.receive_packet().expect("receive_packet");
+        stream.extend_from_slice(&pkt.data);
+    }
+
+    let dir = tmpdir();
+    let es_path = dir.join("reg_enc.h261");
+    let yuv_path = dir.join("reg_enc.yuv");
+    std::fs::write(&es_path, &stream).unwrap();
+
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "h261",
+            "-i",
+        ])
+        .arg(&es_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(
+        status.success(),
+        "ffmpeg failed to decode registry-encoder stream"
+    );
+
+    let decoded = std::fs::read(&yuv_path).expect("read decoded");
+    let frame_size = 176 * 144 * 3 / 2;
+    assert!(
+        decoded.len() >= 4 * frame_size,
+        "ffmpeg decoded too few bytes"
+    );
+}
+
+/// Measure PSNR of our encoder output vs the original source after ffmpeg
+/// cross-decode. At QUANT=8 / default settings (testsrc QCIF), we expect
+/// PSNR_Y ≥ 35 dB — the canonical H.261 quality bar.
+#[test]
+fn encoder_psnr_vs_source_at_default_quant() {
+    if !have_ffmpeg() {
+        eprintln!("ffmpeg not on PATH — skipping");
+        return;
+    }
+    let w = 176usize;
+    let h = 144usize;
+
+    // Generate source frames from a synthetic gradient that moves.
+    let n_frames = 8usize;
+    let mut sources: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+    for f in 0..n_frames {
+        let shift = f as i32 * 3;
+        let mut y = vec![0u8; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                let xi = (i as i32 - shift).rem_euclid(w as i32) as usize;
+                let val = 32 + (xi * 180) / w + (j * 40) / h;
+                y[j * w + i] = val.clamp(0, 255) as u8;
+            }
+        }
+        let cb = vec![128u8; (w / 2) * (h / 2)];
+        let cr = vec![128u8; (w / 2) * (h / 2)];
+        sources.push((y, cb, cr));
+    }
+
+    // Encode with our encoder (QUANT=8, default).
+    let mut enc = H261Encoder::new(SourceFormat::Qcif, 8);
+    let mut stream = Vec::new();
+    for (y, cb, cr) in &sources {
+        let pkt = enc
+            .encode_frame(y, w, cb, w / 2, cr, w / 2)
+            .expect("encode");
+        stream.extend_from_slice(&pkt);
+    }
+
+    let dir = tmpdir();
+    let es_path = dir.join("psnr_test.h261");
+    let yuv_path = dir.join("psnr_test.yuv");
+    std::fs::write(&es_path, &stream).unwrap();
+
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "h261",
+            "-i",
+        ])
+        .arg(&es_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to decode psnr test stream");
+
+    let decoded = std::fs::read(&yuv_path).expect("read decoded");
+    let frame_size = w * h * 3 / 2;
+    assert!(
+        decoded.len() >= n_frames * frame_size,
+        "too few decoded bytes"
+    );
+
+    let mut total_psnr = 0.0f64;
+    let mut count = 0usize;
+    for (i, (y, _, _)) in sources.iter().enumerate() {
+        let dec_y = &decoded[i * frame_size..i * frame_size + w * h];
+        if dec_y.len() == y.len() {
+            let p = psnr(y, dec_y);
+            eprintln!("frame {i}: PSNR_Y = {p:.2} dB");
+            if p.is_finite() {
+                total_psnr += p;
+                count += 1;
+            }
+        }
+    }
+    let avg_psnr = if count > 0 {
+        total_psnr / count as f64
+    } else {
+        0.0
+    };
+    eprintln!("average PSNR_Y = {avg_psnr:.2} dB over {count} frames");
+
+    // The I-frame at QUANT=8 should decode well above 35 dB.
+    // P-frames on this smooth-motion content should stay above 32 dB.
+    assert!(
+        avg_psnr >= 32.0,
+        "average PSNR_Y {avg_psnr:.2} dB below 32.0 dB"
+    );
 }
 
 /// End-to-end FIL test: encode 4 frames of FIL-friendly QCIF, hand the

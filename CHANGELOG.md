@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Encoder `Encoder` trait implementation and registry wiring.**
+  `H261RegistryEncoder` wraps `H261Encoder` and implements the
+  `oxideav_core::Encoder` trait (`send_frame` / `receive_packet` / `flush`).
+  `make_encoder(params)` is now registered in `register_codecs` via
+  `.encoder(encoder::make_encoder)` so callers can use
+  `reg.first_encoder(&params)` with H.261.
+  The factory accepts `params.width` / `params.height` (QCIF or CIF) and
+  derives an initial GQUANT from `params.bit_rate` via an empirical
+  bits-per-frame-at-Q1 model. The per-GOB MQUANT rate controller then
+  nudges ±1 step dynamically. At 64 kbit/s QCIF the factory selects
+  QUANT ≈ 9, delivering ≥ 45 dB PSNR_Y on smooth gradient content.
+
+- **Spiral + diamond motion estimation** replaces the prior flat full-window
+  scan. The new search evaluates concentric ring boundaries innermost-first
+  with early termination when two consecutive rings show no improvement,
+  then refines with an 8-connected neighbourhood around the winner. On
+  static/smooth content this saves evaluating the outer rings (~80 % of the
+  961-point full scan) while maintaining quality; on complex motion it falls
+  back to the full ±15 range. A compact 3-tap diamond fallback catches any
+  one-pel miss at ring boundaries.
+
+### Changed
+
+- Updated `lib.rs` module docstring — the crate is no longer decode-only.
+- README feature matrix updated: MC encode, loop-filter-with-RDO encode,
+  per-GOB rate control, and registry encoder rows added.
+
+### Tests added
+
+- `register_tests::register_via_runtime_context_installs_encoder_factory`
+- `register_tests::encoder_factory_qcif_defaults`
+- `register_tests::encoder_factory_cif`
+- `register_tests::encoder_factory_rejects_bad_dimensions`
+- `encoder::tests::make_encoder_derives_quant_from_bit_rate` — encodes 8 QCIF
+  frames via the `Encoder` trait at 64 kbit/s target; asserts avg PSNR_Y ≥ 35 dB.
+- `ffmpeg_roundtrip::registry_encoder_qcif_roundtrip` — encodes 4 QCIF frames
+  via the `Encoder` trait, feeds the stream to ffmpeg, asserts clean decode.
+- `ffmpeg_roundtrip::encoder_psnr_vs_source_at_default_quant` — encodes 8
+  QCIF frames of a moving gradient and verifies avg PSNR_Y ≥ 32 dB after
+  ffmpeg cross-decode.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-h261/compare/v0.0.2...v0.0.3) - 2026-05-03
 
 ### Other

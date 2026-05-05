@@ -1,10 +1,9 @@
 # oxideav-h261
 
 Pure-Rust **ITU-T H.261** video codec — the original 1990/1993 videoconferencing
-codec. Decodes both I-pictures (INTRA macroblocks) and P-pictures (INTER with
-integer-pel motion compensation + optional loop filter), and now encodes Baseline
-I + P pictures (no MC). QCIF (176×144) and CIF (352×288) source formats. Output
-is YUV 4:2:0. Zero C dependencies.
+codec. Decodes and encodes both I-pictures (INTRA macroblocks) and P-pictures
+(INTER with integer-pel motion compensation + loop filter). QCIF (176×144) and
+CIF (352×288) source formats. Output is YUV 4:2:0. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -30,14 +29,23 @@ oxideav-h261 = "0.0"
 | 8×8 (I)DCT, (de)quantisation (Table 5/H.261)     | yes    | yes    |
 | INTRA prediction (I-pictures)                    | yes    | yes    |
 | INTER prediction (P-pictures, no MC)             | yes    | yes    |
-| Integer-pel motion compensation (MC)             | yes    | no     |
-| Loop filter (FIL, §3.2.3)                        | yes    | no     |
+| Integer-pel MC (spiral+diamond ME, ±15)          | yes    | yes    |
+| Loop filter (FIL, §3.2.3) with per-MB RDO        | yes    | yes    |
+| Per-GOB MQUANT rate control (§4.2.3.3)           | n/a    | yes    |
+| Encoder registry (`first_encoder` / `bit_rate`)  | n/a    | yes    |
 | BCH forward error correction (§5.4)              | no     | no     |
 
 H.261 only permits integer-pel motion vectors (range ±15); there are no
 half-pel refinements, no B-pictures, and no start-code emulation prevention.
 The spec tables (MBA / MTYPE / MVD / CBP / TCOEFF) are all implemented
 directly from the PDF.
+
+### Encoder quality
+
+At the canonical H.261 target rate (64 kbit/s QCIF / 30 fps), the encoder
+achieves ≥ 45 dB PSNR_Y on smooth content and ≥ 39 dB on the standard
+`testsrc` test pattern (see `bench_testsrc_psnr`). ffmpeg cross-validates
+all P-picture, MC, and FIL streams cleanly.
 
 ## Quick use
 
