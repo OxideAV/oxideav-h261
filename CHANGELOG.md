@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **BCH (511, 493) forward error correction framing (§5.4).** New
+  `oxideav_h261::bch` module wraps and unwraps the outer multiframe
+  FEC layer H.261 prescribes for noisy `p × 64 kbit/s` channels. The
+  module computes the 18-bit BCH parity over the 493-bit `Fi || data`
+  field via the spec generator polynomial
+  `g(x) = (x^9 + x^4 + 1)(x^9 + x^6 + x^4 + x^3 + 1)
+        = x^18 + x^15 + x^12 + x^10 + x^8 + x^7 + x^6 + x^3 + 1`
+  (`0x495C9` in 19-bit form), assembles 8-frame multiframes carrying
+  the alignment pattern `S1..S8 = 0 0 0 1 1 0 1 1`, and surfaces the
+  per-frame BCH syndrome as a corruption diagnostic.
+
+  - `parity18(data: &[u8]) -> u32` — long-division shift-register
+    implementation, 19-bit register XORed with `GEN_POLY` whenever
+    the bit-18 sentinel is set.
+  - `syndrome18(data, parity) -> u32` — zero means the codeword
+    matches `g(x)`, non-zero means at least one bit error.
+  - `encode_multiframe(coded, bits)` — packs an arbitrary
+    inner-bitstream payload into 512-byte multiframes, emitting
+    Fi=0 stuffing frames to round up to a multiframe boundary.
+  - `decode_multiframe(framed)` — requires 3 consecutive complete
+    alignment patterns (24 framing bits ≡ 3 multiframes) for lock
+    per §5.4.4; reports `corrupted_frames` (non-zero-syndrome count),
+    `fill_frames` (Fi=0 frames skipped), and the recovered inner data.
+
+  The BCH layer is transport-level — neither the public `H261Decoder`
+  nor the encoder change shape. Callers that need framed output for
+  a raw bit-serial link wrap their bytes; callers receiving a framed
+  stream (e.g. RFC 4587 §6.2 historical deployments) recover the
+  inner stream.
+
+### Tests added
+
+- `bch::tests::*` (12 unit tests in `src/bch.rs`):
+  - Generator polynomial factors `(0x211)*(0x259) == 0x495C9` over
+    GF(2).
+  - All-zero input ⇒ zero parity.
+  - All-ones 493-bit input round-trips through `parity18` /
+    `syndrome18` with zero residue.
+  - Single-bit flip in either data or parity is detected by the
+    syndrome.
+  - Round-trip across 1 / 3 / 6 whole multiframes plus a
+    < 1-multiframe payload that exercises the fill-frame path.
+  - Data corruption surfaces as `corrupted_frames >= 1` without
+    breaking lock.
+  - Lock acquired when the framed stream is preceded by 4 junk bits.
+  - All-ones noise input fails to obtain frame lock (no false
+    positive on alignment).
+- `tests/bch_e2e.rs` (3 integration tests):
+  - End-to-end QCIF I-picture encode → BCH wrap → BCH unwrap → H.261
+    decode round-trip, PSNR ≥ 32 dB.
+  - Single-bit error in the FEC payload is flagged via syndrome but
+    data is still passed through.
+  - Two concatenated pictures BCH-wrapped separately survive the
+    unwrap intact.
+
+### Changed
+
+- `lib.rs` module-docstring "Out of scope" entry for BCH §5.4 replaced
+  with the in-scope description (single-bit *correction* of corrupted
+  codewords is the only remaining out-of-scope item).
+- README feature matrix: `BCH forward error correction (§5.4)` row
+  flipped from `no / no` to `yes / yes`.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-h261/compare/v0.0.3...v0.0.4) - 2026-05-06
 
 ### Other

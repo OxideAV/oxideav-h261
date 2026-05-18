@@ -33,7 +33,7 @@ oxideav-h261 = "0.0"
 | Loop filter (FIL, §3.2.3) with per-MB RDO        | yes    | yes    |
 | Per-GOB MQUANT rate control (§4.2.3.3)           | n/a    | yes    |
 | Encoder registry (`first_encoder` / `bit_rate`)  | n/a    | yes    |
-| BCH forward error correction (§5.4)              | no     | no     |
+| BCH (511,493) FEC framing (§5.4)                 | yes    | yes    |
 
 H.261 only permits integer-pel motion vectors (range ±15); there are no
 half-pel refinements, no B-pictures, and no start-code emulation prevention.
@@ -46,6 +46,29 @@ At the canonical H.261 target rate (64 kbit/s QCIF / 30 fps), the encoder
 achieves ≥ 45 dB PSNR_Y on smooth content and ≥ 39 dB on the standard
 `testsrc` test pattern (see `bench_testsrc_psnr`). ffmpeg cross-validates
 all P-picture, MC, and FIL streams cleanly.
+
+### BCH (511,493) FEC framing (§5.4)
+
+The `bch` module wraps / unwraps the outer forward-error-correction layer
+that H.261 prescribes for noisy p × 64 kbit/s channels. The 8-frame
+multiframe carries a 1-bit framing bit `Si`, a 1-bit fill indicator `Fi`,
+492 bits of coded data, and 18 bits of BCH parity per frame (512 bits
+total). The parity is computed via the generator polynomial
+`g(x) = (x^9 + x^4 + 1)(x^9 + x^6 + x^4 + x^3 + 1)`. Frame lock requires
+three complete multiframes of `(00011011)` alignment-pattern bits per
+§5.4.4. Single-bit-error detection is wired through the per-frame
+syndrome and reported back to the caller; single-bit correction is left
+to the inner H.261 GOB-resync path, which is typically cheaper than
+acting on the corrected bit at the FEC layer.
+
+```rust
+use oxideav_h261::bch::{encode_multiframe, decode_multiframe};
+
+let coded_video: Vec<u8> = /* your H.261 elementary stream */ vec![];
+let framed = encode_multiframe(&coded_video, coded_video.len() * 8);
+let unwrapped = decode_multiframe(&framed).expect("frame lock");
+assert_eq!(&unwrapped.data[..coded_video.len()], &coded_video[..]);
+```
 
 ## Quick use
 

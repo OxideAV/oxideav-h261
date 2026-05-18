@@ -17,10 +17,17 @@
 //!   QCIF 176x144 and CIF 352x288.
 //! * Encoder: I + P pictures, integer-pel MC (spiral+diamond ME), per-GOB
 //!   MQUANT rate control, FIL loop-filter RDO, full §4.2.3.4 MV-pred.
+//! * BCH (511,493) error-correction framing (§5.4): the [`bch`] module
+//!   wraps / unwraps the outer FEC multiframe layer (alignment pattern,
+//!   `Fi` bit, BCH parity computation and per-frame syndrome check).
 //!
 //! Out of scope:
-//! * BCH (511,493) forward error correction framing (§5.4) — decoder is fed
-//!   already-extracted video bitstream.
+//! * Single-bit correction of corrupted BCH (511,493) codewords — the
+//!   [`bch`] module computes parity/syndromes and frames/unframes the
+//!   multiframe layer, but a non-zero syndrome is surfaced to the caller
+//!   rather than acted on (in practice the inner H.261 video VLC resyncs
+//!   at the next GOB start code, which is cheaper than relying on the
+//!   single-bit correction the BCH code formally provides).
 //!
 //! No runtime dependencies beyond `oxideav-core`, `oxideav-codec`, and
 //! `oxideav-pixfmt`.
@@ -30,6 +37,7 @@
 #![allow(clippy::unusual_byte_groupings)]
 #![allow(clippy::unnecessary_cast)]
 
+pub mod bch;
 pub mod block;
 pub mod decoder;
 pub mod encoder;
