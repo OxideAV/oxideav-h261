@@ -20,6 +20,11 @@
 //! * BCH (511,493) error-correction framing (§5.4): the [`bch`] module
 //!   wraps / unwraps the outer FEC multiframe layer (alignment pattern,
 //!   `Fi` bit, BCH parity computation and per-frame syndrome check).
+//! * Hypothetical Reference Decoder buffer model (§5.2 + Annex B): the
+//!   [`hrd`] module exposes the per-picture bit cap (256 kbits CIF /
+//!   64 kbits QCIF) and the HRD buffer-occupancy walk used to verify
+//!   a coded sequence won't underflow a conforming decoder's receiving
+//!   buffer at a given channel rate.
 //!
 //! Out of scope:
 //! * Single-bit correction of corrupted BCH (511,493) codewords — the
@@ -43,6 +48,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod fdct;
 pub mod gob;
+pub mod hrd;
 pub mod idct;
 pub mod mb;
 pub mod picture;

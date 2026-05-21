@@ -451,6 +451,28 @@ mod tests {
         assert_eq!(syndrome18(&ones, par), 0);
     }
 
+    /// Spec §5.4.2 worked example: for the 493-bit input
+    /// `0 followed by 492 ones`, the BCH parity is exactly
+    /// `011011010100011011` (= 0x1B51B). This is the published
+    /// validation vector from ITU-T Rec. H.261 (03/93) §5.4.2.
+    #[test]
+    fn parity_matches_spec_5_4_2_worked_example() {
+        // Build the 493-bit input: bit 0 = 0, bits 1..493 = 1.
+        // Pack into ceil(493/8) = 62 bytes, MSB-first.
+        let mut msg = [0u8; 62];
+        for i in 1..493 {
+            msg[i / 8] |= 1 << (7 - (i & 7));
+        }
+        let par = parity18(&msg);
+        // Expected: 011011010100011011₂ = 0x1B51B.
+        assert_eq!(
+            par, 0x1_B51B,
+            "spec §5.4.2 worked example: parity should be 0x1B51B (binary 011011010100011011), got 0x{par:X}"
+        );
+        // And the syndrome of (msg || par) must be zero.
+        assert_eq!(syndrome18(&msg, par), 0);
+    }
+
     /// A single-bit flip anywhere in the codeword must produce a non-zero
     /// syndrome (single-error detection — the t=1 BCH minimum).
     #[test]

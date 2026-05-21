@@ -34,6 +34,7 @@ oxideav-h261 = "0.0"
 | Per-GOB MQUANT rate control (§4.2.3.3)           | n/a    | yes    |
 | Encoder registry (`first_encoder` / `bit_rate`)  | n/a    | yes    |
 | BCH (511,493) FEC framing (§5.4)                 | yes    | yes    |
+| HRD buffer model (§5.2 + Annex B)                | yes    | yes    |
 
 H.261 only permits integer-pel motion vectors (range ±15); there are no
 half-pel refinements, no B-pictures, and no start-code emulation prevention.
@@ -46,6 +47,44 @@ At the canonical H.261 target rate (64 kbit/s QCIF / 30 fps), the encoder
 achieves ≥ 45 dB PSNR_Y on smooth content and ≥ 39 dB on the standard
 `testsrc` test pattern (see `bench_testsrc_psnr`). ffmpeg cross-validates
 all P-picture, MC, and FIL streams cleanly.
+
+### HRD buffer model (§5.2 + Annex B)
+
+The `hrd` module exposes the Hypothetical Reference Decoder buffer
+walk callers use to verify a coded sequence won't underflow a
+conforming H.261 receiver at a given channel rate. Two compliance
+checks are surfaced as pure functions:
+
+- `check_picture_cap(coded_bits, fmt)` — §5.2 per-picture cap
+  (`64 kbits` QCIF, `256 kbits` CIF), excluding §5.4 FEC framing.
+- `walk_buffer(pictures, N, params)` — Annex B buffer trajectory
+  starting from `b_0 = 0`, accumulating `R * N / 29.97` bits per
+  inter-picture interval and removing each picture instantaneously
+  at its arrival boundary. Reports the first underflow index (if
+  any) and the post-removal occupancy at every step.
+
+`HrdParams::new(R_max)` derives `B = 4 * R_max / 29.97` and the
+receiver buffer size `B + 256 kbits` (Annex B.2) via integer-rational
+arithmetic so long sequences don't drift on floating-point round-off.
+
+```rust
+use oxideav_h261::hrd::{HrdParams, walk_buffer, check_picture_cap, PictureCapStatus};
+use oxideav_h261::picture::SourceFormat;
+
+let sizes_bits: Vec<u32> = vec![/* coded picture sizes */];
+assert_eq!(
+    check_picture_cap(sizes_bits[0], SourceFormat::Qcif),
+    PictureCapStatus::Ok,
+);
+let params = HrdParams::new(64_000); // canonical p × 64 kbit/s ISDN
+let trace = walk_buffer(&sizes_bits, /* skip N = */ 1, params);
+assert!(trace.first_underflow.is_none(), "HRD violation at picture {:?}", trace.first_underflow);
+```
+
+The HRD is purely a coder-side compliance check — nothing in the
+on-wire bitstream changes. The encoder doesn't run it by default
+(see the module docstring for why); callers that need the assertion
+drive it explicitly with their picture-size sequence.
 
 ### BCH (511,493) FEC framing (§5.4)
 

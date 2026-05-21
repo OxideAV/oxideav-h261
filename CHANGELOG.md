@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hypothetical Reference Decoder buffer model (§5.2 + Annex B).** New
+  `oxideav_h261::hrd` module exposes the §5.2 per-picture cap
+  (`64 kbits` QCIF, `256 kbits` CIF, excluding §5.4 FEC framing) and
+  the Annex B buffer-occupancy walk. `HrdParams::new(R_max)` derives
+  `B = 4 * R_max / 29.97` and the receiver buffer size `B + 256 kbits`
+  via integer-rational arithmetic so long sequences don't drift on
+  floating-point round-off. `walk_buffer(pictures, N, params)` returns
+  the post-removal occupancy after every picture and the first underflow
+  index (if any); `check_overflow(pictures, N, params)` flags the dual
+  pre-removal-overflow case. The HRD is a coder-side compliance check
+  only — no on-wire changes.
+
+- **Spec §5.4.2 worked-example regression test for `bch::parity18`.**
+  The ITU-T H.261 (03/93) spec publishes a single validation vector
+  for the BCH parity routine — for the 493-bit input `0` followed by
+  492 ones, the parity is exactly `011011010100011011`₂ = `0x1B51B`.
+  The new `parity_matches_spec_5_4_2_worked_example` test feeds that
+  input through `parity18` and asserts equality with the spec value,
+  pinning the implementation to the spec's own published test data.
+
+### Tests added
+
+- `hrd::tests::*` (12 unit tests in `src/hrd.rs`):
+  - Per-picture cap returns 64 / 256 kbits for QCIF / CIF.
+  - `check_picture_cap` returns `Ok` at-or-below the cap, `Overflow`
+    above it with both `actual_bits` and `cap_bits` populated.
+  - `HrdParams::new` derives `B` correctly at 64 kbit/s and 2 Mbit/s
+    channel rates (integer-rational truncation matches the spec
+    fraction `4 * R * 10000 / 299700`).
+  - `walk_buffer` at matched rate ⇒ buffer drains to exactly 0;
+    smaller pictures accumulate monotonically; oversized first picture
+    triggers `first_underflow = Some(0)`; skip factor `N = 2` doubles
+    per-interval arrival as expected.
+  - `check_overflow` is silent under normal drain, trips at the
+    correct frame index when pictures are tiny relative to arrival.
+- `tests/hrd_e2e.rs` (4 integration tests):
+  - Real QCIF I-pictures at quant=8 / quant=2 fit the §5.2 cap.
+  - 10 real I-pictures at quant=12 fail the HRD walk at N=1 / 29.97 fps
+    over 64 kbit/s (each picture far larger than per-interval arrival)
+    but succeed at N=10 (≈3 fps); confirms the HRD correctly identifies
+    both regimes.
+  - 30 real I-pictures matched against a 64 kbit/s / N=4 channel pass
+    the overflow check (matched-rate drain).
+- `bch::tests::parity_matches_spec_5_4_2_worked_example` (1 new unit
+  test) — verifies `parity18` against the §5.4.2 worked example.
+
+### Changed
+
+- `lib.rs` module-docstring scope: HRD §5.2 + Annex B added to
+  in-scope items.
+- README feature matrix: `HRD buffer model (§5.2 + Annex B)` row
+  added (`yes / yes`).
+
 - **BCH (511, 493) forward error correction framing (§5.4).** New
   `oxideav_h261::bch` module wraps and unwraps the outer multiframe
   FEC layer H.261 prescribes for noisy `p × 64 kbit/s` channels. The
