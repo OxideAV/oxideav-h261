@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RTP payload format (RFC 4587).** New `oxideav_h261::rtp` module
+  implements the H.261 RTP payload-format §4.1 4-byte header (SBIT,
+  EBIT, I, V, GOBN, MBAP, QUANT, HMVD, VMVD) with bit-exact
+  `pack_header` / `unpack_header`, plus the GOB-aligned cheap
+  packetizer (`packetize_gob_aligned`) and `depacketize` reassembler
+  from §4.2. The packetizer splits at byte-aligned PSC / GBSC
+  boundaries, fragments oversized GOBs at byte boundaries (SBIT/EBIT
+  stay zero), and sets the RTP marker-bit hint on the last payload of
+  each frame. Round-trips are byte-exact against `encode_intra_picture`
+  output and the recovered stream still decodes through the regular
+  `H261Decoder`. RFC 4587 §4.1's explicit "no BCH on the RTP path" rule
+  is documented in the module's intro; the `bch` and `rtp` modules are
+  mutually exclusive consumers of an elementary stream. `pack_header`
+  enforces the `-16` MVD prohibition (5-bit field `'10000'` is
+  forbidden by §4.1).
+
 - **Hypothetical Reference Decoder buffer model (§5.2 + Annex B).** New
   `oxideav_h261::hrd` module exposes the §5.2 per-picture cap
   (`64 kbits` QCIF, `256 kbits` CIF, excluding §5.4 FEC framing) and

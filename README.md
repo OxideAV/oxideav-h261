@@ -35,6 +35,7 @@ oxideav-h261 = "0.0"
 | Encoder registry (`first_encoder` / `bit_rate`)  | n/a    | yes    |
 | BCH (511,493) FEC framing (§5.4)                 | yes    | yes    |
 | HRD buffer model (§5.2 + Annex B)                | yes    | yes    |
+| RTP payload format (RFC 4587 §4.1)               | yes    | yes    |
 
 H.261 only permits integer-pel motion vectors (range ±15); there are no
 half-pel refinements, no B-pictures, and no start-code emulation prevention.
@@ -108,6 +109,38 @@ let framed = encode_multiframe(&coded_video, coded_video.len() * 8);
 let unwrapped = decode_multiframe(&framed).expect("frame lock");
 assert_eq!(&unwrapped.data[..coded_video.len()], &coded_video[..]);
 ```
+
+### RTP payload format (RFC 4587)
+
+The `rtp` module packs an H.261 elementary stream into a sequence of
+RTP-shaped payloads (the 4-byte H.261 payload header from §4.1 followed
+by the bitstream slice) and unpacks them back. The GOB-aligned cheap
+packetizer (§4.2) splits at start codes; SBIT/EBIT stay zero so the
+round trip is byte-exact. RFC 4587 explicitly forbids the BCH framing
+on the RTP path — the `bch` and `rtp` modules are mutually exclusive
+consumers of an elementary stream.
+
+```rust
+use oxideav_h261::rtp::{packetize_gob_aligned, depacketize};
+
+let elementary_stream: Vec<u8> = /* H.261 bytes from encode_intra_picture */ vec![];
+let mtu_payload_budget = 1400; // typical IPv4 MTU minus the RTP fixed header
+let packets = packetize_gob_aligned(&elementary_stream, mtu_payload_budget, true, false);
+for p in &packets {
+    // send `p.bytes` as the RTP payload; the marker bit goes in the RTP fixed header
+    let _ = (&p.bytes, p.marker);
+}
+// At the receiver, depacketize the sequence to recover the elementary stream.
+let recovered = depacketize(&packets).expect("depacketize");
+assert_eq!(recovered, elementary_stream);
+```
+
+The packetizer handles GOBs that exceed the MTU by splitting at byte
+boundaries (SBIT/EBIT stay zero in that case too). The 4-byte header
+covers SBIT/EBIT, the I/V hint bits, and the GOBN/MBAP/QUANT/HMVD/VMVD
+context fields; the GOB-aligned packetizer sets the context fields to
+zero per §4.1. MB-level fragmentation with non-zero context is left to
+the caller via [`pack_header`] / [`unpack_header`].
 
 ## Quick use
 

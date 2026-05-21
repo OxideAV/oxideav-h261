@@ -25,6 +25,9 @@
 //!   64 kbits QCIF) and the HRD buffer-occupancy walk used to verify
 //!   a coded sequence won't underflow a conforming decoder's receiving
 //!   buffer at a given channel rate.
+//! * RTP payload-format wrapping (RFC 4587): the [`rtp`] module packs an
+//!   elementary stream into a sequence of GOB-aligned H.261 RTP payloads
+//!   (4-byte header + bitstream slice) and unpacks them back.
 //!
 //! Out of scope:
 //! * Single-bit correction of corrupted BCH (511,493) codewords — the
@@ -53,6 +56,7 @@ pub mod idct;
 pub mod mb;
 pub mod picture;
 pub mod quant;
+pub mod rtp;
 pub mod start_code;
 pub mod tables;
 
