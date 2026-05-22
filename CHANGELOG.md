@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Encoder-side RTP packetiser (`RtpPacketizer`).** Higher-level glue
+  between `H261Encoder` and the RTP wire format. Construct with
+  `RtpPacketizer::new(payload_type, ssrc, initial_sequence_number,
+  max_rtp_packet_size)`; call `pack_frame(frame_bytes,
+  rtp_timestamp_90khz)` once per coded picture. Returns a sequence of
+  `RtpPacket`s whose `bytes` field is a complete RFC 3550 §5.1 fixed
+  header (V=2, P=0, X=0, CC=0, M, PT, seq, ts, SSRC) followed by the
+  RFC 4587 §4.1 4-byte H.261 header and the GOB-aligned payload slice.
+  The marker bit is set on the LAST packet of each frame per RFC 4587
+  §4.1 ("MUST be set to one in the last packet of a video frame;
+  otherwise, it MUST be zero"); sequence numbers auto-advance mod
+  2^16 across frames; the same RTP timestamp is stamped on every
+  packet of one frame (§4.1). The 7-bit payload type is masked
+  internally so callers passing a `u8` with the high bit set don't
+  corrupt the M bit. `parse_rtp_fixed_header` parses RFC 3550 §5.1
+  headers (including any CSRC list) for the receiver side. Wired
+  through an end-to-end test that drives `H261Encoder.encode_frame()`
+  for an I + P pair, packets them, parses the RTP fixed headers,
+  reuses `depacketize` on the inner payloads, and decodes the result
+  back into video frames.
+
 - **RTP payload format (RFC 4587).** New `oxideav_h261::rtp` module
   implements the H.261 RTP payload-format §4.1 4-byte header (SBIT,
   EBIT, I, V, GOBN, MBAP, QUANT, HMVD, VMVD) with bit-exact

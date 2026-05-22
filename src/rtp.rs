@@ -8,8 +8,13 @@
 //!
 //! This module implements the **payload format itself** — packing an
 //! H.261 elementary stream into a sequence of RTP-shaped payloads and
-//! unpacking it back. It does not own UDP/TCP transport, RTCP, SDP, or
-//! the RTP fixed header (those are caller-side concerns).
+//! unpacking it back. The lower-level `packetize_gob_aligned` /
+//! `depacketize` pair handles just the §4.1 4-byte H.261 payload header
+//! and the GOB-aligned payload slice. The higher-level [`RtpPacketizer`]
+//! glue wraps each payload in a full RFC 3550 §5.1 RTP fixed header (V,
+//! P, X, CC, M, PT, sequence number, timestamp, SSRC) so callers can
+//! hand its output straight to UDP / DTLS / SRTP. UDP/TCP transport,
+//! RTCP, and SDP are still caller-side concerns.
 //!
 //! ```text
 //!  0                   1                   2                   3
@@ -58,8 +63,9 @@
 //!   packets fit comfortably below an IPv4 MTU. The header builder is
 //!   nonetheless general enough that a caller can hand-construct an MB-
 //!   fragmented packetizer on top of [`pack_header`] / [`unpack_header`].
-//! * RTP fixed-header construction, timestamps, marker-bit policy. These
-//!   are RTP framing concerns and live in a transport-layer crate.
+//! * RTCP, SDP offer/answer, payload-type negotiation. The PT, SSRC,
+//!   initial sequence number, and per-frame RTP timestamp are passed in
+//!   by the caller from its SDP / clock state.
 //!
 //! ## RFC 4587 §4.1 caveat
 //!
@@ -482,6 +488,326 @@ pub fn depacketize(payloads: &[H261RtpPayload]) -> Result<Vec<u8>, RtpError> {
     Ok(bytes)
 }
 
+/// Length of the RTP fixed header (RFC 3550 §5.1), in bytes, for the
+/// no-CSRC, no-extension case that an H.261 source produces.
+pub const RTP_FIXED_HEADER_LEN: usize = 12;
+
+/// One fully-framed RFC 3550 RTP packet ready to put on the wire.
+///
+/// `bytes` is laid out as:
+///
+/// ```text
+///   [RTP fixed header (12 B, RFC 3550 §5.1)]
+///   [H.261 RTP payload header (4 B,  RFC 4587 §4.1)]
+///   [H.261 elementary-stream slice (1..N B)]
+/// ```
+///
+/// The packet is self-contained: feed `bytes` straight to UDP / DTLS /
+/// SRTP. The `marker`, `sequence_number`, `timestamp`, and `ssrc`
+/// fields are exposed for receivers and for unit-test inspection but
+/// they are also already encoded in `bytes`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RtpPacket {
+    /// Full wire bytes (fixed header + H.261 payload header + payload).
+    pub bytes: Vec<u8>,
+    /// Marker bit — `true` on the last packet of a video frame
+    /// (RFC 4587 §4.1).
+    pub marker: bool,
+    /// 16-bit RTP sequence number assigned to this packet.
+    pub sequence_number: u16,
+    /// 32-bit RTP timestamp (90 kHz clock per RFC 4587 §4.1 — same on
+    /// every packet of one video frame).
+    pub timestamp: u32,
+    /// 32-bit RTP synchronisation-source identifier.
+    pub ssrc: u32,
+}
+
+impl RtpPacket {
+    /// Length of the inner H.261 elementary-stream bytes after the
+    /// 12-byte RTP header and the 4-byte H.261 payload header.
+    pub fn data_len(&self) -> usize {
+        self.bytes
+            .len()
+            .saturating_sub(RTP_FIXED_HEADER_LEN + HEADER_LEN)
+    }
+}
+
+/// RFC 3550 §5.1 RTP fixed-header builder for the simplest case
+/// (no padding, no extension, no CSRC) used by [`RtpPacketizer`].
+///
+/// Layout per RFC 3550 §5.1:
+///
+/// ```text
+///   0                   1                   2                   3
+///    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+///   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///   |V=2|P|X|  CC   |M|     PT      |       sequence number         |
+///   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///   |                           timestamp                           |
+///   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///   |           synchronization source (SSRC) identifier            |
+///   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+///
+/// `pt` is a 7-bit payload type (RFC 4587 §4.1 leaves this to the SDP /
+/// profile layer); the high bit is masked away if the caller passes a
+/// value out of range. `marker` is the M bit. `seq`, `ts`, `ssrc` are
+/// the next sequence number, RTP timestamp, and SSRC respectively.
+fn write_rtp_fixed_header(buf: &mut Vec<u8>, pt: u8, marker: bool, seq: u16, ts: u32, ssrc: u32) {
+    // Byte 0: V=2 (bits 0..2 high), P=0, X=0, CC=0 → 0b10_000000 = 0x80.
+    buf.push(0x80);
+    // Byte 1: M bit (top) + PT (low 7).
+    buf.push(((marker as u8) << 7) | (pt & 0x7F));
+    buf.extend_from_slice(&seq.to_be_bytes());
+    buf.extend_from_slice(&ts.to_be_bytes());
+    buf.extend_from_slice(&ssrc.to_be_bytes());
+}
+
+/// Encoder-side RFC 4587 RTP packetiser.
+///
+/// `RtpPacketizer` is the high-level glue between [`crate::encoder`]'s
+/// elementary-stream output and the RTP wire format. Construct one per
+/// RTP session (one SSRC) with the payload type negotiated for H.261 in
+/// your SDP — typically a value in the dynamic range (96..=127) per
+/// RFC 4587 §4.1 — and call [`Self::pack_frame`] once per coded picture
+/// with the picture's bytes and its 90-kHz RTP timestamp.
+///
+/// Internally each frame is GOB-aligned-split via
+/// [`packetize_gob_aligned`] then wrapped in an RFC 3550 §5.1 fixed
+/// header. The marker bit is set on the last packet of each frame per
+/// RFC 4587 §4.1. The sequence number auto-advances mod 2^16 across
+/// packets and across frames; the initial value is whatever the caller
+/// passes to [`Self::new`] (RFC 3550 §5.1 recommends a random initial
+/// seed for security against known-plaintext attacks).
+///
+/// The RTP timestamp is **not** auto-advanced — RTP timestamps are
+/// supplied per frame by the caller because (a) RTP allows frame
+/// dropping that breaks a simple `+= clock_ticks_per_frame` invariant,
+/// and (b) the 90-kHz clock per RFC 4587 §4.1 is a multiple of 30 / 1.001
+/// fps so a strict integer-rational walk has to live in the caller's
+/// frame-rate state anyway.
+#[derive(Debug, Clone)]
+pub struct RtpPacketizer {
+    pt: u8,
+    ssrc: u32,
+    next_seq: u16,
+    max_payload: usize,
+    intra_only: bool,
+    motion_vectors: bool,
+}
+
+impl RtpPacketizer {
+    /// Construct a new packetiser.
+    ///
+    /// * `payload_type` — 7-bit RTP PT for this stream. High bit is
+    ///   silently masked.
+    /// * `ssrc` — 32-bit synchronisation source.
+    /// * `initial_sequence_number` — first sequence number emitted by
+    ///   [`Self::pack_frame`]; subsequent packets increment mod 2^16.
+    /// * `max_rtp_packet_size` — maximum size in bytes of each emitted
+    ///   RTP packet, **including** the 12-byte RTP fixed header and the
+    ///   4-byte H.261 payload header. Pick `MTU - lower-layer overhead`.
+    ///
+    /// # Panics
+    /// Panics if `max_rtp_packet_size <= RTP_FIXED_HEADER_LEN + HEADER_LEN`
+    /// (the packet must carry at least one byte of H.261 data after both
+    /// headers).
+    pub fn new(
+        payload_type: u8,
+        ssrc: u32,
+        initial_sequence_number: u16,
+        max_rtp_packet_size: usize,
+    ) -> Self {
+        assert!(
+            max_rtp_packet_size > RTP_FIXED_HEADER_LEN + HEADER_LEN,
+            "max_rtp_packet_size must accommodate the 12-byte RTP fixed header + 4-byte H.261 header + ≥ 1 data byte"
+        );
+        Self {
+            pt: payload_type & 0x7F,
+            ssrc,
+            next_seq: initial_sequence_number,
+            max_payload: max_rtp_packet_size,
+            intra_only: false,
+            motion_vectors: true,
+        }
+    }
+
+    /// Set the I (INTRA-only) hint surfaced in the H.261 RTP payload
+    /// header for **every** packet from this packetiser. Per RFC 4587
+    /// §4.1, the meaning of this bit must not change across the RTP
+    /// session, so wire it once at session setup.
+    pub fn with_intra_only(mut self, intra_only: bool) -> Self {
+        self.intra_only = intra_only;
+        self
+    }
+
+    /// Set the V (motion-vectors-may-be-used) hint. Per RFC 4587 §4.1
+    /// the meaning of this bit must not change across the session.
+    pub fn with_motion_vectors(mut self, motion_vectors: bool) -> Self {
+        self.motion_vectors = motion_vectors;
+        self
+    }
+
+    /// Next sequence number that will be assigned to a packet.
+    pub fn next_sequence_number(&self) -> u16 {
+        self.next_seq
+    }
+
+    /// 32-bit SSRC identifier the packetiser stamps into every packet.
+    pub fn ssrc(&self) -> u32 {
+        self.ssrc
+    }
+
+    /// 7-bit RTP payload type the packetiser stamps into every packet.
+    pub fn payload_type(&self) -> u8 {
+        self.pt
+    }
+
+    /// Pack one coded H.261 picture into a sequence of RTP packets.
+    ///
+    /// `frame_bytes` is the H.261 elementary stream for exactly one
+    /// picture — as returned by [`crate::encoder::H261Encoder::encode_frame`]
+    /// or by [`crate::encoder::encode_intra_picture`] /
+    /// `encode_inter_picture`. `rtp_timestamp_90khz` is the RTP
+    /// timestamp (RFC 4587 §4.1: 90-kHz clock); the same value is
+    /// written to every packet of this frame (RFC 3550 §5.1).
+    ///
+    /// The marker bit is set on the LAST emitted packet of the frame
+    /// (RFC 4587 §4.1: "MUST be set to one in the last packet of a
+    /// video frame; otherwise, it MUST be zero").
+    ///
+    /// Returns an empty vector if `frame_bytes` contains no start codes
+    /// (e.g. it was empty, or it was raw padding only — neither is a
+    /// well-formed H.261 picture).
+    pub fn pack_frame(&mut self, frame_bytes: &[u8], rtp_timestamp_90khz: u32) -> Vec<RtpPacket> {
+        let inner_budget = self.max_payload - RTP_FIXED_HEADER_LEN;
+        let h261_payloads = packetize_gob_aligned(
+            frame_bytes,
+            inner_budget,
+            self.intra_only,
+            self.motion_vectors,
+        );
+
+        if h261_payloads.is_empty() {
+            return Vec::new();
+        }
+
+        // RFC 4587 §4.1: "The marker bit of the RTP header MUST be set
+        // to one in the last packet of a video frame; otherwise, it
+        // MUST be zero." Override whatever per-payload hints
+        // packetize_gob_aligned might have flagged: the only marker
+        // that matters at the RTP layer is "is this the last packet of
+        // the frame I'm packing right now".
+        let last_idx = h261_payloads.len() - 1;
+        let mut out = Vec::with_capacity(h261_payloads.len());
+        for (i, p) in h261_payloads.into_iter().enumerate() {
+            let marker = i == last_idx;
+            let seq = self.next_seq;
+            self.next_seq = self.next_seq.wrapping_add(1);
+
+            let mut bytes = Vec::with_capacity(RTP_FIXED_HEADER_LEN + p.bytes.len());
+            write_rtp_fixed_header(
+                &mut bytes,
+                self.pt,
+                marker,
+                seq,
+                rtp_timestamp_90khz,
+                self.ssrc,
+            );
+            bytes.extend_from_slice(&p.bytes);
+
+            out.push(RtpPacket {
+                bytes,
+                marker,
+                sequence_number: seq,
+                timestamp: rtp_timestamp_90khz,
+                ssrc: self.ssrc,
+            });
+        }
+        out
+    }
+}
+
+/// Parsed RTP fixed header (RFC 3550 §5.1) — the fields the H.261
+/// receive path actually inspects. Padding / extension / CSRC handling
+/// is the caller's job; this struct only models the V/P/X/CC/M/PT/seq/
+/// timestamp/SSRC fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RtpFixedHeader {
+    /// RTP version (must equal 2 for this codec; the parser rejects
+    /// other values).
+    pub version: u8,
+    /// Padding (P) bit.
+    pub padding: bool,
+    /// Extension (X) bit.
+    pub extension: bool,
+    /// CSRC count (CC field).
+    pub csrc_count: u8,
+    /// Marker (M) bit.
+    pub marker: bool,
+    /// 7-bit payload type.
+    pub payload_type: u8,
+    /// 16-bit RTP sequence number.
+    pub sequence_number: u16,
+    /// 32-bit RTP timestamp.
+    pub timestamp: u32,
+    /// 32-bit synchronisation-source identifier.
+    pub ssrc: u32,
+}
+
+/// Parse one RFC 3550 §5.1 RTP fixed header from `buf`. Returns the
+/// parsed header and a slice pointing past the fixed header **and**
+/// past any CSRC identifiers (so the next byte the caller looks at is
+/// either a header extension or the H.261 RTP payload header).
+///
+/// Returns:
+/// * [`RtpError::ShortHeader`] if `buf` is shorter than the fixed
+///   12 bytes or shorter than 12 + 4 * CC.
+/// * [`RtpError::FieldOverflow`] if the version field is not 2.
+pub fn parse_rtp_fixed_header(buf: &[u8]) -> Result<(RtpFixedHeader, &[u8]), RtpError> {
+    if buf.len() < RTP_FIXED_HEADER_LEN {
+        return Err(RtpError::ShortHeader);
+    }
+    let b0 = buf[0];
+    let b1 = buf[1];
+    let version = (b0 >> 6) & 0x3;
+    if version != 2 {
+        return Err(RtpError::FieldOverflow {
+            field: "RTP-V",
+            value: version as u32,
+        });
+    }
+    let padding = (b0 & 0x20) != 0;
+    let extension = (b0 & 0x10) != 0;
+    let csrc_count = b0 & 0x0F;
+    let marker = (b1 & 0x80) != 0;
+    let payload_type = b1 & 0x7F;
+    let sequence_number = u16::from_be_bytes([buf[2], buf[3]]);
+    let timestamp = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let ssrc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+
+    let csrc_bytes = (csrc_count as usize) * 4;
+    let need = RTP_FIXED_HEADER_LEN + csrc_bytes;
+    if buf.len() < need {
+        return Err(RtpError::ShortHeader);
+    }
+
+    Ok((
+        RtpFixedHeader {
+            version,
+            padding,
+            extension,
+            csrc_count,
+            marker,
+            payload_type,
+            sequence_number,
+            timestamp,
+            ssrc,
+        },
+        &buf[need..],
+    ))
+}
+
 /// Minimal MSB-first bit-append buffer used by [`depacketize`] to
 /// handle non-zero SBIT/EBIT in the general case. The fast path
 /// (`sbit == 0 && ebit == 0`) reduces to byte-aligned appends.
@@ -820,5 +1146,247 @@ mod tests {
     #[should_panic(expected = "max_payload must accommodate")]
     fn packetize_panics_on_tiny_max_payload() {
         let _ = packetize_gob_aligned(&[0x00, 0x01, 0x00], HEADER_LEN, false, false);
+    }
+
+    // ------------------------------------------------------------------
+    // RtpPacketizer / parse_rtp_fixed_header tests
+    // ------------------------------------------------------------------
+
+    fn synthetic_two_picture_stream() -> Vec<u8> {
+        // Two pictures back-to-back: PSC + 5 bytes, PSC + 5 bytes.
+        let mut data = vec![0x00, 0x01, 0x00];
+        data.extend(std::iter::repeat(0x11).take(5));
+        data.extend_from_slice(&[0x00, 0x01, 0x00]);
+        data.extend(std::iter::repeat(0x22).take(5));
+        data
+    }
+
+    fn synthetic_one_picture_stream() -> Vec<u8> {
+        let mut data = vec![0x00, 0x01, 0x00];
+        data.extend(std::iter::repeat(0xA5).take(20));
+        data
+    }
+
+    #[test]
+    fn rtp_packet_stamps_fixed_header_fields_and_marker_on_last() {
+        let mut pk = RtpPacketizer::new(96, 0xDEAD_BEEF, 1000, 1500);
+        let frame = synthetic_one_picture_stream();
+        let packets = pk.pack_frame(&frame, 90_000);
+        assert_eq!(packets.len(), 1);
+        let p = &packets[0];
+        assert_eq!(
+            p.bytes.len(),
+            RTP_FIXED_HEADER_LEN + HEADER_LEN + frame.len()
+        );
+        assert_eq!(p.sequence_number, 1000);
+        assert_eq!(p.timestamp, 90_000);
+        assert_eq!(p.ssrc, 0xDEAD_BEEF);
+        assert!(p.marker, "single-packet frame must carry M=1");
+        // The wire bytes' marker bit lives in byte 1 bit 7.
+        assert_eq!(p.bytes[1] & 0x80, 0x80);
+        assert_eq!(p.bytes[1] & 0x7F, 96);
+        // V=2, P=0, X=0, CC=0 ⇒ byte 0 == 0x80.
+        assert_eq!(p.bytes[0], 0x80);
+        // Sequence number advanced.
+        assert_eq!(pk.next_sequence_number(), 1001);
+    }
+
+    #[test]
+    fn rtp_packet_marker_set_only_on_last_of_frame_when_fragmented() {
+        // Tiny MTU forces fragmentation: 20-byte payload window.
+        let mut pk = RtpPacketizer::new(96, 1, 0, 20)
+            .with_intra_only(true)
+            .with_motion_vectors(false);
+        let frame = synthetic_one_picture_stream();
+        let packets = pk.pack_frame(&frame, 12345);
+        assert!(packets.len() >= 2, "expected fragmentation");
+        for (i, p) in packets.iter().enumerate() {
+            if i + 1 == packets.len() {
+                assert!(p.marker, "last packet must have M=1");
+                assert_eq!(p.bytes[1] & 0x80, 0x80);
+            } else {
+                assert!(!p.marker, "non-last packet must have M=0");
+                assert_eq!(p.bytes[1] & 0x80, 0);
+            }
+            assert_eq!(p.timestamp, 12345);
+            assert_eq!(p.ssrc, 1);
+        }
+        // Sequence numbers are dense.
+        for w in packets.windows(2) {
+            assert_eq!(w[1].sequence_number, w[0].sequence_number.wrapping_add(1));
+        }
+    }
+
+    #[test]
+    fn rtp_packet_two_frames_share_timestamp_per_frame_only() {
+        let mut pk = RtpPacketizer::new(96, 7, 0, 1500);
+        let one = synthetic_one_picture_stream();
+        let pkts1 = pk.pack_frame(&one, 100);
+        let pkts2 = pk.pack_frame(&one, 200);
+        assert_eq!(pkts1.len(), 1);
+        assert_eq!(pkts2.len(), 1);
+        assert_eq!(pkts1[0].timestamp, 100);
+        assert_eq!(pkts2[0].timestamp, 200);
+        // Sequence number kept advancing across frame boundary.
+        assert_eq!(pkts2[0].sequence_number, pkts1[0].sequence_number + 1);
+        // Both frames are tail-of-frame ⇒ both marker = 1.
+        assert!(pkts1[0].marker);
+        assert!(pkts2[0].marker);
+    }
+
+    #[test]
+    fn rtp_packet_two_gobs_in_one_frame_only_last_has_marker() {
+        // Two GOBs in one frame: PSC + GOB1 + GOB2. Only the GOB2
+        // packet should carry M=1 (it's the tail of the frame).
+        let mut pk = RtpPacketizer::new(96, 1, 0, 1500);
+        let frame = synthetic_two_picture_stream();
+        // Caveat: synthetic_two_picture_stream actually has two PSCs.
+        // Packetizer treats each PSC as starting a new frame, but the
+        // RtpPacketizer-level marker is "last packet of the call to
+        // pack_frame", so both should have marker=true ONLY on the
+        // last packet of the pack_frame call. The packet stream order
+        // is still "GOB1 then GOB2", so only GOB2's packet has M=1.
+        let packets = pk.pack_frame(&frame, 90_000);
+        assert!(packets.len() >= 2, "expected ≥ 2 packets");
+        assert!(!packets[0].marker, "first packet must not be M=1");
+        assert!(packets.last().unwrap().marker, "last packet must be M=1");
+    }
+
+    #[test]
+    fn rtp_packet_payload_type_is_masked_to_7_bits() {
+        // Pass PT=0xFF, expect the wire byte to carry only the low 7
+        // bits (0x7F), so byte 1 with M=0 is 0x7F.
+        let mut pk = RtpPacketizer::new(0xFF, 0, 0, 1500);
+        let pkts = pk.pack_frame(&synthetic_one_picture_stream(), 1);
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(pk.payload_type(), 0x7F);
+        // Marker bit IS set on the only packet (last of frame), so the
+        // wire byte is 0xFF; mask it back out to verify PT.
+        let pt = pkts[0].bytes[1] & 0x7F;
+        assert_eq!(pt, 0x7F);
+    }
+
+    #[test]
+    fn rtp_packet_sequence_number_wraps() {
+        let mut pk = RtpPacketizer::new(96, 0, u16::MAX, 1500);
+        let p1 = pk.pack_frame(&synthetic_one_picture_stream(), 0);
+        let p2 = pk.pack_frame(&synthetic_one_picture_stream(), 1);
+        assert_eq!(p1[0].sequence_number, u16::MAX);
+        assert_eq!(p2[0].sequence_number, 0);
+    }
+
+    #[test]
+    fn rtp_packet_empty_input_emits_no_packets() {
+        let mut pk = RtpPacketizer::new(96, 0, 0, 1500);
+        let pkts = pk.pack_frame(&[], 0);
+        assert!(pkts.is_empty());
+        // No-start-code input also emits nothing.
+        let pkts = pk.pack_frame(&[0xFFu8; 8], 0);
+        assert!(pkts.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "max_rtp_packet_size must accommodate")]
+    fn rtp_packetizer_panics_on_tiny_mtu() {
+        let _ = RtpPacketizer::new(96, 0, 0, RTP_FIXED_HEADER_LEN + HEADER_LEN);
+    }
+
+    #[test]
+    fn parse_rtp_fixed_header_round_trips_against_packetizer_output() {
+        let mut pk = RtpPacketizer::new(101, 0x1234_5678, 42, 1500);
+        let pkts = pk.pack_frame(&synthetic_one_picture_stream(), 0xCAFE_BABE);
+        let pkt = &pkts[0];
+        let (hdr, rest) = parse_rtp_fixed_header(&pkt.bytes).unwrap();
+        assert_eq!(hdr.version, 2);
+        assert!(!hdr.padding);
+        assert!(!hdr.extension);
+        assert_eq!(hdr.csrc_count, 0);
+        assert!(hdr.marker);
+        assert_eq!(hdr.payload_type, 101);
+        assert_eq!(hdr.sequence_number, 42);
+        assert_eq!(hdr.timestamp, 0xCAFE_BABE);
+        assert_eq!(hdr.ssrc, 0x1234_5678);
+        // The first 4 bytes of `rest` are the H.261 RTP payload header.
+        assert!(rest.len() >= HEADER_LEN);
+        let (h261_hdr, _payload) = unpack_header(rest).unwrap();
+        assert_eq!(h261_hdr.sbit, 0);
+        assert_eq!(h261_hdr.ebit, 0);
+    }
+
+    #[test]
+    fn parse_rtp_fixed_header_rejects_short_buffer() {
+        for n in 0..RTP_FIXED_HEADER_LEN {
+            let buf = vec![0x80u8; n]; // V=2 in the first byte but truncated
+            assert_eq!(parse_rtp_fixed_header(&buf), Err(RtpError::ShortHeader));
+        }
+    }
+
+    #[test]
+    fn parse_rtp_fixed_header_rejects_wrong_version() {
+        // V=1, P=0, X=0, CC=0 ⇒ 0x40.
+        let mut buf = vec![0u8; RTP_FIXED_HEADER_LEN];
+        buf[0] = 0x40;
+        assert_eq!(
+            parse_rtp_fixed_header(&buf),
+            Err(RtpError::FieldOverflow {
+                field: "RTP-V",
+                value: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_rtp_fixed_header_consumes_csrc_block() {
+        // V=2, P=0, X=0, CC=2 ⇒ byte 0 = 0x82. We feed 12 + 2*4 = 20 B.
+        let mut buf = vec![0u8; RTP_FIXED_HEADER_LEN + 8 + 3];
+        buf[0] = 0x82;
+        buf[1] = 0x00; // M=0, PT=0
+                       // Fill seq/ts/ssrc with sentinel zeros, then two CSRC ids.
+        buf[12..16].copy_from_slice(&0xAABB_CCDDu32.to_be_bytes());
+        buf[16..20].copy_from_slice(&0x1122_3344u32.to_be_bytes());
+        buf[20] = 0xFE; // sentinel tail byte
+        buf[21] = 0xED;
+        buf[22] = 0xBE;
+        let (hdr, rest) = parse_rtp_fixed_header(&buf).unwrap();
+        assert_eq!(hdr.csrc_count, 2);
+        assert_eq!(rest, &[0xFE, 0xED, 0xBE]);
+    }
+
+    #[test]
+    fn parse_rtp_fixed_header_short_when_csrc_count_overruns() {
+        // Claim CC=15 but only carry 12 bytes ⇒ ShortHeader.
+        let mut buf = vec![0u8; RTP_FIXED_HEADER_LEN];
+        buf[0] = 0x8F; // V=2, CC=15
+        assert_eq!(parse_rtp_fixed_header(&buf), Err(RtpError::ShortHeader));
+    }
+
+    #[test]
+    fn rtp_packet_round_trip_recovers_elementary_stream() {
+        // Pack a frame, then strip the RTP fixed header + reuse
+        // depacketize on the inner H.261 payloads to recover bytes.
+        // Use a deliberately tiny MTU so the synthetic stream is
+        // fragmented across packets.
+        let mut pk = RtpPacketizer::new(96, 0, 0, RTP_FIXED_HEADER_LEN + HEADER_LEN + 4);
+        // Stream: PSC + 30 bytes ⇒ inner budget is 4 ⇒ ≥ 8 chunks.
+        let mut frame = vec![0x00, 0x01, 0x00];
+        frame.extend(std::iter::repeat(0xA5).take(30));
+        let pkts = pk.pack_frame(&frame, 0);
+        assert!(
+            pkts.len() >= 2,
+            "expected fragmentation, got {}",
+            pkts.len()
+        );
+        let mut inner = Vec::new();
+        for p in &pkts {
+            let (_h, rest) = parse_rtp_fixed_header(&p.bytes).unwrap();
+            // Re-wrap as H261RtpPayload so depacketize can consume it.
+            inner.push(H261RtpPayload {
+                header: unpack_header(rest).unwrap().0,
+                bytes: rest.to_vec(),
+                marker: p.marker,
+            });
+        }
+        let recovered = depacketize(&inner).unwrap();
+        assert_eq!(recovered, frame);
     }
 }

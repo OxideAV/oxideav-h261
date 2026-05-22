@@ -142,6 +142,45 @@ context fields; the GOB-aligned packetizer sets the context fields to
 zero per §4.1. MB-level fragmentation with non-zero context is left to
 the caller via [`pack_header`] / [`unpack_header`].
 
+#### Encoder-side full RTP packetiser (`RtpPacketizer`)
+
+`RtpPacketizer` is the higher-level glue between the encoder and the
+RTP wire format. Construct one per RTP session (one SSRC) and call
+`pack_frame(frame_bytes, rtp_timestamp_90khz)` once per coded picture;
+it returns a sequence of `RtpPacket`s whose `bytes` field is a
+complete RFC 3550 §5.1 fixed header (V=2, P=0, X=0, CC=0, M, PT,
+sequence number, timestamp, SSRC) followed by the RFC 4587 §4.1
+4-byte H.261 header and the payload slice. The marker bit is set on
+the LAST packet of each frame per §4.1; sequence numbers auto-advance
+mod 2^16 across frames; the same RTP timestamp is stamped on every
+packet of a single frame (§4.1: "If a video image occupies more than
+one packet, the timestamp SHALL be the same on all of those packets").
+
+```rust
+use oxideav_h261::encoder::H261Encoder;
+use oxideav_h261::picture::SourceFormat;
+use oxideav_h261::rtp::RtpPacketizer;
+
+let mut enc = H261Encoder::new(SourceFormat::Qcif, 12);
+// PT=96 (dynamic-range), SSRC=0xFEEDFACE, initial seq=0, MTU 1400 B.
+let mut pk = RtpPacketizer::new(96, 0xFEEDFACE, 0, 1400).with_intra_only(false);
+
+let y = vec![0u8; 176 * 144];
+let cb = vec![128u8; 88 * 72];
+let cr = vec![128u8; 88 * 72];
+let bits = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap();
+let packets = pk.pack_frame(&bits, 0); // RTP 90-kHz timestamp = 0 for first frame
+for p in &packets {
+    // p.bytes is already framed; ship it as a UDP datagram payload.
+    assert!(p.bytes.len() <= 1400);
+}
+assert!(packets.last().unwrap().marker, "M=1 on the last packet of a frame");
+```
+
+Receivers can use `parse_rtp_fixed_header` to strip the 12-byte RFC 3550
+fixed header (including any CSRC list) and then feed the remaining inner
+payload into the existing `unpack_header` + `depacketize` path.
+
 ## Quick use
 
 ```rust

@@ -27,7 +27,10 @@
 //!   buffer at a given channel rate.
 //! * RTP payload-format wrapping (RFC 4587): the [`rtp`] module packs an
 //!   elementary stream into a sequence of GOB-aligned H.261 RTP payloads
-//!   (4-byte header + bitstream slice) and unpacks them back.
+//!   (4-byte header + bitstream slice) and unpacks them back. The
+//!   `RtpPacketizer` glue wraps each payload in a full RFC 3550 §5.1
+//!   RTP fixed header (V/P/X/CC/M/PT/seq/timestamp/SSRC) so callers can
+//!   hand `pack_frame` output straight to UDP / DTLS / SRTP.
 //!
 //! Out of scope:
 //! * Single-bit correction of corrupted BCH (511,493) codewords — the

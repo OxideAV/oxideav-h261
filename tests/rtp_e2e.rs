@@ -7,9 +7,12 @@
 //! must still accept it.
 
 use oxideav_h261::decoder::H261Decoder;
-use oxideav_h261::encoder::encode_intra_picture;
+use oxideav_h261::encoder::{encode_intra_picture, H261Encoder};
 use oxideav_h261::picture::SourceFormat;
-use oxideav_h261::rtp::{depacketize, packetize_gob_aligned, unpack_header, HEADER_LEN};
+use oxideav_h261::rtp::{
+    depacketize, packetize_gob_aligned, parse_rtp_fixed_header, unpack_header, H261RtpPayload,
+    RtpPacketizer, HEADER_LEN, RTP_FIXED_HEADER_LEN,
+};
 
 use oxideav_core::registry::codec::Decoder;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
@@ -129,5 +132,152 @@ fn rtp_payload_header_packs_to_4_bytes_uniformly() {
     for p in &pkts {
         assert!(p.bytes.len() > HEADER_LEN);
         assert_eq!(HEADER_LEN, 4);
+    }
+}
+
+// --------------------------------------------------------------------
+// RtpPacketizer (encoder-side full RFC 3550 packets)
+// --------------------------------------------------------------------
+
+#[test]
+fn rtp_packetizer_emits_full_rtp_packets_for_a_real_intra_frame() {
+    let (y, cb, cr) = gradient_qcif();
+    let bits = encode_qcif_intra(&y, &cb, &cr, 8, 0);
+    let mut pk = RtpPacketizer::new(96, 0xCAFEBABE, 100, 1400).with_intra_only(true);
+    let packets = pk.pack_frame(&bits, 90_000);
+    assert!(
+        !packets.is_empty(),
+        "RtpPacketizer should emit at least one packet for a real frame"
+    );
+
+    // Every packet carries the same SSRC + timestamp, and consecutive
+    // sequence numbers.
+    let mut expected_seq = 100u16;
+    for p in &packets {
+        assert_eq!(p.ssrc, 0xCAFEBABE);
+        assert_eq!(p.timestamp, 90_000);
+        assert_eq!(p.sequence_number, expected_seq);
+        expected_seq = expected_seq.wrapping_add(1);
+        // Wire bytes match struct.
+        assert_eq!(
+            u32::from_be_bytes(p.bytes[8..12].try_into().unwrap()),
+            p.ssrc
+        );
+        assert_eq!(
+            u32::from_be_bytes(p.bytes[4..8].try_into().unwrap()),
+            p.timestamp
+        );
+        assert_eq!(
+            u16::from_be_bytes(p.bytes[2..4].try_into().unwrap()),
+            p.sequence_number
+        );
+        // V=2, P=0, X=0, CC=0 ⇒ byte 0 == 0x80.
+        assert_eq!(p.bytes[0], 0x80);
+        assert!(p.bytes.len() <= 1400);
+        assert!(p.bytes.len() > RTP_FIXED_HEADER_LEN + HEADER_LEN);
+    }
+    // Exactly one packet — the last — carries M=1.
+    let markers: Vec<bool> = packets.iter().map(|p| p.marker).collect();
+    assert!(markers.last().copied().unwrap());
+    assert_eq!(markers.iter().filter(|m| **m).count(), 1);
+}
+
+#[test]
+fn rtp_packetizer_drives_h261_encoder_end_to_end() {
+    // Encode two frames (I then P) through the public H261Encoder API
+    // and packetise each one independently. Verify timestamps are
+    // independent, sequence numbers are dense, every frame's last
+    // packet carries the marker, and reassembled bytes decode through
+    // the H261Decoder.
+    let (y, cb, cr) = gradient_qcif();
+    let mut enc = H261Encoder::new(SourceFormat::Qcif, 12);
+    let mut pk = RtpPacketizer::new(96, 0xFEEDFACE, 9000, 1024).with_intra_only(false);
+
+    let bits_a = enc
+        .encode_frame(&y, 176, &cb, 88, &cr, 88)
+        .expect("encode frame A");
+    let bits_b = enc
+        .encode_frame(&y, 176, &cb, 88, &cr, 88)
+        .expect("encode frame B");
+
+    let packets_a = pk.pack_frame(&bits_a, 0);
+    let packets_b = pk.pack_frame(&bits_b, 3000); // +3000 ticks at 90 kHz = 1/30s
+    assert!(!packets_a.is_empty());
+    assert!(!packets_b.is_empty());
+
+    // All packets in A share timestamp 0, all in B share timestamp 3000.
+    for p in &packets_a {
+        assert_eq!(p.timestamp, 0);
+    }
+    for p in &packets_b {
+        assert_eq!(p.timestamp, 3000);
+    }
+    // Sequence numbers run dense across the frame boundary.
+    assert_eq!(
+        packets_b[0].sequence_number,
+        packets_a.last().unwrap().sequence_number.wrapping_add(1)
+    );
+    // Marker bit set exactly on the last packet of each frame.
+    assert!(packets_a.last().unwrap().marker);
+    assert!(packets_b.last().unwrap().marker);
+    assert_eq!(packets_a.iter().filter(|p| p.marker).count(), 1);
+    assert_eq!(packets_b.iter().filter(|p| p.marker).count(), 1);
+
+    // Receiver path: parse the RTP fixed headers, hand the inner H.261
+    // payloads to depacketize, decode the result.
+    let mut dec = H261Decoder::new(CodecId::new(oxideav_h261::CODEC_ID_STR));
+    for (frame_pkts, frame_bits) in [(&packets_a, &bits_a), (&packets_b, &bits_b)] {
+        let mut inner = Vec::new();
+        for rp in frame_pkts {
+            let (rtp_hdr, rest) = parse_rtp_fixed_header(&rp.bytes).expect("rtp parse");
+            assert_eq!(rtp_hdr.payload_type, 96);
+            assert_eq!(rtp_hdr.ssrc, 0xFEEDFACE);
+            let (h261_hdr, _payload) = unpack_header(rest).expect("h261 unpack");
+            inner.push(H261RtpPayload {
+                header: h261_hdr,
+                bytes: rest.to_vec(),
+                marker: rp.marker,
+            });
+        }
+        let recovered = depacketize(&inner).expect("depacketize");
+        assert_eq!(
+            recovered, *frame_bits,
+            "RtpPacketizer round trip must be byte-exact"
+        );
+        let pkt = Packet::new(0, TimeBase::new(1, 30), recovered);
+        dec.send_packet(&pkt).expect("send_packet");
+    }
+    dec.flush().expect("flush");
+    let mut frames = 0;
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(vf)) => {
+                assert_eq!(vf.planes[0].stride, 176);
+                frames += 1;
+            }
+            Ok(other) => panic!("expected video frame, got {other:?}"),
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("decode failed after RtpPacketizer: {e}"),
+        }
+    }
+    assert!(frames >= 1, "expected at least one decoded frame");
+}
+
+#[test]
+fn rtp_packetizer_payload_size_fits_under_mtu() {
+    // Every emitted packet must be ≤ max_rtp_packet_size, never above.
+    let (y, cb, cr) = gradient_qcif();
+    let bits = encode_qcif_intra(&y, &cb, &cr, 16, 0);
+    for &mtu in &[64usize, 200, 512, 1500] {
+        let mut pk = RtpPacketizer::new(96, 1, 0, mtu);
+        let packets = pk.pack_frame(&bits, 0);
+        for p in &packets {
+            assert!(
+                p.bytes.len() <= mtu,
+                "packet len {} exceeds mtu {}",
+                p.bytes.len(),
+                mtu
+            );
+        }
     }
 }
