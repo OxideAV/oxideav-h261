@@ -281,3 +281,79 @@ fn rtp_packetizer_payload_size_fits_under_mtu() {
         }
     }
 }
+
+#[test]
+fn rtcp_sender_report_reflects_packetizer_session_state() {
+    use oxideav_h261::rtcp::{parse_report, ReceptionReportBlock, PT_SR};
+
+    // Encode two QCIF I-pictures and packetize each, then build an RTCP SR
+    // from the packetizer's running counters (RFC 3550 §6.4.1).
+    let (y, cb, cr) = gradient_qcif();
+    let f0 = encode_qcif_intra(&y, &cb, &cr, 12, 0);
+    let f1 = encode_qcif_intra(&y, &cb, &cr, 12, 1);
+
+    let mut pk = RtpPacketizer::new(96, 0x1357_9BDF, 0, 1500);
+    let p0 = pk.pack_frame(&f0, 0);
+    let p1 = pk.pack_frame(&f1, 3003);
+
+    let expected_packets = (p0.len() + p1.len()) as u32;
+    let expected_octets: u32 = p0
+        .iter()
+        .chain(p1.iter())
+        .map(|p| (p.bytes.len() - RTP_FIXED_HEADER_LEN) as u32)
+        .sum();
+    assert_eq!(pk.packet_count(), expected_packets);
+    assert_eq!(pk.octet_count(), expected_octets);
+
+    // SR with one reception report block describing a peer.
+    let block = ReceptionReportBlock {
+        ssrc: 0x2468_ACE0,
+        fraction_lost: 26, // ~10%
+        cumulative_lost: 5,
+        extended_highest_seq: 0x0001_0042,
+        jitter: 144,
+        last_sr: 0xB705_2000,
+        delay_since_last_sr: 0x0005_4000,
+    };
+    let ntp = 0xB44D_B705_2000_0000u64;
+    let sr = pk.sender_report(ntp, std::slice::from_ref(&block)).unwrap();
+
+    let parsed = parse_report(&sr).unwrap();
+    assert_eq!(parsed.packet_type, PT_SR);
+    assert_eq!(parsed.ssrc, 0x1357_9BDF);
+    let info = parsed.sender_info.expect("SR carries sender info");
+    assert_eq!(info.ntp_timestamp, ntp);
+    assert_eq!(info.rtp_timestamp, 3003); // last frame's RTP timestamp
+    assert_eq!(info.packet_count, expected_packets);
+    assert_eq!(info.octet_count, expected_octets);
+    assert_eq!(parsed.report_blocks, vec![block]);
+}
+
+#[test]
+fn rtcp_receiver_report_round_trips_pure_receiver_path() {
+    use oxideav_h261::rtcp::{build_receiver_report, parse_report, ReceptionReportBlock, PT_RR};
+
+    // A pure receiver (no media transmitted) emits an RR. The canonical
+    // empty RR (RC = 0) heads a compound packet when nothing is heard;
+    // a populated RR carries one block per source.
+    let empty = build_receiver_report(0xCAFE, &[]).unwrap();
+    let parsed_empty = parse_report(&empty).unwrap();
+    assert_eq!(parsed_empty.packet_type, PT_RR);
+    assert!(parsed_empty.sender_info.is_none());
+    assert!(parsed_empty.report_blocks.is_empty());
+
+    let block = ReceptionReportBlock {
+        ssrc: 0x1357_9BDF, // the sender from the previous test
+        fraction_lost: 0,
+        cumulative_lost: -2, // a duplicate arrived ⇒ negative
+        extended_highest_seq: 0x0000_00FF,
+        jitter: 7,
+        last_sr: 0x1122_3344,
+        delay_since_last_sr: 0x0000_8000,
+    };
+    let rr = build_receiver_report(0xCAFE, std::slice::from_ref(&block)).unwrap();
+    let parsed = parse_report(&rr).unwrap();
+    assert_eq!(parsed.ssrc, 0xCAFE);
+    assert_eq!(parsed.report_blocks, vec![block]);
+    assert_eq!(parsed.report_blocks[0].cumulative_lost, -2);
+}

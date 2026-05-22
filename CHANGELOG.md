@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RTCP Sender / Receiver Report builders (`oxideav_h261::rtcp`).** The
+  control-channel companions to the RTP data path (RFC 3550 §6.4).
+  `build_sender_report` (PT=200, §6.4.1) emits the 8-byte RTCP header +
+  20-byte sender-info section (NTP + RTP timestamps, sender's packet &
+  octet counts) + 0..=31 reception report blocks; `build_receiver_report`
+  (PT=201, §6.4.2) is the same minus the sender-info section, with an
+  empty RR (RC=0) as the canonical "nothing to report" packet.
+  `ReceptionReportBlock` (24 bytes: SSRC, 8-bit fraction lost, 24-bit
+  two's-complement cumulative lost, extended highest sequence number,
+  jitter, LSR, DLSR) and `SenderInfo` round-trip through `parse_report`,
+  which validates V=2, the SR/RR PT, and the §6.4.1 `length` field
+  (32-bit words minus one). `RtpPacketizer` now tracks the session's
+  running packet/octet counts and the last frame's RTP timestamp, exposed
+  via `packet_count()` / `octet_count()` / `sender_info()` and a
+  `sender_report()` convenience that drops a conformant SR straight out of
+  the packetiser state. Scheduling (§6.2), SDES/CNAME/BYE, and the
+  §A.1/§A.3/§A.8 loss/jitter estimators remain caller-side (out of scope
+  for the codec). Wired through end-to-end tests that encode QCIF
+  I-pictures, packetize them, build an SR from the packetiser counters,
+  and round-trip both SR and RR through the parser.
+
 - **Encoder-side RTP packetiser (`RtpPacketizer`).** Higher-level glue
   between `H261Encoder` and the RTP wire format. Construct with
   `RtpPacketizer::new(payload_type, ssrc, initial_sequence_number,

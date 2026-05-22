@@ -594,6 +594,16 @@ pub struct RtpPacketizer {
     max_payload: usize,
     intra_only: bool,
     motion_vectors: bool,
+    /// Running count of RTP data packets emitted by `pack_frame`, for the
+    /// SR "sender's packet count" field (RFC 3550 §6.4.1). Wraps mod 2^32.
+    packet_count: u32,
+    /// Running count of payload octets (everything after the 12-byte RTP
+    /// fixed header) emitted by `pack_frame`, for the SR "sender's octet
+    /// count" field (RFC 3550 §6.4.1). Wraps mod 2^32.
+    octet_count: u32,
+    /// RTP timestamp of the most recently packed frame, surfaced into the
+    /// SR sender-info section. `None` until the first `pack_frame` call.
+    last_rtp_timestamp: Option<u32>,
 }
 
 impl RtpPacketizer {
@@ -629,6 +639,9 @@ impl RtpPacketizer {
             max_payload: max_rtp_packet_size,
             intra_only: false,
             motion_vectors: true,
+            packet_count: 0,
+            octet_count: 0,
+            last_rtp_timestamp: None,
         }
     }
 
@@ -716,6 +729,13 @@ impl RtpPacketizer {
             );
             bytes.extend_from_slice(&p.bytes);
 
+            // RFC 3550 §6.4.1: "sender's octet count" is the total number
+            // of *payload* octets — everything after the RTP fixed header,
+            // excluding header and padding. For H.261 that's the 4-byte
+            // payload header plus the bitstream slice (== p.bytes.len()).
+            self.packet_count = self.packet_count.wrapping_add(1);
+            self.octet_count = self.octet_count.wrapping_add(p.bytes.len() as u32);
+
             out.push(RtpPacket {
                 bytes,
                 marker,
@@ -724,7 +744,61 @@ impl RtpPacketizer {
                 ssrc: self.ssrc,
             });
         }
+        if !out.is_empty() {
+            self.last_rtp_timestamp = Some(rtp_timestamp_90khz);
+        }
         out
+    }
+
+    /// Total RTP data packets this packetiser has emitted so far — the
+    /// "sender's packet count" field of an RTCP SR (RFC 3550 §6.4.1).
+    pub fn packet_count(&self) -> u32 {
+        self.packet_count
+    }
+
+    /// Total payload octets this packetiser has emitted so far (everything
+    /// after each RTP fixed header) — the "sender's octet count" field of
+    /// an RTCP SR (RFC 3550 §6.4.1).
+    pub fn octet_count(&self) -> u32 {
+        self.octet_count
+    }
+
+    /// Build the [`crate::rtcp::SenderInfo`] section for an RTCP Sender
+    /// Report from this packetiser's running counters (RFC 3550 §6.4.1).
+    ///
+    /// `ntp_timestamp` is the 64-bit NTP wallclock at which the SR is being
+    /// sent (the caller's clock; pass `0` if it has no notion of wallclock,
+    /// per §6.4.1). The RTP timestamp written into the sender info is the
+    /// timestamp of the most recently packed frame; if no frame has been
+    /// packed yet it is `0`.
+    ///
+    /// The returned `SenderInfo` is fed to
+    /// [`crate::rtcp::build_sender_report`] together with this packetiser's
+    /// [`Self::ssrc`] and any reception report blocks the endpoint has.
+    pub fn sender_info(&self, ntp_timestamp: u64) -> crate::rtcp::SenderInfo {
+        crate::rtcp::SenderInfo {
+            ntp_timestamp,
+            rtp_timestamp: self.last_rtp_timestamp.unwrap_or(0),
+            packet_count: self.packet_count,
+            octet_count: self.octet_count,
+        }
+    }
+
+    /// Build a complete RTCP Sender Report (PT = 200) for this session from
+    /// the packetiser's running counters plus caller-supplied reception
+    /// report blocks (RFC 3550 §6.4.1).
+    ///
+    /// `ntp_timestamp` is the wallclock NTP value for the report instant;
+    /// `blocks` are the reception report blocks for sources this endpoint
+    /// has heard (0..=31). Returns the wire bytes, or
+    /// [`crate::rtcp::RtcpError::TooManyReportBlocks`] if more than 31
+    /// blocks are supplied.
+    pub fn sender_report(
+        &self,
+        ntp_timestamp: u64,
+        blocks: &[crate::rtcp::ReceptionReportBlock],
+    ) -> Result<Vec<u8>, crate::rtcp::RtcpError> {
+        crate::rtcp::build_sender_report(self.ssrc, &self.sender_info(ntp_timestamp), blocks)
     }
 }
 
@@ -1358,6 +1432,68 @@ mod tests {
         let mut buf = vec![0u8; RTP_FIXED_HEADER_LEN];
         buf[0] = 0x8F; // V=2, CC=15
         assert_eq!(parse_rtp_fixed_header(&buf), Err(RtpError::ShortHeader));
+    }
+
+    #[test]
+    fn packetizer_tracks_packet_and_octet_counts() {
+        use crate::rtcp::{parse_report, PT_SR};
+        let mut pk = RtpPacketizer::new(96, 0xABCD, 0, 1500);
+        assert_eq!(pk.packet_count(), 0);
+        assert_eq!(pk.octet_count(), 0);
+
+        let frame = synthetic_one_picture_stream();
+        let pkts = pk.pack_frame(&frame, 9000);
+        assert_eq!(pkts.len(), 1);
+        // One packet emitted; octet count is everything after the 12-byte
+        // fixed header = HEADER_LEN + inner data.
+        assert_eq!(pk.packet_count(), 1);
+        let expected_octets = (pkts[0].bytes.len() - RTP_FIXED_HEADER_LEN) as u32;
+        assert_eq!(pk.octet_count(), expected_octets);
+
+        // A second frame accumulates.
+        let pkts2 = pk.pack_frame(&frame, 12000);
+        assert_eq!(pk.packet_count(), 2);
+        let expected2 = expected_octets + (pkts2[0].bytes.len() - RTP_FIXED_HEADER_LEN) as u32;
+        assert_eq!(pk.octet_count(), expected2);
+
+        // Build an SR from the packetiser state and verify the counters
+        // round-trip and the RTP timestamp is the last frame's.
+        let sr = pk
+            .sender_report(SenderInfoTestClock::NTP, &[])
+            .expect("sr builds");
+        let parsed = parse_report(&sr).unwrap();
+        assert_eq!(parsed.packet_type, PT_SR);
+        assert_eq!(parsed.ssrc, 0xABCD);
+        let info = parsed.sender_info.expect("SR carries sender info");
+        assert_eq!(info.packet_count, 2);
+        assert_eq!(info.octet_count, expected2);
+        assert_eq!(info.rtp_timestamp, 12000);
+        assert_eq!(info.ntp_timestamp, SenderInfoTestClock::NTP);
+    }
+
+    struct SenderInfoTestClock;
+    impl SenderInfoTestClock {
+        const NTP: u64 = 0xB44D_B705_2000_0000;
+    }
+
+    #[test]
+    fn sender_info_rtp_timestamp_zero_before_any_frame() {
+        let pk = RtpPacketizer::new(96, 1, 0, 1500);
+        let info = pk.sender_info(0);
+        assert_eq!(info.rtp_timestamp, 0);
+        assert_eq!(info.packet_count, 0);
+        assert_eq!(info.octet_count, 0);
+    }
+
+    #[test]
+    fn empty_pack_frame_does_not_advance_counters() {
+        let mut pk = RtpPacketizer::new(96, 1, 0, 1500);
+        let _ = pk.pack_frame(&[], 5);
+        let _ = pk.pack_frame(&[0xFFu8; 8], 5); // no start codes
+        assert_eq!(pk.packet_count(), 0);
+        assert_eq!(pk.octet_count(), 0);
+        // last_rtp_timestamp stays unset.
+        assert_eq!(pk.sender_info(0).rtp_timestamp, 0);
     }
 
     #[test]

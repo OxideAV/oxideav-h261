@@ -36,6 +36,7 @@ oxideav-h261 = "0.0"
 | BCH (511,493) FEC framing (§5.4)                 | yes    | yes    |
 | HRD buffer model (§5.2 + Annex B)                | yes    | yes    |
 | RTP payload format (RFC 4587 §4.1)               | yes    | yes    |
+| RTCP SR / RR reports (RFC 3550 §6.4)             | yes    | yes    |
 
 H.261 only permits integer-pel motion vectors (range ±15); there are no
 half-pel refinements, no B-pictures, and no start-code emulation prevention.
@@ -180,6 +181,35 @@ assert!(packets.last().unwrap().marker, "M=1 on the last packet of a frame");
 Receivers can use `parse_rtp_fixed_header` to strip the 12-byte RFC 3550
 fixed header (including any CSRC list) and then feed the remaining inner
 payload into the existing `unpack_header` + `depacketize` path.
+
+### RTCP Sender / Receiver Reports (RFC 3550 §6.4)
+
+The `rtcp` module builds and parses the two RTCP report packets an H.261
+endpoint emits on its control channel: the **Sender Report** (SR, PT=200,
+§6.4.1) with its 20-byte sender-info section (NTP + RTP timestamps,
+sender's packet & octet counts) and the **Receiver Report** (RR, PT=201,
+§6.4.2). Both carry up to 31 24-byte `ReceptionReportBlock`s (SSRC,
+fraction lost, 24-bit two's-complement cumulative lost, extended highest
+sequence number, jitter, LSR, DLSR). `RtpPacketizer` tracks the running
+packet/octet counts so a conformant SR drops straight out of the session:
+
+```rust
+use oxideav_h261::rtcp::{ReceptionReportBlock, parse_report};
+use oxideav_h261::rtp::RtpPacketizer;
+
+let mut pk = RtpPacketizer::new(96, 0x1357_9BDF, 0, 1400);
+let _ = pk.pack_frame(&frame_bytes, 0); // tracks packet & octet counts
+let block = ReceptionReportBlock { ssrc: 0x2468_ACE0, fraction_lost: 26, ..Default::default() };
+let sr = pk.sender_report(/* ntp */ 0xB44D_B705_2000_0000, &[block]).unwrap();
+let report = parse_report(&sr).unwrap(); // round-trips the SR fields
+# let frame_bytes: Vec<u8> = vec![];
+```
+
+The builders only (de)serialise the report wire format; the §6.2
+transmission-interval scheduler, SDES/CNAME compound items, BYE, and the
+§A.1/§A.3/§A.8 loss/jitter estimators are session-management concerns
+above the codec and remain caller-side. Empty RR (RC=0) is supported as
+the canonical "nothing to report" packet that heads a compound RTCP packet.
 
 ## Quick use
 

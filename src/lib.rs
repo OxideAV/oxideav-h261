@@ -31,6 +31,11 @@
 //!   `RtpPacketizer` glue wraps each payload in a full RFC 3550 §5.1
 //!   RTP fixed header (V/P/X/CC/M/PT/seq/timestamp/SSRC) so callers can
 //!   hand `pack_frame` output straight to UDP / DTLS / SRTP.
+//! * RTCP report packets (RFC 3550 §6.4): the [`rtcp`] module builds and
+//!   parses Sender Report (SR, PT=200) and Receiver Report (RR, PT=201)
+//!   packets — the control-channel companions to the [`rtp`] data path.
+//!   `RtpPacketizer` tracks the sender's running packet / octet counts so a
+//!   conformant SR can be emitted directly from its session state.
 //!
 //! Out of scope:
 //! * Single-bit correction of corrupted BCH (511,493) codewords — the
@@ -59,6 +64,7 @@ pub mod idct;
 pub mod mb;
 pub mod picture;
 pub mod quant;
+pub mod rtcp;
 pub mod rtp;
 pub mod start_code;
 pub mod tables;
