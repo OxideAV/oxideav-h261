@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RTCP APP (Application-Defined) packet (`oxideav_h261::rtcp`).** Builder and
+  parser for RFC 3550 §6.7 (PT = 204). `build_app(subtype, ssrc, name, data)`
+  emits the standard 4-byte RTCP header (with the 5-bit RC slot reused as the
+  §6.7 subtype) + SSRC + 4-octet ASCII name + application-dependent data;
+  `parse_app` reverses it. The builder enforces three §6.7 invariants —
+  `subtype` ≤ 31 (5-bit field, `AppSubtypeOutOfRange`), `name` exactly 4
+  octets (`AppNameWrongLength`), and `data.len() % 4 == 0`
+  (`AppDataNotAligned`, "must be a multiple of 32 bits long"). The parser
+  rejects truncated buffers, V != 2, PT != 204, and length-field-smaller-than-
+  mandatory-header. APP packets now round-trip through `parse_compound` as a
+  typed `RtcpPacket::App(AppPacket)` variant rather than falling into the
+  catch-all `Other`; unknown PTs (e.g. RFC 4585 RTPFB = 205) still surface as
+  `Other`. §6.7 mandates names be case-sensitive ("uppercase and lowercase
+  characters treated as distinct"), so the parser surfaces the four bytes
+  verbatim without case folding. The §6.2 transmission-interval scheduler and
+  the §A.1 / §A.3 / §A.8 loss-fraction / jitter estimators remain caller-side
+  (out of scope for the codec). 14 new unit tests cover the header layout for
+  empty + data-bearing packets, subtype-0 / subtype-31 boundaries, 1024-byte
+  payload round-trip, byte-exact (non-case-folded) name preservation,
+  short-header / bad-version / wrong-PT / truncated-by-length / past-stated-
+  length rejection paths, all three builder validation errors (subtype-32,
+  name-of-every-non-4-length, data-of-every-non-aligned-length 1..=9), and a
+  compound RR + SDES + APP round-trip that pulls the App variant back typed.
+  The pre-existing "compound_preserves_unknown_app_packet" test was updated to
+  use PT = 205 (a stand-in for an RFC 4585 RTPFB packet this module doesn't
+  model) since APP is no longer "unknown."
+
 - **RTCP SDES + BYE + compound packets (`oxideav_h261::rtcp`).** Rounds out
   the control channel beyond SR/RR (RFC 3550 §6.5 / §6.6 / §6.1).
   `build_sdes` / `parse_sdes` (PT=202, §6.5) handle Source Description

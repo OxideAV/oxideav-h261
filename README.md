@@ -38,6 +38,7 @@ oxideav-h261 = "0.0"
 | RTP payload format (RFC 4587 §4.1)               | yes    | yes    |
 | RTCP SR / RR reports (RFC 3550 §6.4)             | yes    | yes    |
 | RTCP SDES + BYE + compound (RFC 3550 §6.5/§6.6)  | yes    | yes    |
+| RTCP APP application-defined (RFC 3550 §6.7)     | yes    | yes    |
 
 H.261 only permits integer-pel motion vectors (range ±15); there are no
 half-pel refinements, no B-pictures, and no start-code emulation prevention.
@@ -247,6 +248,47 @@ let datagram = compound(&[&rr, &sdes, &bye]);
 let parsed = parse_compound(&datagram).unwrap();
 assert_eq!(parsed.len(), 3);
 ```
+
+### RTCP APP application-defined (RFC 3550 §6.7)
+
+`build_app` / `parse_app` round-trip the **Application-Defined** RTCP packet
+type (PT = 204). The wire format is the standard 4-byte RTCP header (with the
+5-bit RC slot reused as a 5-bit `subtype`) followed by the originating SSRC,
+a 4-octet ASCII `name`, and optional application-dependent data — §6.7 requires
+the data section to be a multiple of 32 bits long. Names are byte-exact:
+§6.7 mandates that uppercase and lowercase characters be treated as distinct,
+so the parser surfaces the four bytes without any case folding. The builder
+rejects `subtype > 31`, `name.len() != 4`, and `data.len() % 4 != 0`; the
+parser rejects V != 2, PT != 204, a length field smaller than the mandatory
+12-byte header, and a length field that runs past the buffer end. APP packets
+that flow through a compound RTCP datagram now come back as a typed
+`RtcpPacket::App(AppPacket)` variant from `parse_compound`; unknown packet
+types (e.g. RFC 4585 RTPFB = 205) still surface as `RtcpPacket::Other`.
+
+```rust
+use oxideav_h261::rtcp::{build_app, parse_app, build_receiver_report, build_cname_sdes,
+                          compound, parse_compound, RtcpPacket};
+
+// Application-defined ping-style packet: name "PING", subtype = sequence,
+// data = 4-byte echo cookie.
+let cookie: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+let app = build_app(/* subtype */ 7, /* ssrc */ 0xCAFE_F00D, b"PING", &cookie).unwrap();
+let parsed = parse_app(&app).unwrap();
+assert_eq!(parsed.subtype, 7);
+assert_eq!(&parsed.name, b"PING");
+assert_eq!(parsed.data, cookie);
+
+// Drops cleanly into a compound datagram alongside the mandatory RR + SDES.
+let rr = build_receiver_report(0xCAFE_F00D, &[]).unwrap();
+let sdes = build_cname_sdes(0xCAFE_F00D, "me@host").unwrap();
+let datagram = compound(&[&rr, &sdes, &app]);
+let packets = parse_compound(&datagram).unwrap();
+assert!(matches!(packets[2], RtcpPacket::App(_)));
+```
+
+The §6.2 transmission-interval scheduler and the §A.1 / §A.3 / §A.8
+loss-fraction / jitter estimators remain caller-side — they belong above the
+codec in session-management code, not in the wire-format module.
 
 ## Quick use
 

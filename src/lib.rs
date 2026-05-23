@@ -36,6 +36,13 @@
 //!   packets — the control-channel companions to the [`rtp`] data path.
 //!   `RtpPacketizer` tracks the sender's running packet / octet counts so a
 //!   conformant SR can be emitted directly from its session state.
+//! * RTCP SDES / BYE / APP packets (RFC 3550 §6.5 / §6.6 / §6.7): the
+//!   [`rtcp`] module also builds and parses Source Description (SDES,
+//!   PT=202), Goodbye (BYE, PT=203), and Application-Defined (APP, PT=204)
+//!   packets, plus compound-packet (§6.1) concatenation and walking. APP
+//!   carries a 4-byte ASCII name + 32-bit-aligned application-dependent
+//!   data for application-layer extensions that do not warrant their own
+//!   IANA-registered packet type.
 //!
 //! Out of scope:
 //! * Single-bit correction of corrupted BCH (511,493) codewords — the

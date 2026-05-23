@@ -22,6 +22,10 @@
 //!   PHONE / LOC / TOOL / NOTE / PRIV (§6.5.2–§6.5.8) are also supported.
 //! * **BYE** (Goodbye, PT = 203, §6.6) — announces that one or more SSRC/CSRC
 //!   sources have left the session, with an optional free-text reason.
+//! * **APP** (Application-Defined, PT = 204, §6.7) — a four-octet ASCII name
+//!   plus an arbitrary application-dependent payload (a multiple of 32 bits
+//!   long). Intended for experimental extensions and per-application control
+//!   that does not warrant its own IANA-registered packet type.
 //!
 //! ## Compound packets (§6.1)
 //!
@@ -108,6 +112,15 @@ pub const PT_RR: u8 = 201;
 pub const PT_SDES: u8 = 202;
 /// PT code for an RTCP Goodbye packet (RFC 3550 §6.6).
 pub const PT_BYE: u8 = 203;
+/// PT code for an RTCP Application-defined packet (RFC 3550 §6.7).
+pub const PT_APP: u8 = 204;
+
+/// Length in octets of the APP `name` field (RFC 3550 §6.7:
+/// "name: 4 octets … a sequence of four ASCII characters").
+pub const APP_NAME_LEN: usize = 4;
+
+/// Maximum value the 5-bit APP `subtype` field can hold (RFC 3550 §6.7).
+pub const APP_SUBTYPE_MAX: u8 = 31;
 
 /// Maximum number of chunks (SDES) or SSRC/CSRC identifiers (BYE) that fit in
 /// one packet — the SC field is 5 bits (RFC 3550 §6.5 / §6.6).
@@ -169,6 +182,13 @@ pub enum RtcpError {
     /// A `PRIV` SDES item's prefix + value would exceed the 255-octet item
     /// length budget once the 1-byte prefix-length is included (RFC 3550 §6.5.8).
     PrivTooLong { len: usize },
+    /// An APP `name` field is not exactly 4 octets (RFC 3550 §6.7).
+    AppNameWrongLength { len: usize },
+    /// An APP `application-dependent data` blob is not a multiple of 32 bits
+    /// (RFC 3550 §6.7: "It must be a multiple of 32 bits long.").
+    AppDataNotAligned { len: usize },
+    /// An APP `subtype` exceeds the 5-bit field maximum of 31 (RFC 3550 §6.7).
+    AppSubtypeOutOfRange { value: u8 },
 }
 
 impl core::fmt::Display for RtcpError {
@@ -198,6 +218,15 @@ impl core::fmt::Display for RtcpError {
             }
             RtcpError::PrivTooLong { len } => {
                 write!(f, "rtcp: PRIV item {len} octets exceeds the 255 limit")
+            }
+            RtcpError::AppNameWrongLength { len } => {
+                write!(f, "rtcp: APP name is {len} octets, must be exactly 4")
+            }
+            RtcpError::AppDataNotAligned { len } => {
+                write!(f, "rtcp: APP data is {len} octets, must be a multiple of 4")
+            }
+            RtcpError::AppSubtypeOutOfRange { value } => {
+                write!(f, "rtcp: APP subtype {value} exceeds the 5-bit max of 31")
             }
         }
     }
@@ -914,6 +943,137 @@ pub fn parse_bye(buf: &[u8]) -> Result<ByePacket, RtcpError> {
 }
 
 // ---------------------------------------------------------------------------
+// APP — Application-Defined RTCP Packet (RFC 3550 §6.7)
+// ---------------------------------------------------------------------------
+//
+// Wire layout (§6.7):
+//
+// ```text
+//  0                   1                   2                   3
+//   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  |V=2|P| subtype |   PT=APP=204  |             length            |
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  |                          SSRC/CSRC                            |
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  |                          name (ASCII)                         |
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  |                  application-dependent data                ...
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// ```
+//
+// The APP packet replaces the SR/RR's 5-bit RC field with a 5-bit `subtype`,
+// adds a 4-byte ASCII `name`, and follows with optional application-defined
+// data that "must be a multiple of 32 bits long" (§6.7). Names with
+// unrecognised values "should be ignored" (§6.7) — this module exposes the
+// raw bytes back to the caller so application-layer routing can do that.
+
+/// A parsed RTCP APP (Application-Defined) packet (RFC 3550 §6.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppPacket {
+    /// 5-bit subtype field. Per §6.7, "may be used as a subtype to allow a
+    /// set of APP packets to be defined under one unique name, or for any
+    /// application-dependent data."
+    pub subtype: u8,
+    /// SSRC/CSRC identifier of the source.
+    pub ssrc: u32,
+    /// The 4-byte ASCII name field. Held as raw bytes because §6.7 mandates
+    /// "uppercase and lowercase characters treated as distinct" — case-folding
+    /// would silently merge namespaces — and because we never want to panic on
+    /// a malformed remote-host packet that put non-ASCII bytes here.
+    pub name: [u8; APP_NAME_LEN],
+    /// Application-dependent data. Always a multiple of 4 bytes long per §6.7;
+    /// may be empty. The application interprets it; this module does not.
+    pub data: Vec<u8>,
+}
+
+/// Build an RTCP APP (Application-Defined) packet (PT = 204, RFC 3550 §6.7).
+///
+/// `subtype` (0..=31) goes into the 5-bit RC-slot field. `ssrc` is the
+/// source identifier. `name` is the mandatory 4-byte ASCII name (the function
+/// rejects any other length). `data` is the application-dependent payload —
+/// it must be a multiple of 4 bytes (§6.7); pass an empty slice for none.
+///
+/// Returns the wire bytes (a multiple of 4 in length, no padding), or one of:
+/// * [`RtcpError::AppSubtypeOutOfRange`] — `subtype` > 31.
+/// * [`RtcpError::AppNameWrongLength`] — `name.len() != 4`.
+/// * [`RtcpError::AppDataNotAligned`] — `data.len() % 4 != 0`.
+pub fn build_app(subtype: u8, ssrc: u32, name: &[u8], data: &[u8]) -> Result<Vec<u8>, RtcpError> {
+    if subtype > APP_SUBTYPE_MAX {
+        return Err(RtcpError::AppSubtypeOutOfRange { value: subtype });
+    }
+    if name.len() != APP_NAME_LEN {
+        return Err(RtcpError::AppNameWrongLength { len: name.len() });
+    }
+    if data.len() % 4 != 0 {
+        return Err(RtcpError::AppDataNotAligned { len: data.len() });
+    }
+    // Header (4) + SSRC (4) + name (4) + data.
+    let total = RTCP_HEADER_FIXED_LEN + 4 + APP_NAME_LEN + data.len();
+    debug_assert_eq!(total % 4, 0);
+    let mut buf = Vec::with_capacity(total);
+    // The header writer uses the same V/P/cnt|PT|length layout as SDES/BYE;
+    // here `cnt` is the §6.7 subtype slot.
+    write_count_header(&mut buf, subtype, PT_APP, total);
+    buf.extend_from_slice(&ssrc.to_be_bytes());
+    buf.extend_from_slice(name);
+    buf.extend_from_slice(data);
+    debug_assert_eq!(buf.len(), total);
+    Ok(buf)
+}
+
+/// Parse a single RTCP APP packet from the front of `buf` (RFC 3550 §6.7).
+///
+/// Validates V=2 and PT=204, reads the subtype out of the 5-bit RC slot, then
+/// reads SSRC, the 4-byte name, and the application-dependent data up to the
+/// length field's stated end. The `length` field bounds how far the parser
+/// will read into `buf`; any bytes past it are ignored. Returns
+/// [`RtcpError::Truncated`] if the stated length runs past the buffer end,
+/// [`RtcpError::ShortHeader`] if `buf` is shorter than the 12-byte
+/// header + SSRC + name, [`RtcpError::BadVersion`] for V != 2, or
+/// [`RtcpError::UnexpectedPacketType`] if PT is not 204.
+pub fn parse_app(buf: &[u8]) -> Result<AppPacket, RtcpError> {
+    // Minimum APP packet is the 4-byte header + SSRC (4) + name (4) = 12.
+    const MIN_LEN: usize = RTCP_HEADER_FIXED_LEN + 4 + APP_NAME_LEN;
+    if buf.len() < MIN_LEN {
+        return Err(RtcpError::ShortHeader);
+    }
+    let b0 = buf[0];
+    if (b0 >> 6) & 0x3 != 2 {
+        return Err(RtcpError::BadVersion {
+            value: (b0 >> 6) & 0x3,
+        });
+    }
+    if buf[1] != PT_APP {
+        return Err(RtcpError::UnexpectedPacketType { value: buf[1] });
+    }
+    let subtype = b0 & 0x1F;
+    let stated_words = u16::from_be_bytes([buf[2], buf[3]]);
+    let stated_total = (stated_words as usize + 1) * 4;
+    if stated_total < MIN_LEN {
+        // Length field claims fewer bytes than the mandatory APP header itself.
+        return Err(RtcpError::LengthMismatch {
+            stated_words: stated_total.div_ceil(4) as u16,
+            actual_words: MIN_LEN.div_ceil(4) as u16,
+        });
+    }
+    if buf.len() < stated_total {
+        return Err(RtcpError::Truncated);
+    }
+    let ssrc = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let mut name = [0u8; APP_NAME_LEN];
+    name.copy_from_slice(&buf[8..8 + APP_NAME_LEN]);
+    let data_start = RTCP_HEADER_FIXED_LEN + 4 + APP_NAME_LEN;
+    let data = buf[data_start..stated_total].to_vec();
+    Ok(AppPacket {
+        subtype,
+        ssrc,
+        name,
+        data,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Compound packets (RFC 3550 §6.1)
 // ---------------------------------------------------------------------------
 
@@ -926,7 +1086,9 @@ pub enum RtcpPacket {
     Sdes(SdesPacket),
     /// BYE goodbye (PT 203).
     Bye(ByePacket),
-    /// A sub-packet whose PT this module does not model (e.g. APP=204 or a
+    /// APP application-defined (PT 204).
+    App(AppPacket),
+    /// A sub-packet whose PT this module does not model (e.g. RTPFB=205 or a
     /// profile extension). The raw bytes are returned so the caller can route
     /// or ignore it; the compound walk still advances correctly via its
     /// length field.
@@ -976,6 +1138,7 @@ pub fn parse_compound(buf: &[u8]) -> Result<Vec<RtcpPacket>, RtcpError> {
             PT_SR | PT_RR => RtcpPacket::Report(parse_report(sub)?),
             PT_SDES => RtcpPacket::Sdes(parse_sdes(sub)?),
             PT_BYE => RtcpPacket::Bye(parse_bye(sub)?),
+            PT_APP => RtcpPacket::App(parse_app(sub)?),
             other => RtcpPacket::Other {
                 packet_type: other,
                 bytes: sub.to_vec(),
@@ -1462,6 +1625,160 @@ mod tests {
         assert_eq!(parse_bye(&bytes), Err(RtcpError::Truncated));
     }
 
+    // ---- APP — Application-Defined (§6.7) -------------------------------
+
+    #[test]
+    fn app_header_layout_empty_data() {
+        // The minimal APP packet has no application-dependent data; length
+        // covers the 12-byte header + SSRC + name.
+        let bytes = build_app(0, 0xDEAD_BEEF, b"TEST", &[]).unwrap();
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(bytes[0], 0x80); // V=2, P=0, subtype=0
+        assert_eq!(bytes[1], PT_APP);
+        // length = (12 / 4) - 1 = 2.
+        assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 2);
+        assert_eq!(
+            u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            0xDEAD_BEEF
+        );
+        assert_eq!(&bytes[8..12], b"TEST");
+    }
+
+    #[test]
+    fn app_round_trip_with_data() {
+        // 8 bytes of application data → packet len = 12 + 8 = 20.
+        let data = [0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x02, 0x03, 0x04];
+        let bytes = build_app(7, 0x1234_5678, b"oxAV", &data).unwrap();
+        assert_eq!(bytes.len(), 20);
+        // subtype goes into the low 5 bits of byte 0.
+        assert_eq!(bytes[0] & 0x1F, 7);
+        let parsed = parse_app(&bytes).unwrap();
+        assert_eq!(parsed.subtype, 7);
+        assert_eq!(parsed.ssrc, 0x1234_5678);
+        assert_eq!(&parsed.name, b"oxAV");
+        assert_eq!(parsed.data, data);
+    }
+
+    #[test]
+    fn app_subtype_31_max_is_allowed() {
+        // §6.7: subtype is 5 bits. 31 is the inclusive max.
+        let bytes = build_app(31, 0, b"NAME", &[]).unwrap();
+        assert_eq!(bytes[0] & 0x1F, 31);
+        let parsed = parse_app(&bytes).unwrap();
+        assert_eq!(parsed.subtype, 31);
+    }
+
+    #[test]
+    fn app_rejects_subtype_over_31() {
+        assert_eq!(
+            build_app(32, 0, b"NAME", &[]),
+            Err(RtcpError::AppSubtypeOutOfRange { value: 32 })
+        );
+        assert_eq!(
+            build_app(255, 0, b"NAME", &[]),
+            Err(RtcpError::AppSubtypeOutOfRange { value: 255 })
+        );
+    }
+
+    #[test]
+    fn app_rejects_name_not_4_octets() {
+        for bad in [
+            b"".as_ref(),
+            b"x".as_ref(),
+            b"xyz".as_ref(),
+            b"toolong".as_ref(),
+        ] {
+            assert_eq!(
+                build_app(0, 0, bad, &[]),
+                Err(RtcpError::AppNameWrongLength { len: bad.len() })
+            );
+        }
+    }
+
+    #[test]
+    fn app_rejects_data_not_32_bit_aligned() {
+        for bad_len in [1, 2, 3, 5, 6, 7, 9] {
+            let data = vec![0u8; bad_len];
+            assert_eq!(
+                build_app(0, 0, b"NAME", &data),
+                Err(RtcpError::AppDataNotAligned { len: bad_len })
+            );
+        }
+    }
+
+    #[test]
+    fn app_round_trip_large_data() {
+        // 1024 bytes of payload is well within a single RTCP packet budget.
+        let mut data = Vec::with_capacity(1024);
+        for i in 0..1024 {
+            data.push((i & 0xFF) as u8);
+        }
+        let bytes = build_app(3, 0xCAFE_F00D, b"BIG!", &data).unwrap();
+        let parsed = parse_app(&bytes).unwrap();
+        assert_eq!(parsed.subtype, 3);
+        assert_eq!(parsed.ssrc, 0xCAFE_F00D);
+        assert_eq!(&parsed.name, b"BIG!");
+        assert_eq!(parsed.data, data);
+    }
+
+    #[test]
+    fn app_name_is_byte_exact_not_case_folded() {
+        // §6.7: "uppercase and lowercase characters treated as distinct."
+        let a = build_app(0, 0, b"NaMe", &[]).unwrap();
+        let b = build_app(0, 0, b"name", &[]).unwrap();
+        assert_ne!(a, b);
+        let pa = parse_app(&a).unwrap();
+        let pb = parse_app(&b).unwrap();
+        assert_ne!(pa.name, pb.name);
+    }
+
+    #[test]
+    fn app_parse_rejects_short_header() {
+        // 11 bytes is one byte short of header + SSRC + name (12).
+        let bytes = [0x80, PT_APP, 0x00, 0x02, 0, 0, 0, 0, b'X', b'X', b'X'];
+        assert_eq!(parse_app(&bytes), Err(RtcpError::ShortHeader));
+    }
+
+    #[test]
+    fn app_parse_rejects_bad_version() {
+        let mut bytes = build_app(0, 0, b"NAME", &[]).unwrap();
+        // Clobber V to 0 (top two bits).
+        bytes[0] &= 0x3F;
+        assert_eq!(parse_app(&bytes), Err(RtcpError::BadVersion { value: 0 }));
+    }
+
+    #[test]
+    fn app_parse_rejects_wrong_pt() {
+        let mut bytes = build_app(0, 0, b"NAME", &[]).unwrap();
+        bytes[1] = PT_BYE;
+        assert_eq!(
+            parse_app(&bytes),
+            Err(RtcpError::UnexpectedPacketType { value: PT_BYE })
+        );
+    }
+
+    #[test]
+    fn app_parse_rejects_truncated_when_length_exceeds_buffer() {
+        let mut bytes = build_app(0, 0, b"NAME", &[0u8; 8]).unwrap();
+        // Lie about the length, claiming 6 words (28 bytes) when only 20 are
+        // present.
+        bytes[2..4].copy_from_slice(&6u16.to_be_bytes());
+        assert_eq!(parse_app(&bytes), Err(RtcpError::Truncated));
+    }
+
+    #[test]
+    fn app_parse_ignores_trailing_bytes_past_stated_length() {
+        // §6.7 packets are self-delimited by their length field; bytes past
+        // it (e.g. another stacked compound sub-packet) must not be consumed.
+        let mut bytes = build_app(2, 0xAA, b"app1", &[1, 2, 3, 4]).unwrap();
+        let original_len = bytes.len();
+        bytes.extend_from_slice(&[0xFF; 8]);
+        let parsed = parse_app(&bytes).unwrap();
+        assert_eq!(parsed.subtype, 2);
+        assert_eq!(parsed.data, vec![1, 2, 3, 4]);
+        assert_eq!(original_len, RTCP_HEADER_FIXED_LEN + 4 + APP_NAME_LEN + 4);
+    }
+
     // ---- Compound packets (§6.1) ----------------------------------------
 
     #[test]
@@ -1530,19 +1847,41 @@ mod tests {
     }
 
     #[test]
-    fn compound_preserves_unknown_app_packet() {
-        // An APP (PT=204) sub-packet we don't model should round-trip as
-        // Other with its raw bytes, and the walk must still advance past it.
+    fn compound_rr_sdes_app_round_trips() {
+        // RR + SDES CNAME + APP — the APP variant must come back typed, not
+        // as `Other`, now that the parser models PT=204.
+        let rr = build_receiver_report(0xBBBB_BBBB, &[]).unwrap();
+        let sdes = build_cname_sdes(0xBBBB_BBBB, "x@y").unwrap();
+        let app = build_app(15, 0xBBBB_BBBB, b"OXAV", &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        let datagram = compound(&[&rr, &sdes, &app]);
+        let parsed = parse_compound(&datagram).unwrap();
+        assert_eq!(parsed.len(), 3);
+        match &parsed[2] {
+            RtcpPacket::App(a) => {
+                assert_eq!(a.subtype, 15);
+                assert_eq!(a.ssrc, 0xBBBB_BBBB);
+                assert_eq!(&a.name, b"OXAV");
+                assert_eq!(a.data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            other => panic!("expected App, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compound_preserves_unknown_packet_type() {
+        // A sub-packet whose PT this module does not model (e.g. RTPFB=205,
+        // RFC 4585) should round-trip as `Other` with its raw bytes, and the
+        // walk must still advance past it.
         let rr = build_receiver_report(1, &[]).unwrap();
-        // Hand-built APP: V=2, subtype=0, PT=204, length=1 (2 words), SSRC.
-        let app = vec![0x80, 204, 0x00, 0x01, 0, 0, 0, 9];
-        let datagram = compound(&[&rr, &app]);
+        // Hand-built RTPFB-like: V=2, FMT=0, PT=205, length=1 (2 words), SSRC.
+        let fb = vec![0x80, 205, 0x00, 0x01, 0, 0, 0, 9];
+        let datagram = compound(&[&rr, &fb]);
         let parsed = parse_compound(&datagram).unwrap();
         assert_eq!(parsed.len(), 2);
         match &parsed[1] {
             RtcpPacket::Other { packet_type, bytes } => {
-                assert_eq!(*packet_type, 204);
-                assert_eq!(bytes, &app);
+                assert_eq!(*packet_type, 205);
+                assert_eq!(bytes, &fb);
             }
             other => panic!("expected Other, got {other:?}"),
         }
