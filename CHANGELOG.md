@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RTCP SDES + BYE + compound packets (`oxideav_h261::rtcp`).** Rounds out
+  the control channel beyond SR/RR (RFC 3550 §6.5 / §6.6 / §6.1).
+  `build_sdes` / `parse_sdes` (PT=202, §6.5) handle Source Description
+  packets: 0..=31 chunks, each binding an SSRC/CSRC to a list of `SdesItem`s
+  — `Cname` (§6.5.1, mandatory), `Name`, `Email`, `Phone`, `Loc`, `Tool`,
+  `Note`, and `Priv` (§6.5.8 prefix/value) — independently 32-bit-aligned
+  with a trailing END (item-type-0) byte and null padding. `build_cname_sdes`
+  is the one-call helper for the minimal "SSRC → CNAME" chunk §6.1 requires
+  in every compound packet. `build_bye` / `parse_bye` (PT=203, §6.6) carry
+  0..=31 leaving SSRC/CSRC identifiers plus an optional 8-bit-length-prefixed,
+  null-padded free-text reason. `compound` concatenates pre-built sub-packets
+  into one datagram body; `parse_compound` walks a received datagram back into
+  typed `RtcpPacket`s (`Report` / `Sdes` / `Bye` / `Other` for unmodelled PTs
+  such as APP=204), advancing via each sub-packet's self-delimiting `length`
+  field. Item text / reason strings are validated against the 255-octet 8-bit
+  length limit (`TextTooLong` / `PrivTooLong`); the SC field is capped at 31
+  (`TooManySources`); parsers decode text UTF-8-lossily so a malformed
+  datagram never panics, skip unknown SDES item types forward-compatibly, and
+  reject truncated / wrong-PT / wrong-version input. Scheduling (§6.2) and the
+  §A.1/§A.3/§A.8 loss/jitter estimators remain caller-side (out of scope for
+  the codec). 19 new unit tests cover header/alignment, all-item-type and
+  multi-chunk round-trips, max-length and empty-chunk edges, the 31/255 caps,
+  unknown-item skipping, and three compound-packet round-trips (RR+SDES+BYE,
+  SR-with-block+SDES, RR+unmodelled-APP) plus truncation rejection.
+
 - **RTCP Sender / Receiver Report builders (`oxideav_h261::rtcp`).** The
   control-channel companions to the RTP data path (RFC 3550 §6.4).
   `build_sender_report` (PT=200, §6.4.1) emits the 8-byte RTCP header +

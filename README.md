@@ -37,6 +37,7 @@ oxideav-h261 = "0.0"
 | HRD buffer model (§5.2 + Annex B)                | yes    | yes    |
 | RTP payload format (RFC 4587 §4.1)               | yes    | yes    |
 | RTCP SR / RR reports (RFC 3550 §6.4)             | yes    | yes    |
+| RTCP SDES + BYE + compound (RFC 3550 §6.5/§6.6)  | yes    | yes    |
 
 H.261 only permits integer-pel motion vectors (range ±15); there are no
 half-pel refinements, no B-pictures, and no start-code emulation prevention.
@@ -206,10 +207,46 @@ let report = parse_report(&sr).unwrap(); // round-trips the SR fields
 ```
 
 The builders only (de)serialise the report wire format; the §6.2
-transmission-interval scheduler, SDES/CNAME compound items, BYE, and the
-§A.1/§A.3/§A.8 loss/jitter estimators are session-management concerns
-above the codec and remain caller-side. Empty RR (RC=0) is supported as
-the canonical "nothing to report" packet that heads a compound RTCP packet.
+transmission-interval scheduler and the §A.1/§A.3/§A.8 loss/jitter
+estimators are session-management concerns above the codec and remain
+caller-side. Empty RR (RC=0) is supported as the canonical "nothing to
+report" packet that heads a compound RTCP packet.
+
+### RTCP SDES / BYE + compound packets (RFC 3550 §6.5 / §6.6 / §6.1)
+
+The `rtcp` module also builds and parses the two RTCP packet types that
+round out a conformant control channel: **SDES** (Source Description,
+PT=202, §6.5) and **BYE** (Goodbye, PT=203, §6.6). RFC 3550 §6.1 requires
+every transmitted RTCP packet to be a *compound* packet — a report (SR/RR)
+**first**, followed by an SDES packet carrying at least the mandatory
+CNAME item, then optionally BYE. `compound` concatenates pre-built
+sub-packets into one datagram body; `parse_compound` walks a received
+datagram back into typed `RtcpPacket`s (`Report` / `Sdes` / `Bye` /
+`Other` for unmodelled PTs such as APP=204), advancing via each
+sub-packet's self-delimiting `length` field.
+
+SDES chunks bind an SSRC/CSRC to a list of `SdesItem`s — `Cname` (§6.5.1,
+mandatory), `Name`, `Email`, `Phone`, `Loc`, `Tool`, `Note`, and `Priv`
+(the §6.5.8 prefix/value extension) — each independently 32-bit-aligned
+with a trailing END item-type-0 byte and null padding. `build_cname_sdes`
+is the one-call helper for the minimal "SSRC → CNAME" chunk every compound
+packet must carry. BYE lists the leaving SSRC/CSRC identifiers plus an
+optional free-text reason (8-bit-length-prefixed, null-padded to a 32-bit
+boundary). Item text and reason strings are validated against the 255-octet
+8-bit length limit; the parsers decode text UTF-8-lossily so a malformed
+datagram never panics.
+
+```rust
+use oxideav_h261::rtcp::{build_cname_sdes, build_bye, build_receiver_report, compound, parse_compound};
+
+// The canonical minimal compound: empty RR + SDES CNAME, then a BYE.
+let rr = build_receiver_report(0xAAAA_AAAA, &[]).unwrap();
+let sdes = build_cname_sdes(0xAAAA_AAAA, "me@host").unwrap();
+let bye = build_bye(&[0xAAAA_AAAA], Some("leaving")).unwrap();
+let datagram = compound(&[&rr, &sdes, &bye]);
+let parsed = parse_compound(&datagram).unwrap();
+assert_eq!(parsed.len(), 3);
+```
 
 ## Quick use
 

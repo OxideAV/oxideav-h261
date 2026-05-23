@@ -1,10 +1,10 @@
-//! RTCP Sender Report (SR) / Receiver Report (RR) builders — RFC 3550 §6.4.
+//! RTCP control-channel packets — RFC 3550 §6.
 //!
 //! The [`crate::rtp::RtpPacketizer`] puts H.261 media on the wire as RFC 3550
 //! §5.1 RTP data packets. Every RTP session also runs an RTCP control channel
 //! (RFC 3550 §6) on which each participant periodically reports transmission
-//! and reception statistics. This module builds and parses the two report
-//! packets an H.261 endpoint emits:
+//! and reception statistics and identifies itself. This module builds and
+//! parses the RTCP packet types an H.261 endpoint emits:
 //!
 //! * **SR** (Sender Report, PT = 200, §6.4.1) — sent by a participant that
 //!   has transmitted data during the interval. It carries a 20-byte *sender
@@ -14,6 +14,25 @@
 //!   the sender-info section. An empty RR (RC = 0) is the canonical "I have
 //!   nothing to report" packet a pure receiver puts at the head of its
 //!   compound RTCP packet.
+//! * **SDES** (Source Description, PT = 202, §6.5) — one or more *chunks*,
+//!   each binding an SSRC/CSRC to a list of textual items. The **CNAME**
+//!   item (§6.5.1) is mandatory: §6.1 requires every compound RTCP packet to
+//!   carry an SDES CNAME so a new receiver can bind the (randomly chosen,
+//!   collision-mutable) SSRC to a stable source identifier. NAME / EMAIL /
+//!   PHONE / LOC / TOOL / NOTE / PRIV (§6.5.2–§6.5.8) are also supported.
+//! * **BYE** (Goodbye, PT = 203, §6.6) — announces that one or more SSRC/CSRC
+//!   sources have left the session, with an optional free-text reason.
+//!
+//! ## Compound packets (§6.1)
+//!
+//! RFC 3550 §6.1 requires every transmitted RTCP packet to be a *compound*
+//! packet of at least two stacked sub-packets: a report (SR or RR — an empty
+//! RR if nothing was sent or received) **first**, followed by an SDES packet
+//! carrying at least the CNAME item, then optionally BYE / APP. The
+//! sub-packets are concatenated with no separators; each is self-delimiting
+//! via its 16-bit `length` field (32-bit words minus one). [`compound`]
+//! concatenates pre-built sub-packets into one datagram body; [`parse_compound`]
+//! walks a received datagram back into the individual packets.
 //!
 //! Both reports share the same 8-byte RTCP header and the same 24-byte
 //! [`ReceptionReportBlock`] format. The only structural difference is the
@@ -72,23 +91,41 @@
 //! H.261 over RTP (RFC 4587) is a thin payload format on top of RFC 3550;
 //! it does not redefine RTCP. These builders therefore live here so an
 //! H.261 sender driven by [`crate::rtp::RtpPacketizer`] can emit a
-//! conformant SR (using the packet/octet counters the packetiser already
-//! tracks) and a receiver can emit/parse RR blocks. Scheduling (the §6.2
-//! transmission-interval algorithm), the compound-packet SDES/CNAME item,
-//! BYE, and the reception-statistics estimators (§A.3 loss fraction, §A.8
-//! jitter) are deliberately out of scope — those are session-management
+//! conformant compound packet (SR/RR + SDES CNAME, optionally followed by
+//! BYE) using the packet/octet counters the packetiser already tracks, and a
+//! receiver can parse the same. Scheduling (the §6.2 transmission-interval
+//! algorithm) and the reception-statistics estimators (§A.3 loss fraction,
+//! §A.8 jitter) are deliberately out of scope — those are session-management
 //! concerns above the codec, and RFC 3550 specifies them independently of
-//! the report wire format implemented here. The builder accepts pre-computed
-//! statistics; the parser surfaces them back.
+//! the wire formats implemented here. The builders accept pre-computed
+//! statistics; the parsers surface them back.
 
 /// PT code for an RTCP Sender Report (RFC 3550 §6.4.1).
 pub const PT_SR: u8 = 200;
 /// PT code for an RTCP Receiver Report (RFC 3550 §6.4.2).
 pub const PT_RR: u8 = 201;
+/// PT code for an RTCP Source Description packet (RFC 3550 §6.5).
+pub const PT_SDES: u8 = 202;
+/// PT code for an RTCP Goodbye packet (RFC 3550 §6.6).
+pub const PT_BYE: u8 = 203;
+
+/// Maximum number of chunks (SDES) or SSRC/CSRC identifiers (BYE) that fit in
+/// one packet — the SC field is 5 bits (RFC 3550 §6.5 / §6.6).
+pub const MAX_SOURCE_COUNT: usize = 31;
+
+/// Maximum length in octets of one SDES item's text / BYE reason string — the
+/// length byte is 8 bits (RFC 3550 §6.5).
+pub const MAX_TEXT_LEN: usize = 255;
 
 /// Length in bytes of the common RTCP report header (V/P/RC, PT, length,
 /// SSRC of sender). RFC 3550 §6.4.1: "the header, is 8 octets long".
 pub const RTCP_HEADER_LEN: usize = 8;
+
+/// Length in bytes of the fixed RTCP header common to *all* packet types
+/// (the V/P/count byte, PT, and 16-bit length) — RFC 3550 §6.4.1. SR/RR
+/// follow it with the sender's SSRC (making [`RTCP_HEADER_LEN`] = 8); SDES /
+/// BYE do not, so their bodies begin right after these 4 bytes.
+pub const RTCP_HEADER_FIXED_LEN: usize = 4;
 
 /// Length in bytes of the SR sender-info section (RFC 3550 §6.4.1:
 /// "the sender information, is 20 octets long").
@@ -123,6 +160,15 @@ pub enum RtcpError {
         stated_words: u16,
         actual_words: u16,
     },
+    /// More than 31 SDES chunks / BYE sources were supplied — they cannot be
+    /// encoded into the 5-bit SC field (RFC 3550 §6.5 / §6.6).
+    TooManySources { count: usize },
+    /// An SDES item text or BYE reason exceeds the 255-octet limit imposed by
+    /// the 8-bit length byte (RFC 3550 §6.5).
+    TextTooLong { len: usize },
+    /// A `PRIV` SDES item's prefix + value would exceed the 255-octet item
+    /// length budget once the 1-byte prefix-length is included (RFC 3550 §6.5.8).
+    PrivTooLong { len: usize },
 }
 
 impl core::fmt::Display for RtcpError {
@@ -144,6 +190,15 @@ impl core::fmt::Display for RtcpError {
                 f,
                 "rtcp: length field says {stated_words} words, body is {actual_words}"
             ),
+            RtcpError::TooManySources { count } => {
+                write!(f, "rtcp: {count} sources exceeds the 31-source SC limit")
+            }
+            RtcpError::TextTooLong { len } => {
+                write!(f, "rtcp: text/reason {len} octets exceeds the 255 limit")
+            }
+            RtcpError::PrivTooLong { len } => {
+                write!(f, "rtcp: PRIV item {len} octets exceeds the 255 limit")
+            }
         }
     }
 }
@@ -276,6 +331,19 @@ fn write_header(buf: &mut Vec<u8>, rc: u8, pt: u8, ssrc: u32, total_len_bytes: u
     let length_field = words.saturating_sub(1);
     buf.extend_from_slice(&length_field.to_be_bytes());
     buf.extend_from_slice(&ssrc.to_be_bytes());
+}
+
+/// Fixed 4-byte header writer for packet types whose count field (SC) is *not*
+/// followed by a sender SSRC in the header — SDES (§6.5) and BYE (§6.6). `cnt`
+/// is the 5-bit source/chunk count, `pt` the packet type, `total_len_bytes`
+/// the whole packet length (must be a multiple of 4).
+fn write_count_header(buf: &mut Vec<u8>, cnt: u8, pt: u8, total_len_bytes: usize) {
+    debug_assert!(cnt <= 31);
+    debug_assert_eq!(total_len_bytes % 4, 0);
+    buf.push(0x80 | (cnt & 0x1F)); // V=2, P=0, count
+    buf.push(pt);
+    let words = (total_len_bytes / 4) as u16;
+    buf.extend_from_slice(&words.saturating_sub(1).to_be_bytes());
 }
 
 /// Build an RTCP Sender Report (PT = 200, RFC 3550 §6.4.1).
@@ -426,6 +494,504 @@ pub fn parse_report(buf: &[u8]) -> Result<RtcpReport, RtcpError> {
         sender_info,
         report_blocks,
     })
+}
+
+// ---------------------------------------------------------------------------
+// SDES — Source Description (RFC 3550 §6.5)
+// ---------------------------------------------------------------------------
+
+/// SDES item type codes (RFC 3550 §6.5). Type 0 is the END marker that
+/// terminates a chunk's item list.
+pub mod sdes_type {
+    /// END: item-list terminator (RFC 3550 §6.5 — "an item type of zero").
+    pub const END: u8 = 0;
+    /// CNAME: canonical end-point identifier (RFC 3550 §6.5.1) — mandatory.
+    pub const CNAME: u8 = 1;
+    /// NAME: user name (RFC 3550 §6.5.2).
+    pub const NAME: u8 = 2;
+    /// EMAIL: electronic mail address (RFC 3550 §6.5.3).
+    pub const EMAIL: u8 = 3;
+    /// PHONE: phone number (RFC 3550 §6.5.4).
+    pub const PHONE: u8 = 4;
+    /// LOC: geographic user location (RFC 3550 §6.5.5).
+    pub const LOC: u8 = 5;
+    /// TOOL: application or tool name (RFC 3550 §6.5.6).
+    pub const TOOL: u8 = 6;
+    /// NOTE: notice / status (RFC 3550 §6.5.7).
+    pub const NOTE: u8 = 7;
+    /// PRIV: private extensions (RFC 3550 §6.5.8).
+    pub const PRIV: u8 = 8;
+}
+
+/// One SDES item (RFC 3550 §6.5): an 8-bit type, an 8-bit text-length, and the
+/// text itself. The text is UTF-8 (US-ASCII is a subset); it is **not**
+/// null-terminated and may be no longer than 255 octets.
+///
+/// `PRIV` (§6.5.8) carries a length-prefixed `prefix` string followed by a
+/// `value` string that fills the rest of the item, so it is modelled as a
+/// distinct variant rather than a single text blob.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SdesItem {
+    /// Canonical name (`user@host` / `host`), §6.5.1. Mandatory in every
+    /// compound packet (§6.1).
+    Cname(String),
+    /// User's real name, §6.5.2.
+    Name(String),
+    /// Email address, §6.5.3.
+    Email(String),
+    /// Phone number, §6.5.4.
+    Phone(String),
+    /// Geographic location, §6.5.5.
+    Loc(String),
+    /// Tool name / version, §6.5.6.
+    Tool(String),
+    /// Transient notice / status, §6.5.7.
+    Note(String),
+    /// Private extension (§6.5.8): a `prefix` name plus a `value` string.
+    Priv { prefix: String, value: String },
+}
+
+impl SdesItem {
+    /// The 8-bit SDES type code for this item (RFC 3550 §6.5).
+    pub fn type_code(&self) -> u8 {
+        match self {
+            SdesItem::Cname(_) => sdes_type::CNAME,
+            SdesItem::Name(_) => sdes_type::NAME,
+            SdesItem::Email(_) => sdes_type::EMAIL,
+            SdesItem::Phone(_) => sdes_type::PHONE,
+            SdesItem::Loc(_) => sdes_type::LOC,
+            SdesItem::Tool(_) => sdes_type::TOOL,
+            SdesItem::Note(_) => sdes_type::NOTE,
+            SdesItem::Priv { .. } => sdes_type::PRIV,
+        }
+    }
+
+    /// Total on-wire length of this item including the 2-byte type+length
+    /// header (the END terminator and 32-bit chunk padding are accounted for
+    /// at the chunk level, not here).
+    fn wire_len(&self) -> usize {
+        2 + self.text_len()
+    }
+
+    /// Length of the item's text payload (the value of the 8-bit length byte).
+    /// For `PRIV` this is `1 + prefix.len() + value.len()` (§6.5.8).
+    fn text_len(&self) -> usize {
+        match self {
+            SdesItem::Cname(s)
+            | SdesItem::Name(s)
+            | SdesItem::Email(s)
+            | SdesItem::Phone(s)
+            | SdesItem::Loc(s)
+            | SdesItem::Tool(s)
+            | SdesItem::Note(s) => s.len(),
+            SdesItem::Priv { prefix, value } => 1 + prefix.len() + value.len(),
+        }
+    }
+
+    /// Validate the item's text fits the 8-bit length byte (RFC 3550 §6.5).
+    fn validate(&self) -> Result<(), RtcpError> {
+        match self {
+            SdesItem::Priv { .. } => {
+                let len = self.text_len();
+                if len > MAX_TEXT_LEN {
+                    return Err(RtcpError::PrivTooLong { len });
+                }
+            }
+            _ => {
+                let len = self.text_len();
+                if len > MAX_TEXT_LEN {
+                    return Err(RtcpError::TextTooLong { len });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write(&self, buf: &mut Vec<u8>) {
+        buf.push(self.type_code());
+        match self {
+            SdesItem::Priv { prefix, value } => {
+                // text_len() == 1 (prefix-len byte) + prefix + value.
+                buf.push((1 + prefix.len() + value.len()) as u8);
+                buf.push(prefix.len() as u8);
+                buf.extend_from_slice(prefix.as_bytes());
+                buf.extend_from_slice(value.as_bytes());
+            }
+            SdesItem::Cname(s)
+            | SdesItem::Name(s)
+            | SdesItem::Email(s)
+            | SdesItem::Phone(s)
+            | SdesItem::Loc(s)
+            | SdesItem::Tool(s)
+            | SdesItem::Note(s) => {
+                buf.push(s.len() as u8);
+                buf.extend_from_slice(s.as_bytes());
+            }
+        }
+    }
+}
+
+/// One SDES chunk (RFC 3550 §6.5): an SSRC/CSRC identifier plus a list of
+/// items. On the wire the item list is terminated by a zero type byte and the
+/// chunk is padded with null octets to the next 32-bit boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SdesChunk {
+    /// The SSRC/CSRC these items describe.
+    pub ssrc: u32,
+    /// The item list (a CNAME should be present per §6.1).
+    pub items: Vec<SdesItem>,
+}
+
+impl SdesChunk {
+    /// On-wire length of this chunk: 4 (SSRC) + items + the END byte, rounded
+    /// up to the next multiple of 4 (RFC 3550 §6.5 32-bit chunk alignment).
+    fn padded_len(&self) -> usize {
+        let raw = 4 + self.items.iter().map(SdesItem::wire_len).sum::<usize>() + 1; // +1 END
+        raw.div_ceil(4) * 4
+    }
+
+    fn write(&self, buf: &mut Vec<u8>) {
+        let start = buf.len();
+        buf.extend_from_slice(&self.ssrc.to_be_bytes());
+        for item in &self.items {
+            item.write(buf);
+        }
+        // END marker (item type 0) terminates the list, then pad with null
+        // octets to the next 32-bit boundary (§6.5).
+        buf.push(sdes_type::END);
+        while (buf.len() - start) % 4 != 0 {
+            buf.push(0);
+        }
+    }
+}
+
+/// Build an RTCP SDES packet (PT = 202, RFC 3550 §6.5).
+///
+/// `chunks` are the per-source descriptions (0..=31). A typical H.261
+/// endpoint sends a single chunk for its own SSRC carrying at least a CNAME
+/// item (§6.1). Each item's text must fit the 8-bit length byte (≤ 255
+/// octets); each chunk is independently 32-bit-aligned with a trailing END
+/// item-type-0 byte and null padding.
+///
+/// Returns the wire bytes (a multiple of 4 in length), or
+/// [`RtcpError::TooManySources`] / [`RtcpError::TextTooLong`] /
+/// [`RtcpError::PrivTooLong`].
+pub fn build_sdes(chunks: &[SdesChunk]) -> Result<Vec<u8>, RtcpError> {
+    if chunks.len() > MAX_SOURCE_COUNT {
+        return Err(RtcpError::TooManySources {
+            count: chunks.len(),
+        });
+    }
+    for chunk in chunks {
+        for item in &chunk.items {
+            item.validate()?;
+        }
+    }
+    let body: usize = chunks.iter().map(SdesChunk::padded_len).sum();
+    let total = RTCP_HEADER_FIXED_LEN + body;
+    let mut buf = Vec::with_capacity(total);
+    write_count_header(&mut buf, chunks.len() as u8, PT_SDES, total);
+    for chunk in chunks {
+        chunk.write(&mut buf);
+    }
+    debug_assert_eq!(buf.len(), total);
+    debug_assert_eq!(buf.len() % 4, 0);
+    Ok(buf)
+}
+
+/// A parsed RTCP SDES packet (RFC 3550 §6.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SdesPacket {
+    /// The chunks, in wire order.
+    pub chunks: Vec<SdesChunk>,
+}
+
+/// Parse a single RTCP SDES packet from the front of `buf`.
+///
+/// Validates V=2 and PT=202, then walks `SC` chunks. Each chunk's item list
+/// is read until a zero type byte (END), then advanced to the next 32-bit
+/// boundary. The 16-bit `length` field bounds how far the walk may read;
+/// chunks may not cross it. Unknown item types are surfaced via
+/// [`RtcpError::UnexpectedPacketType`]-free tolerance: an item type outside
+/// 1..=8 is skipped over (consuming its declared length) so a forward-
+/// compatible parser doesn't reject profile extensions, but its content is
+/// not retained.
+pub fn parse_sdes(buf: &[u8]) -> Result<SdesPacket, RtcpError> {
+    if buf.len() < RTCP_HEADER_FIXED_LEN {
+        return Err(RtcpError::ShortHeader);
+    }
+    let b0 = buf[0];
+    if (b0 >> 6) & 0x3 != 2 {
+        return Err(RtcpError::BadVersion {
+            value: (b0 >> 6) & 0x3,
+        });
+    }
+    if buf[1] != PT_SDES {
+        return Err(RtcpError::UnexpectedPacketType { value: buf[1] });
+    }
+    let sc = (b0 & 0x1F) as usize;
+    let stated_words = u16::from_be_bytes([buf[2], buf[3]]);
+    // Body bytes the length field claims (header is fixed 4 bytes here; the
+    // length covers the whole packet in words minus one, §6.4.1).
+    let stated_total = (stated_words as usize + 1) * 4;
+    let body_end = stated_total.min(buf.len());
+
+    let mut off = RTCP_HEADER_FIXED_LEN;
+    let mut chunks = Vec::with_capacity(sc);
+    for _ in 0..sc {
+        if off + 4 > body_end {
+            return Err(RtcpError::Truncated);
+        }
+        let ssrc = u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+        off += 4;
+        let mut items = Vec::new();
+        loop {
+            if off >= body_end {
+                return Err(RtcpError::Truncated);
+            }
+            let ty = buf[off];
+            off += 1;
+            if ty == sdes_type::END {
+                break;
+            }
+            if off >= body_end {
+                return Err(RtcpError::Truncated);
+            }
+            let len = buf[off] as usize;
+            off += 1;
+            if off + len > body_end {
+                return Err(RtcpError::Truncated);
+            }
+            let text = &buf[off..off + len];
+            off += len;
+            match ty {
+                sdes_type::CNAME => items.push(SdesItem::Cname(utf8_lossy(text))),
+                sdes_type::NAME => items.push(SdesItem::Name(utf8_lossy(text))),
+                sdes_type::EMAIL => items.push(SdesItem::Email(utf8_lossy(text))),
+                sdes_type::PHONE => items.push(SdesItem::Phone(utf8_lossy(text))),
+                sdes_type::LOC => items.push(SdesItem::Loc(utf8_lossy(text))),
+                sdes_type::TOOL => items.push(SdesItem::Tool(utf8_lossy(text))),
+                sdes_type::NOTE => items.push(SdesItem::Note(utf8_lossy(text))),
+                // A PRIV item with a zero-length body has no prefix-length
+                // byte and so cannot be decoded — skip it (it was already
+                // consumed by the length advance above).
+                sdes_type::PRIV if len >= 1 => {
+                    let plen = (text[0] as usize).min(len - 1);
+                    let prefix = utf8_lossy(&text[1..1 + plen]);
+                    let value = utf8_lossy(&text[1 + plen..]);
+                    items.push(SdesItem::Priv { prefix, value });
+                }
+                _ => { /* unknown item type: already skipped its length */ }
+            }
+        }
+        // Advance over null padding to the next 32-bit boundary.
+        while (off - RTCP_HEADER_FIXED_LEN) % 4 != 0 {
+            if off >= body_end {
+                break;
+            }
+            off += 1;
+        }
+        chunks.push(SdesChunk { ssrc, items });
+    }
+    Ok(SdesPacket { chunks })
+}
+
+/// Convenience: build a single-chunk SDES packet carrying only a CNAME item —
+/// the minimal SDES every compound RTCP packet must include (RFC 3550 §6.1).
+pub fn build_cname_sdes(ssrc: u32, cname: &str) -> Result<Vec<u8>, RtcpError> {
+    build_sdes(&[SdesChunk {
+        ssrc,
+        items: vec![SdesItem::Cname(cname.to_string())],
+    }])
+}
+
+// ---------------------------------------------------------------------------
+// BYE — Goodbye (RFC 3550 §6.6)
+// ---------------------------------------------------------------------------
+
+/// A parsed RTCP BYE packet (RFC 3550 §6.6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ByePacket {
+    /// The SSRC/CSRC identifiers leaving the session (1..=31; zero is valid
+    /// but useless per §6.6).
+    pub sources: Vec<u32>,
+    /// Optional free-text reason for leaving (§6.6), e.g. "camera malfunction".
+    pub reason: Option<String>,
+}
+
+/// Build an RTCP BYE packet (PT = 203, RFC 3550 §6.6).
+///
+/// `sources` are the SSRC/CSRC identifiers leaving (0..=31). `reason` is an
+/// optional free-text explanation; it is prefixed by an 8-bit length byte and
+/// the whole packet is padded with null octets to the next 32-bit boundary
+/// (§6.6 — this padding is separate from the header P bit). The reason text
+/// must be ≤ 255 octets.
+pub fn build_bye(sources: &[u32], reason: Option<&str>) -> Result<Vec<u8>, RtcpError> {
+    if sources.len() > MAX_SOURCE_COUNT {
+        return Err(RtcpError::TooManySources {
+            count: sources.len(),
+        });
+    }
+    let reason_bytes = reason.map(str::as_bytes);
+    if let Some(r) = reason_bytes {
+        if r.len() > MAX_TEXT_LEN {
+            return Err(RtcpError::TextTooLong { len: r.len() });
+        }
+    }
+    // Body so far: SC * 4 (SSRC list) + optional (1 length byte + reason).
+    let mut body = sources.len() * 4;
+    if let Some(r) = reason_bytes {
+        body += 1 + r.len();
+    }
+    // Pad the whole packet (header + body) to a 32-bit boundary.
+    let unpadded = RTCP_HEADER_FIXED_LEN + body;
+    let total = unpadded.div_ceil(4) * 4;
+    let mut buf = Vec::with_capacity(total);
+    write_count_header(&mut buf, sources.len() as u8, PT_BYE, total);
+    for &s in sources {
+        buf.extend_from_slice(&s.to_be_bytes());
+    }
+    if let Some(r) = reason_bytes {
+        buf.push(r.len() as u8);
+        buf.extend_from_slice(r);
+    }
+    while buf.len() < total {
+        buf.push(0);
+    }
+    debug_assert_eq!(buf.len(), total);
+    Ok(buf)
+}
+
+/// Parse a single RTCP BYE packet from the front of `buf` (RFC 3550 §6.6).
+///
+/// Validates V=2 and PT=203, reads `SC` SSRC/CSRC identifiers, then — if the
+/// `length` field indicates bytes remain past the identifier list — reads the
+/// 8-bit-prefixed reason string. Trailing null padding is ignored.
+pub fn parse_bye(buf: &[u8]) -> Result<ByePacket, RtcpError> {
+    if buf.len() < RTCP_HEADER_FIXED_LEN {
+        return Err(RtcpError::ShortHeader);
+    }
+    let b0 = buf[0];
+    if (b0 >> 6) & 0x3 != 2 {
+        return Err(RtcpError::BadVersion {
+            value: (b0 >> 6) & 0x3,
+        });
+    }
+    if buf[1] != PT_BYE {
+        return Err(RtcpError::UnexpectedPacketType { value: buf[1] });
+    }
+    let sc = (b0 & 0x1F) as usize;
+    let stated_words = u16::from_be_bytes([buf[2], buf[3]]);
+    let stated_total = (stated_words as usize + 1) * 4;
+    let body_end = stated_total.min(buf.len());
+
+    let mut off = RTCP_HEADER_FIXED_LEN;
+    if off + sc * 4 > body_end {
+        return Err(RtcpError::Truncated);
+    }
+    let mut sources = Vec::with_capacity(sc);
+    for _ in 0..sc {
+        sources.push(u32::from_be_bytes([
+            buf[off],
+            buf[off + 1],
+            buf[off + 2],
+            buf[off + 3],
+        ]));
+        off += 4;
+    }
+    // Optional reason string: present iff a length byte remains in the body.
+    let reason = if off < body_end {
+        let len = buf[off] as usize;
+        off += 1;
+        if off + len > body_end {
+            return Err(RtcpError::Truncated);
+        }
+        Some(utf8_lossy(&buf[off..off + len]))
+    } else {
+        None
+    };
+    Ok(ByePacket { sources, reason })
+}
+
+// ---------------------------------------------------------------------------
+// Compound packets (RFC 3550 §6.1)
+// ---------------------------------------------------------------------------
+
+/// One sub-packet recovered from a compound RTCP packet by [`parse_compound`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RtcpPacket {
+    /// SR / RR report (PT 200 / 201).
+    Report(RtcpReport),
+    /// SDES source-description (PT 202).
+    Sdes(SdesPacket),
+    /// BYE goodbye (PT 203).
+    Bye(ByePacket),
+    /// A sub-packet whose PT this module does not model (e.g. APP=204 or a
+    /// profile extension). The raw bytes are returned so the caller can route
+    /// or ignore it; the compound walk still advances correctly via its
+    /// length field.
+    Other { packet_type: u8, bytes: Vec<u8> },
+}
+
+/// Concatenate pre-built RTCP sub-packets into one compound-packet datagram
+/// body (RFC 3550 §6.1). The sub-packets are emitted in the order given with
+/// no separators; each must already be a self-delimiting RTCP packet (a
+/// multiple of 4 bytes with a correct `length` field), which the builders in
+/// this module guarantee.
+///
+/// §6.1 requires the first sub-packet to be a report (SR/RR) and an SDES
+/// CNAME to be present; this function does not enforce that ordering — it is a
+/// pure byte concatenator — but callers should respect it.
+pub fn compound(packets: &[&[u8]]) -> Vec<u8> {
+    let total: usize = packets.iter().map(|p| p.len()).sum();
+    let mut buf = Vec::with_capacity(total);
+    for p in packets {
+        buf.extend_from_slice(p);
+    }
+    buf
+}
+
+/// Walk a received compound RTCP datagram into its individual sub-packets
+/// (RFC 3550 §6.1). Each sub-packet is self-delimited by its 16-bit `length`
+/// field (32-bit words minus one); the walk consumes `(length + 1) * 4` bytes
+/// per sub-packet until the buffer is exhausted.
+///
+/// Returns [`RtcpError::ShortHeader`] if a sub-packet header is truncated and
+/// [`RtcpError::Truncated`] if a stated length runs past the buffer end.
+pub fn parse_compound(buf: &[u8]) -> Result<Vec<RtcpPacket>, RtcpError> {
+    let mut out = Vec::new();
+    let mut off = 0;
+    while off < buf.len() {
+        if buf.len() - off < RTCP_HEADER_FIXED_LEN {
+            return Err(RtcpError::ShortHeader);
+        }
+        let pt = buf[off + 1];
+        let words = u16::from_be_bytes([buf[off + 2], buf[off + 3]]) as usize;
+        let sub_len = (words + 1) * 4;
+        if off + sub_len > buf.len() {
+            return Err(RtcpError::Truncated);
+        }
+        let sub = &buf[off..off + sub_len];
+        let parsed = match pt {
+            PT_SR | PT_RR => RtcpPacket::Report(parse_report(sub)?),
+            PT_SDES => RtcpPacket::Sdes(parse_sdes(sub)?),
+            PT_BYE => RtcpPacket::Bye(parse_bye(sub)?),
+            other => RtcpPacket::Other {
+                packet_type: other,
+                bytes: sub.to_vec(),
+            },
+        };
+        out.push(parsed);
+        off += sub_len;
+    }
+    Ok(out)
+}
+
+/// Lossy UTF-8 decode for an SDES/BYE text field. RFC 3550 §6.5 mandates
+/// UTF-8, but a malformed packet from the network must not panic the parser,
+/// so invalid sequences are replaced with U+FFFD.
+fn utf8_lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 #[cfg(test)]
@@ -659,5 +1225,335 @@ mod tests {
             SenderInfo::ntp_from_parts(0xB44D_B705, 0x2000_0000),
             0xB44D_B705_2000_0000
         );
+    }
+
+    // ---- SDES (§6.5) -----------------------------------------------------
+
+    #[test]
+    fn sdes_cname_header_and_alignment() {
+        let bytes = build_cname_sdes(0xDEAD_BEEF, "alice@example.com").unwrap();
+        // V=2, P=0, SC=1 → 0x81.
+        assert_eq!(bytes[0], 0x81);
+        assert_eq!(bytes[1], PT_SDES);
+        // Body: SSRC(4) + type(1) + len(1) + 17 text + END(1) = 24, padded to
+        // 24 (already a multiple of 4). Packet = 4 header + 24 = 28 bytes.
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(bytes.len() % 4, 0);
+        // length = words - 1 = 28/4 - 1 = 6.
+        assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 6);
+        // SSRC follows the 4-byte fixed header.
+        assert_eq!(
+            u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            0xDEAD_BEEF
+        );
+        assert_eq!(bytes[8], sdes_type::CNAME);
+        assert_eq!(bytes[9], 17);
+    }
+
+    #[test]
+    fn sdes_round_trip_all_item_types() {
+        let chunk = SdesChunk {
+            ssrc: 0xCAFE_F00D,
+            items: vec![
+                SdesItem::Cname("doe@sleepy.example.com".to_string()),
+                SdesItem::Name("John Doe".to_string()),
+                SdesItem::Email("John.Doe@example.com".to_string()),
+                SdesItem::Phone("+1 908 555 1212".to_string()),
+                SdesItem::Loc("Murray Hill, New Jersey".to_string()),
+                SdesItem::Tool("oxideav-h261".to_string()),
+                SdesItem::Note("on the phone".to_string()),
+                SdesItem::Priv {
+                    prefix: "x-oxideav".to_string(),
+                    value: "round101".to_string(),
+                },
+            ],
+        };
+        let bytes = build_sdes(std::slice::from_ref(&chunk)).unwrap();
+        assert_eq!(bytes.len() % 4, 0);
+        let parsed = parse_sdes(&bytes).unwrap();
+        assert_eq!(parsed.chunks.len(), 1);
+        assert_eq!(parsed.chunks[0], chunk);
+    }
+
+    #[test]
+    fn sdes_multiple_chunks_each_aligned() {
+        let chunks = vec![
+            SdesChunk {
+                ssrc: 0x1111_1111,
+                items: vec![SdesItem::Cname("a@h".to_string())],
+            },
+            SdesChunk {
+                ssrc: 0x2222_2222,
+                items: vec![SdesItem::Cname("bb@hh".to_string())],
+            },
+        ];
+        let bytes = build_sdes(&chunks).unwrap();
+        assert_eq!(bytes[0] & 0x1F, 2); // SC = 2
+        assert_eq!(bytes.len() % 4, 0);
+        let parsed = parse_sdes(&bytes).unwrap();
+        assert_eq!(parsed.chunks, chunks);
+    }
+
+    #[test]
+    fn sdes_empty_chunk_is_four_null_octets() {
+        // A chunk with zero items: SSRC(4) + END(1) padded to 8 bytes.
+        let chunks = vec![SdesChunk {
+            ssrc: 0x0102_0304,
+            items: vec![],
+        }];
+        let bytes = build_sdes(&chunks).unwrap();
+        // 4 header + 8 chunk = 12 bytes.
+        assert_eq!(bytes.len(), 12);
+        let parsed = parse_sdes(&bytes).unwrap();
+        assert_eq!(parsed.chunks[0].ssrc, 0x0102_0304);
+        assert!(parsed.chunks[0].items.is_empty());
+    }
+
+    #[test]
+    fn sdes_rejects_more_than_31_chunks() {
+        let chunks = vec![
+            SdesChunk {
+                ssrc: 0,
+                items: vec![]
+            };
+            32
+        ];
+        assert_eq!(
+            build_sdes(&chunks),
+            Err(RtcpError::TooManySources { count: 32 })
+        );
+    }
+
+    #[test]
+    fn sdes_rejects_text_over_255() {
+        let chunks = vec![SdesChunk {
+            ssrc: 1,
+            items: vec![SdesItem::Cname("x".repeat(256))],
+        }];
+        assert_eq!(
+            build_sdes(&chunks),
+            Err(RtcpError::TextTooLong { len: 256 })
+        );
+    }
+
+    #[test]
+    fn sdes_priv_rejects_over_255() {
+        // prefix(200) + value(60) + 1 prefix-len byte = 261 > 255.
+        let chunks = vec![SdesChunk {
+            ssrc: 1,
+            items: vec![SdesItem::Priv {
+                prefix: "p".repeat(200),
+                value: "v".repeat(60),
+            }],
+        }];
+        assert_eq!(
+            build_sdes(&chunks),
+            Err(RtcpError::PrivTooLong { len: 261 })
+        );
+    }
+
+    #[test]
+    fn sdes_max_length_cname_round_trips() {
+        let chunks = vec![SdesChunk {
+            ssrc: 7,
+            items: vec![SdesItem::Cname("z".repeat(255))],
+        }];
+        let bytes = build_sdes(&chunks).unwrap();
+        let parsed = parse_sdes(&bytes).unwrap();
+        assert_eq!(parsed.chunks[0].items[0], SdesItem::Cname("z".repeat(255)));
+    }
+
+    #[test]
+    fn sdes_parse_skips_unknown_item_type() {
+        // Hand-craft a chunk with an unknown item type 99 between two CNAMEs.
+        let mut buf = Vec::new();
+        write_count_header(&mut buf, 1, PT_SDES, 0); // placeholder length
+        let chunk_start = buf.len();
+        buf.extend_from_slice(&0xABCD_1234u32.to_be_bytes());
+        // CNAME "hi"
+        buf.push(sdes_type::CNAME);
+        buf.push(2);
+        buf.extend_from_slice(b"hi");
+        // unknown type 99, 3 bytes
+        buf.push(99);
+        buf.push(3);
+        buf.extend_from_slice(b"xyz");
+        buf.push(sdes_type::END);
+        while (buf.len() - chunk_start) % 4 != 0 {
+            buf.push(0);
+        }
+        let words = (buf.len() / 4) as u16;
+        buf[2..4].copy_from_slice(&(words - 1).to_be_bytes());
+        let parsed = parse_sdes(&buf).unwrap();
+        // Only the CNAME survives; the unknown item is skipped.
+        assert_eq!(
+            parsed.chunks[0].items,
+            vec![SdesItem::Cname("hi".to_string())]
+        );
+    }
+
+    #[test]
+    fn sdes_parse_rejects_wrong_pt() {
+        let mut bytes = build_cname_sdes(1, "a@b").unwrap();
+        bytes[1] = PT_BYE;
+        assert_eq!(
+            parse_sdes(&bytes),
+            Err(RtcpError::UnexpectedPacketType { value: PT_BYE })
+        );
+    }
+
+    // ---- BYE (§6.6) ------------------------------------------------------
+
+    #[test]
+    fn bye_no_reason_header_and_length() {
+        let bytes = build_bye(&[0xDEAD_BEEF, 0xCAFE_F00D], None).unwrap();
+        // V=2, P=0, SC=2 → 0x82.
+        assert_eq!(bytes[0], 0x82);
+        assert_eq!(bytes[1], PT_BYE);
+        // 4 header + 8 (two SSRCs) = 12 bytes; length = 12/4 - 1 = 2.
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 2);
+        let parsed = parse_bye(&bytes).unwrap();
+        assert_eq!(parsed.sources, vec![0xDEAD_BEEF, 0xCAFE_F00D]);
+        assert_eq!(parsed.reason, None);
+    }
+
+    #[test]
+    fn bye_with_reason_round_trips_and_pads() {
+        let bytes = build_bye(&[0x1234_5678], Some("camera malfunction")).unwrap();
+        // 4 header + 4 SSRC + 1 len + 18 reason = 27, padded to 28.
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(bytes.len() % 4, 0);
+        let parsed = parse_bye(&bytes).unwrap();
+        assert_eq!(parsed.sources, vec![0x1234_5678]);
+        assert_eq!(parsed.reason.as_deref(), Some("camera malfunction"));
+    }
+
+    #[test]
+    fn bye_empty_reason_is_distinguished_from_none() {
+        // A zero-length reason still emits the length byte, so the parser
+        // returns Some("") rather than None.
+        let bytes = build_bye(&[1], Some("")).unwrap();
+        let parsed = parse_bye(&bytes).unwrap();
+        assert_eq!(parsed.reason.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn bye_rejects_more_than_31_sources() {
+        let sources = vec![0u32; 32];
+        assert_eq!(
+            build_bye(&sources, None),
+            Err(RtcpError::TooManySources { count: 32 })
+        );
+    }
+
+    #[test]
+    fn bye_rejects_reason_over_255() {
+        assert_eq!(
+            build_bye(&[1], Some(&"r".repeat(256))),
+            Err(RtcpError::TextTooLong { len: 256 })
+        );
+    }
+
+    #[test]
+    fn bye_parse_rejects_truncated_sources() {
+        let mut bytes = build_bye(&[1, 2], None).unwrap();
+        bytes.truncate(RTCP_HEADER_FIXED_LEN + 4); // only one SSRC present
+        assert_eq!(parse_bye(&bytes), Err(RtcpError::Truncated));
+    }
+
+    // ---- Compound packets (§6.1) ----------------------------------------
+
+    #[test]
+    fn compound_rr_sdes_bye_round_trips() {
+        // The canonical minimal compound: empty RR + SDES CNAME, then a BYE.
+        let rr = build_receiver_report(0xAAAA_AAAA, &[]).unwrap();
+        let sdes = build_cname_sdes(0xAAAA_AAAA, "me@host").unwrap();
+        let bye = build_bye(&[0xAAAA_AAAA], Some("leaving")).unwrap();
+        let datagram = compound(&[&rr, &sdes, &bye]);
+        assert_eq!(datagram.len(), rr.len() + sdes.len() + bye.len());
+
+        let parsed = parse_compound(&datagram).unwrap();
+        assert_eq!(parsed.len(), 3);
+        match &parsed[0] {
+            RtcpPacket::Report(r) => {
+                assert_eq!(r.packet_type, PT_RR);
+                assert_eq!(r.ssrc, 0xAAAA_AAAA);
+            }
+            other => panic!("expected RR, got {other:?}"),
+        }
+        match &parsed[1] {
+            RtcpPacket::Sdes(s) => {
+                assert_eq!(
+                    s.chunks[0].items,
+                    vec![SdesItem::Cname("me@host".to_string())]
+                );
+            }
+            other => panic!("expected SDES, got {other:?}"),
+        }
+        match &parsed[2] {
+            RtcpPacket::Bye(b) => {
+                assert_eq!(b.sources, vec![0xAAAA_AAAA]);
+                assert_eq!(b.reason.as_deref(), Some("leaving"));
+            }
+            other => panic!("expected BYE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compound_sr_with_block_then_sdes() {
+        let info = SenderInfo {
+            ntp_timestamp: 0xB44D_B705_2000_0000,
+            rtp_timestamp: 90_000,
+            packet_count: 3,
+            octet_count: 1000,
+        };
+        let block = ReceptionReportBlock {
+            ssrc: 0xBBBB_BBBB,
+            fraction_lost: 5,
+            cumulative_lost: 2,
+            ..Default::default()
+        };
+        let sr = build_sender_report(0x1357_9BDF, &info, &[block]).unwrap();
+        let sdes = build_cname_sdes(0x1357_9BDF, "cam@studio").unwrap();
+        let datagram = compound(&[&sr, &sdes]);
+        let parsed = parse_compound(&datagram).unwrap();
+        assert_eq!(parsed.len(), 2);
+        match &parsed[0] {
+            RtcpPacket::Report(r) => {
+                assert_eq!(r.packet_type, PT_SR);
+                assert_eq!(r.sender_info, Some(info));
+                assert_eq!(r.report_blocks, vec![block]);
+            }
+            other => panic!("expected SR, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compound_preserves_unknown_app_packet() {
+        // An APP (PT=204) sub-packet we don't model should round-trip as
+        // Other with its raw bytes, and the walk must still advance past it.
+        let rr = build_receiver_report(1, &[]).unwrap();
+        // Hand-built APP: V=2, subtype=0, PT=204, length=1 (2 words), SSRC.
+        let app = vec![0x80, 204, 0x00, 0x01, 0, 0, 0, 9];
+        let datagram = compound(&[&rr, &app]);
+        let parsed = parse_compound(&datagram).unwrap();
+        assert_eq!(parsed.len(), 2);
+        match &parsed[1] {
+            RtcpPacket::Other { packet_type, bytes } => {
+                assert_eq!(*packet_type, 204);
+                assert_eq!(bytes, &app);
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compound_parse_rejects_truncated_subpacket() {
+        let rr = build_receiver_report(1, &[]).unwrap();
+        let mut datagram = compound(&[&rr]);
+        // Claim a longer length than the buffer provides.
+        datagram[2..4].copy_from_slice(&5u16.to_be_bytes());
+        assert_eq!(parse_compound(&datagram), Err(RtcpError::Truncated));
     }
 }
