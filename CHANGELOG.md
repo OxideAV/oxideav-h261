@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-h261/compare/v0.0.4...v0.0.5) - 2026-05-24
+
+### Other
+
+- RFC 4587 §6.1.1/§6.2 video/H261 rtpmap + fmtp parameter mapping
+- RFC 3550 §6.7 Application-Defined (APP, PT=204) packet
+- RFC 3550 §6.5 SDES + §6.6 BYE + §6.1 compound packets
+- RFC 3550 §6.4 Sender/Receiver Report builders + RtpPacketizer counters
+- encoder-side RFC 3550 packetiser stamps RFC 4587 RTP packets
+- implement RFC 4587 H.261 RTP payload-format wrap/unwrap
+- implement §5.2 + Annex B HRD buffer model and §5.4.2 spec test
+- implement BCH (511,493) forward error correction framing (§5.4)
+
 ### Added
 
 - **SDP media-type / `rtpmap` / `fmtp` parameter mapping (`oxideav_h261::sdp`).**
