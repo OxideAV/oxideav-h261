@@ -39,6 +39,7 @@ oxideav-h261 = "0.0"
 | RTCP SR / RR reports (RFC 3550 §6.4)             | yes    | yes    |
 | RTCP SDES + BYE + compound (RFC 3550 §6.5/§6.6)  | yes    | yes    |
 | RTCP APP application-defined (RFC 3550 §6.7)     | yes    | yes    |
+| SDP rtpmap/fmtp media type (RFC 4587 §6.1.1/6.2) | yes    | yes    |
 
 H.261 only permits integer-pel motion vectors (range ±15); there are no
 half-pel refinements, no B-pictures, and no start-code emulation prevention.
@@ -289,6 +290,55 @@ assert!(matches!(packets[2], RtcpPacket::App(_)));
 The §6.2 transmission-interval scheduler and the §A.1 / §A.3 / §A.8
 loss-fraction / jitter estimators remain caller-side — they belong above the
 codec in session-management code, not in the wire-format module.
+
+### SDP media type and rtpmap/fmtp parameters (RFC 4587 §6.1.1 / §6.2)
+
+The `sdp` module maps the `video/H261` media-type registration to the SDP
+`a=rtpmap` and `a=fmtp` attribute lines an H.261 endpoint exchanges at session
+setup. The `a=rtpmap` line is fixed: encoding name `H261`, clock rate `90000`
+(`ENCODING_NAME` / `CLOCK_RATE`), media name `video` for the `m=` line.
+`format_rtpmap(pt)` emits it; `parse_rtpmap` reads one back and confirms it is
+H.261 (case-insensitively on the encoding name, rejecting other codecs).
+
+The three optional `a=fmtp` parameters from §6.1.1 — `CIF`, `QCIF`, and `D` —
+are modelled by `H261FmtpParams`. `CIF` / `QCIF` carry an integer 1..=4 (the
+minimum picture interval, MPI) meaning "max rate `29.97 / value` fps"; `D`
+signals H.261 Annex D still-image support (`1` = yes, `0`/absent = no).
+`format_value` emits the bare `CIF=2;QCIF=1;D=1` list (CIF before QCIF, per the
+§6.2.1 worked example) and `format_fmtp(pt, &params)` wraps it in the full
+`a=fmtp:<pt> …` line (returning `None` when no parameters are set, since §6.2
+includes the line only "if any"). `parse_value` / `parse_fmtp` reverse it,
+enforcing the 1..=4 MPI range and the `D ∈ {0,1}` rule, tolerating whitespace,
+matching parameter names case-insensitively, and skipping unknown parameters
+forward-compatibly.
+
+```rust
+use oxideav_h261::picture::SourceFormat;
+use oxideav_h261::sdp::{format_rtpmap, format_fmtp, parse_rtpmap, parse_fmtp, H261FmtpParams};
+
+// Build the two attribute lines for payload type 31 (the §6.2.1 example).
+let params = H261FmtpParams { cif: Some(2), qcif: Some(1), d: Some(true) };
+assert_eq!(format_rtpmap(31), "a=rtpmap:31 H261/90000");
+assert_eq!(format_fmtp(31, &params).unwrap(), "a=fmtp:31 CIF=2;QCIF=1;D=1");
+
+// Parse a peer's offer back into typed parameters.
+let map = parse_rtpmap("a=rtpmap:31 H261/90000").unwrap();
+let offered = parse_fmtp("a=fmtp:31 CIF=2;QCIF=1;D=1", map.payload_type).unwrap().unwrap();
+assert_eq!(offered, params);
+// CIF=2 ⇒ ≤ 15 fps (29.97/2 = 2997/200) per §6.2.1.
+assert_eq!(offered.max_frame_rate(SourceFormat::Cif), Some((2997, 200)));
+```
+
+The §6.2.1 offer/answer helpers round out the module: `validate` enforces
+"SHALL specify at least one supported picture size", `rfc2032_fallback` returns
+the §6.2.1 default (QCIF at MPI=1) assumed for a peer that sends no picture-size
+parameter, and `max_frame_rate` / `mpi` / `supports` read out the advertised
+capability per `SourceFormat`. The SDP offer/answer state machine itself and
+the rest of the session description (`v=` / `o=` / `c=` / `t=`) stay caller-side
+— this module owns only the H.261-specific `rtpmap` / `fmtp` attribute wire
+format. The RFC 2032 H.261-specific RTCP control packets (FIR / NACK) are
+deliberately not implemented: RFC 4587 §7.1 mandates that "new implementations
+SHALL ignore them, and they SHALL NOT be used by new implementations."
 
 ## Quick use
 

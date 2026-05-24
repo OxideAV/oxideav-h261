@@ -43,6 +43,11 @@
 //!   carries a 4-byte ASCII name + 32-bit-aligned application-dependent
 //!   data for application-layer extensions that do not warrant their own
 //!   IANA-registered packet type.
+//! * SDP media-type signalling (RFC 4587 §6.1.1 / §6.2): the [`sdp`] module
+//!   maps the `video/H261` media type and its three optional parameters
+//!   (`CIF`, `QCIF`, `D`) to the SDP `a=rtpmap` / `a=fmtp` attribute lines,
+//!   with the §6.2.1 offer/answer helpers (per-format MPI frame-rate bound,
+//!   the "at least one picture size" invariant, the RFC-2032 QCIF fallback).
 //!
 //! Out of scope:
 //! * Single-bit correction of corrupted BCH (511,493) codewords — the
@@ -73,6 +78,7 @@ pub mod picture;
 pub mod quant;
 pub mod rtcp;
 pub mod rtp;
+pub mod sdp;
 pub mod start_code;
 pub mod tables;
 

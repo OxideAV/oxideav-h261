@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SDP media-type / `rtpmap` / `fmtp` parameter mapping (`oxideav_h261::sdp`).**
+  New module implementing the RFC 4587 §6.1.1 `video/H261` media-type
+  registration and its §6.2 SDP mapping. The `a=rtpmap` line is fixed —
+  encoding name `H261`, clock rate `90000`, `m=` media name `video` (pinned by
+  `ENCODING_NAME` / `CLOCK_RATE` / `MEDIA_NAME`); `format_rtpmap(pt)` emits it
+  and `parse_rtpmap` reads it back, confirming the encoding name is H.261
+  (case-insensitively), tolerating the optional trailing channel field, and
+  rejecting other codecs / non-rtpmap lines. `H261FmtpParams { cif, qcif, d }`
+  models the three §6.1.1 optional `a=fmtp` parameters: `CIF` / `QCIF` carry an
+  MPI integer 1..=4 ("max rate `29.97 / value` fps"), `D` signals Annex D
+  still-image support (`1`/`0`). `format_value` / `format_fmtp` emit
+  `CIF=2;QCIF=1;D=1` (CIF before QCIF, the §6.2.1 example order; no line when
+  no parameters are set, per §6.2 "if any"); `parse_value` / `parse_fmtp`
+  reverse it, enforcing the 1..=4 MPI range (`MpiOutOfRange`) and `D ∈ {0,1}`
+  (`BadAnnexD`), rejecting non-integer values / malformed tokens / duplicate
+  picture-size params, tolerating whitespace, matching parameter names
+  case-insensitively, and skipping unknown parameters forward-compatibly. The
+  §6.2.1 offer/answer helpers: `validate` enforces "SHALL specify at least one
+  supported picture size" (`NoPictureSize`), `rfc2032_fallback` returns the
+  §6.2.1 default (QCIF MPI=1) for a peer that omits picture-size params, and
+  `max_frame_rate(fmt)` returns the exact `29.97 / MPI` bound as an integer
+  rational (`(2997, 100 * MPI)`) so the §6.2.1 "≤ 15 fps for CIF=2" bound is
+  computed without floating-point round-off. The SDP offer/answer state machine
+  and the rest of the session description (`v=` / `o=` / `c=` / `t=`) remain
+  caller-side — this module owns only the H.261-specific `rtpmap` / `fmtp` wire
+  format. The RFC 2032 H.261-specific RTCP control packets (FIR / NACK) are
+  deliberately not implemented: RFC 4587 §7.1 mandates new implementations
+  SHALL ignore them and SHALL NOT use them. 36 new unit tests cover the
+  spec-example round trip, both line builders/parsers (with and without the
+  `a=` prefix), the full 1..=4 MPI range, all six error variants, the
+  forward-compatible unknown-parameter skip, case-insensitive name matching,
+  the RFC-2032 fallback, the frame-rate rational, and a full two-line session-
+  description round trip.
+
 - **RTCP APP (Application-Defined) packet (`oxideav_h261::rtcp`).** Builder and
   parser for RFC 3550 §6.7 (PT = 204). `build_app(subtype, ssrc, name, data)`
   emits the standard 4-byte RTCP header (with the 5-bit RC slot reused as the
