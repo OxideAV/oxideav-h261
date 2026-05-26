@@ -1,0 +1,44 @@
+[package]
+name = "oxideav-h261-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# H.261's decoder is the part worth fuzzing: a 20-bit picture start
+# code (PSC) plus a 6-bit PTYPE selects QCIF (176x144) or CIF
+# (352x288); an inner sequence of 16-bit GBSC + 4-bit GN + 5-bit
+# GQUANT GOB headers walks the macroblock layer, whose MBA / MTYPE
+# (with MQUANT / MVD / CBP variants) / CBP VLCs and TCOEFF VLC +
+# 20-bit escape drive an attacker-controlled IDCT / motion-comp /
+# loop-filter chain. The PSC / GBSC scanner, every VLC table, the
+# §4.2.3.4 MV predictor reset rules, the §3.2.3 loop filter, the
+# integer-pel motion-compensation indexing, and the inverse 8x8 IDCT
+# all consume bytes whose shape the fuzzer can dictate. There is no
+# external library oracle worth pulling in (the clean-room wall bars
+# any reference codec source anyway), so this fuzz crate is
+# decode-only: feed arbitrary bytes through `H261Decoder::send_packet`
+# / `receive_frame` / `flush` and assert the calls always return a
+# `Result` rather than panicking, aborting, integer-overflowing (in a
+# debug / ASAN build), indexing out of bounds, or OOMing.
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-h261]
+path = ".."
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_h261"
+path = "fuzz_targets/decode_h261.rs"
+test = false
+doc = false

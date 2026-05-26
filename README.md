@@ -340,6 +340,37 @@ format. The RFC 2032 H.261-specific RTCP control packets (FIR / NACK) are
 deliberately not implemented: RFC 4587 §7.1 mandates that "new implementations
 SHALL ignore them, and they SHALL NOT be used by new implementations."
 
+### Daily fuzzing
+
+A `cargo-fuzz` harness lives under `fuzz/`. The single target
+(`decode_h261`) drives arbitrary fuzz-supplied bytes through the
+decoder's full public surface (`send_packet` → drain `receive_frame`
+→ `flush` → drain again), so the PSC / GBSC start-code scanners,
+every VLC table (MBA / MTYPE / MVD / CBP / TCOEFF + 20-bit escape),
+the §4.2.3.4 MV predictor, the integer-pel MC indexing, the §3.2.3
+loop filter, and the 8×8 IDCT are all exercised against bytes whose
+shape the fuzzer dictates. The contract under test is purely that
+every call *returns*: no panic, no abort, no integer overflow (in
+debug / ASAN builds), no out-of-bounds index, no allocator OOM.
+
+The seed corpus (`fuzz/corpus/decode_h261/`) is generated from the
+in-tree encoder and covers QCIF + CIF I-pictures across a quantiser
+range (8 / 12 / 31), plus QCIF + CIF I+P pairs that exercise motion
+compensation and the loop filter. `tests/fuzz_seed_corpus.rs` drives
+the same logic on stable Rust against the same corpus so the regular
+CI matrix catches a regression in the public decoder surface without
+waiting for the daily fuzz run.
+
+The workflow at `.github/workflows/fuzz.yml` runs `cargo fuzz run
+decode_h261 -- -max_total_time=1800` (30-minute budget) once a day
+via the org-shared `crate-fuzz.yml` reusable workflow.
+
+```sh
+cargo install cargo-fuzz
+cd crates/oxideav-h261
+cargo +nightly fuzz run decode_h261 -- -max_total_time=60
+```
+
 ## Quick use
 
 ```rust

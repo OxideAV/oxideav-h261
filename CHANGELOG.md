@@ -22,6 +22,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Daily `cargo-fuzz` decoder harness.** New `fuzz/` subcrate with a
+  single `decode_h261` target that drives arbitrary fuzz-supplied
+  bytes through the decoder's full public surface (`send_packet` →
+  drain `receive_frame` → `flush` → drain) so the PSC / GBSC scanners,
+  every VLC table (MBA / MTYPE / MVD / CBP / TCOEFF + 20-bit escape),
+  the §4.2.3.4 MV predictor, the integer-pel MC indexing, the §3.2.3
+  loop filter, and the 8×8 IDCT are all exercised against attacker-
+  controlled bytes. The contract under test is purely that every call
+  *returns* — no panic, no abort, no integer overflow, no out-of-bounds
+  index, no allocator OOM. Seed corpus is encoder-derived: QCIF + CIF
+  I-pictures across `q ∈ {8, 12, 31}`, plus QCIF + CIF I+P pairs that
+  exercise motion compensation and the loop filter. A new
+  `tests/fuzz_seed_corpus.rs` test drives the same logic on stable
+  Rust against the same corpus so the regular CI matrix catches a
+  regression in the public decoder surface without waiting for the
+  daily fuzz run. Workflow `.github/workflows/fuzz.yml` runs the
+  target once a day via the org-shared `crate-fuzz.yml` reusable
+  workflow (30-minute budget).
+
 - **SDP media-type / `rtpmap` / `fmtp` parameter mapping (`oxideav_h261::sdp`).**
   New module implementing the RFC 4587 §6.1.1 `video/H261` media-type
   registration and its §6.2 SDP mapping. The `a=rtpmap` line is fixed —
