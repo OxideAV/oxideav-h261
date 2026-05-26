@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Second `cargo-fuzz` target — RTCP compound parser.** New
+  `parse_rtcp_compound` fuzz target drives arbitrary fuzz-supplied bytes
+  through the public RTCP parser surface (`parse_compound`,
+  `parse_report`, `parse_sdes`, `parse_bye`, `parse_app`) so the §6.1
+  compound walk (16-bit-length advance), the SR/RR fixed header + RC
+  block walk, SDES chunk + item walk (including the PRIV inner 8-bit
+  length), BYE reason-string length-prefix, and APP `name`/`data` 32-bit
+  alignment are all exercised against bytes whose shape the fuzzer
+  dictates. Same contract as the existing `decode_h261` target: every
+  call must return — no panic, no abort, no integer overflow (in debug
+  / ASAN builds), no out-of-bounds index, no allocator OOM. The seed
+  corpus under `fuzz/corpus/parse_rtcp_compound/` contains nine valid
+  datagrams (empty RR, SR with no blocks, SR with one block, RR with
+  two blocks, SDES CNAME, BYE with reason, APP with PING payload, and
+  two compound packets). `tests/fuzz_seed_corpus_rtcp.rs` drives the
+  same logic on stable Rust against the corpus plus several adversarial
+  in-line buffers (lying header length, zero-length advance, truncated
+  compound, SDES PRIV length overflow, BYE reason overflow, APP at the
+  5-bit subtype maximum, unknown PT=205) so a regression in the public
+  parser surface trips an existing CI lane rather than waiting for the
+  daily fuzz run.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-h261/compare/v0.0.4...v0.0.5) - 2026-05-24
 
 ### Other

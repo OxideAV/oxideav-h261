@@ -342,33 +342,63 @@ SHALL ignore them, and they SHALL NOT be used by new implementations."
 
 ### Daily fuzzing
 
-A `cargo-fuzz` harness lives under `fuzz/`. The single target
-(`decode_h261`) drives arbitrary fuzz-supplied bytes through the
-decoder's full public surface (`send_packet` → drain `receive_frame`
-→ `flush` → drain again), so the PSC / GBSC start-code scanners,
-every VLC table (MBA / MTYPE / MVD / CBP / TCOEFF + 20-bit escape),
-the §4.2.3.4 MV predictor, the integer-pel MC indexing, the §3.2.3
-loop filter, and the 8×8 IDCT are all exercised against bytes whose
-shape the fuzzer dictates. The contract under test is purely that
-every call *returns*: no panic, no abort, no integer overflow (in
-debug / ASAN builds), no out-of-bounds index, no allocator OOM.
+A `cargo-fuzz` harness lives under `fuzz/`. Two targets cover the
+two distinct attack surfaces an H.261 endpoint exposes to the
+network:
 
-The seed corpus (`fuzz/corpus/decode_h261/`) is generated from the
-in-tree encoder and covers QCIF + CIF I-pictures across a quantiser
-range (8 / 12 / 31), plus QCIF + CIF I+P pairs that exercise motion
-compensation and the loop filter. `tests/fuzz_seed_corpus.rs` drives
-the same logic on stable Rust against the same corpus so the regular
-CI matrix catches a regression in the public decoder surface without
-waiting for the daily fuzz run.
+* **`decode_h261`** drives arbitrary fuzz-supplied bytes through the
+  decoder's full public surface (`send_packet` → drain `receive_frame`
+  → `flush` → drain again), so the PSC / GBSC start-code scanners,
+  every VLC table (MBA / MTYPE / MVD / CBP / TCOEFF + 20-bit escape),
+  the §4.2.3.4 MV predictor, the integer-pel MC indexing, the §3.2.3
+  loop filter, and the 8×8 IDCT are all exercised against bytes whose
+  shape the fuzzer dictates.
+* **`parse_rtcp_compound`** drives arbitrary fuzz-supplied bytes
+  through the RTCP control-channel parser surface
+  (`parse_compound` / `parse_report` / `parse_sdes` / `parse_bye` /
+  `parse_app`), so the RFC 3550 §6.1 compound walk (advance via each
+  sub-packet's 16-bit `length` field), the SR / RR fixed header + RC
+  block walk (§6.4.1 / §6.4.2), the SDES chunk + item walk including
+  the §6.5.8 PRIV inner 8-bit length prefix, the BYE reason-string
+  length prefix (§6.6), and the APP `name`/`data` 32-bit alignment
+  (§6.7) are all exercised against attacker-controlled bytes.
+
+The contract under test is the same for both targets: every call
+must *return* — no panic, no abort, no integer overflow (in debug /
+ASAN builds), no out-of-bounds index, no allocator OOM.
+
+The seed corpus for `decode_h261` (`fuzz/corpus/decode_h261/`) is
+generated from the in-tree encoder and covers QCIF + CIF I-pictures
+across a quantiser range (8 / 12 / 31), plus QCIF + CIF I+P pairs
+that exercise motion compensation and the loop filter. The seed
+corpus for `parse_rtcp_compound`
+(`fuzz/corpus/parse_rtcp_compound/`) contains nine valid datagrams:
+empty RR, SR with no blocks, SR with one block, RR with two blocks,
+SDES CNAME, BYE with reason, APP with PING payload, and two
+compound packets (RR + SDES + BYE; SR + SDES + APP).
+
+`tests/fuzz_seed_corpus.rs` and `tests/fuzz_seed_corpus_rtcp.rs`
+drive the same logic on stable Rust against each corpus so the
+regular CI matrix catches a regression in either public surface
+without waiting for the daily fuzz run. The RTCP stable-CI test
+also drives a handful of hand-crafted adversarial buffers — lying
+header length, zero-length advance, truncated compound, SDES PRIV
+length overflow, BYE reason overflow, APP at the 5-bit subtype
+maximum, unknown PT=205 — so the parser-surface contract stays
+covered even if the on-disk corpus is corrupted.
 
 The workflow at `.github/workflows/fuzz.yml` runs `cargo fuzz run
 decode_h261 -- -max_total_time=1800` (30-minute budget) once a day
-via the org-shared `crate-fuzz.yml` reusable workflow.
+via the org-shared `crate-fuzz.yml` reusable workflow. The
+`parse_rtcp_compound` target shares the same workflow file once the
+reusable workflow gains per-target sequencing; until then the
+stable-CI test is the primary regression guard.
 
 ```sh
 cargo install cargo-fuzz
 cd crates/oxideav-h261
 cargo +nightly fuzz run decode_h261 -- -max_total_time=60
+cargo +nightly fuzz run parse_rtcp_compound -- -max_total_time=60
 ```
 
 ## Quick use

@@ -42,3 +42,17 @@ name = "decode_h261"
 path = "fuzz_targets/decode_h261.rs"
 test = false
 doc = false
+
+# Second fuzz target — the RTCP control-channel parser surface (RFC 3550
+# §6). RTCP packets arrive from a peer on the network; their bytes are
+# attacker-controlled. Each sub-packet's 16-bit `length` field governs the
+# walk advance, every SDES / BYE / APP item carries 8-bit-length-prefixed
+# text the parser must bound-check, and the compound packet is a self-
+# delimiting stream of these sub-packets. This is exactly the shape a
+# parser is most likely to mis-implement, so it gets its own target
+# distinct from the elementary-stream decode_h261 target.
+[[bin]]
+name = "parse_rtcp_compound"
+path = "fuzz_targets/parse_rtcp_compound.rs"
+test = false
+doc = false
