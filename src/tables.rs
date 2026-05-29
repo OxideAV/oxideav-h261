@@ -473,7 +473,11 @@ pub fn decode_tcoeff(br: &mut BitReader<'_>, is_first: bool) -> Result<TcoeffSym
                 level_abs: 1,
             });
         }
-        // Two-bit discriminator.
+        // Two-bit discriminator needs at least 2 bits available;
+        // a malformed bitstream may have left only one.
+        if avail < 2 {
+            return Err(Error::invalid("h261 tcoeff: truncated `1?` prefix"));
+        }
         let two = (peek >> (avail - 2)) & 0b11;
         if two == 0b10 {
             br.consume(2)?;
@@ -818,6 +822,33 @@ mod tests {
         let data = [0b0000_0100u8];
         let mut br = BitReader::new(&data);
         assert_eq!(decode_tcoeff(&mut br, false).unwrap(), TcoeffSym::Escape);
+    }
+
+    /// Regression test for the round-175 daily-fuzz crash on a malformed
+    /// elementary stream. `decode_tcoeff(.., is_first = false)` was given
+    /// a bit-reader with exactly one bit remaining and that bit was `1`.
+    /// The function took the `b0 == 1` branch and then peeked two bits
+    /// from `peek >> (avail - 2)`, where `avail = 1` caused an unsigned
+    /// underflow → panic (`attempt to subtract with overflow` under
+    /// debug / ASAN builds). The fix gates the two-bit peek behind
+    /// `avail >= 2` and returns `Error::invalid` on the truncated input
+    /// instead, restoring the public-surface contract from the fuzz
+    /// harness: every call returns — no panic.
+    #[test]
+    fn tcoeff_truncated_one_bit_does_not_panic() {
+        // Build a one-bit-remaining reader whose remaining bit is `1`:
+        // a single byte `0b0000_0001` with the top seven bits consumed.
+        let data = [0b0000_0001u8];
+        let mut br = BitReader::new(&data);
+        for _ in 0..7 {
+            br.consume(1).unwrap();
+        }
+        // avail = 1, next-bit = 1 — the panic shape pre-fix.
+        let r = decode_tcoeff(&mut br, false);
+        assert!(
+            r.is_err(),
+            "truncated `1?` prefix must return Err, not panic"
+        );
     }
 
     #[test]

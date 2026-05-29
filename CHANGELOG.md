@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Decoder panic on a truncated `1?` TCOEFF prefix** (round 175,
+  surfaced by the scheduled daily `decode_h261` fuzz harness).
+  `decode_tcoeff(.., is_first = false)` saw a bit-reader where exactly
+  one bit remained and that bit was `1`. The function took the
+  `b0 == 1` branch and then peeked two bits from
+  `peek >> (avail - 2)`, where `avail = 1` caused an unsigned
+  underflow → `attempt to subtract with overflow` panic under debug
+  / ASAN builds. The two-bit peek is now gated behind `avail >= 2`
+  and the call returns `Error::invalid("h261 tcoeff: truncated `1?`
+  prefix")` on the malformed input, restoring the public-surface
+  contract from the fuzz harness: every call returns — no panic, no
+  abort, no out-of-bounds. New regression test
+  `tcoeff_truncated_one_bit_does_not_panic` covers it on stable Rust.
+
 ### Added
 
 - **Criterion benchmark suite** (`benches/transform`, `benches/encode`,
