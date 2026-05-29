@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-h261/compare/v0.0.5...v0.0.6) - 2026-05-29
+
+### Other
+
+- RFC 4587 §6.2.1 offer/answer negotiation helper
+- fix truncated `1?` TCOEFF prefix panic (daily-fuzz finding)
+- criterion suite for transform / encode / decode hot paths
+- scrub decorative external-implementation attribution
+- second cargo-fuzz target for RTCP compound parser
+- cargo-fuzz decoder harness + daily workflow
+
 ### Added
 
 - **SDP offer/answer negotiation helper** (RFC 4587 §6.2.1). The
