@@ -16,3 +16,32 @@ categories = ["multimedia::encoding", "multimedia::video"]
 [dependencies]
 oxideav-core = "0.1"
 oxideav-pixfmt = "0.1"
+
+[dev-dependencies]
+# Round 175 (depth-mode benchmarks): Criterion drives three bench
+# harnesses (`transform`, `encode`, `decode`) that future codec
+# rounds use to A/B their algorithm tweaks. Pinned to the same 0.5
+# line the other OxideAV crates with benches (tta, flac, magicyuv,
+# huffyuv, h264, prores) already track.
+criterion = "0.5"
+
+# Round 175 benches. Each binary lives in `benches/<name>.rs` and is
+# self-contained: every YUV source frame is synthesised in-bench
+# from a deterministic xorshift seed plus a striped pattern (no
+# committed fixtures, no on-disk testsrc, no ffmpeg call). The
+# encode benches drive the production `encode_intra_picture` /
+# `encode_inter_picture` paths; the decode benches first run the
+# encoder to produce a real elementary stream, then feed it through
+# `H261Decoder::send_packet` + `receive_frame`. Run with:
+#     cargo bench -p oxideav-h261 --bench <name>
+[[bench]]
+name = "transform"
+harness = false
+
+[[bench]]
+name = "encode"
+harness = false
+
+[[bench]]
+name = "decode"
+harness = false

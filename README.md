@@ -401,6 +401,59 @@ cargo +nightly fuzz run decode_h261 -- -max_total_time=60
 cargo +nightly fuzz run parse_rtcp_compound -- -max_total_time=60
 ```
 
+### Benchmarks
+
+A `criterion` benchmark suite lives under `benches/`. Three targets
+cover the three layers of the codec pipeline so future optimisation
+rounds (e.g. a SIMD IDCT, a fixed-point FDCT, a precomputed CBP-
+prefix table, a faster spiral+diamond ME) have a baseline to A/B
+against:
+
+* **`transform`** — single 8×8 block forward / inverse DCT. Four
+  sub-scenarios (`fdct_intra` / `fdct_signed` / `idct_intra` /
+  `idct_signed`) — the encoder and decoder hot path at the leaf.
+* **`encode`** — full picture encode through the production
+  `encode_intra_picture` / `H261Encoder::encode_frame` paths.
+  Sub-scenarios: `encode_qcif_intra_q8` (single 176×144 I-picture,
+  no ME), `encode_qcif_inter_one_q8` (a single P-picture from a
+  pre-computed I recon, isolates the per-frame P cost),
+  `encode_qcif_inter_chain_4_q8` (I + 3 P at quant=8 — adds the
+  full rate-controller carryover), and `encode_cif_intra_q8`
+  (352×288 I-only, amortises the per-MB constant).
+* **`decode`** — full picture decode through `H261Decoder::send_packet`
+  + `receive_frame`. Sub-scenarios mirror the encode bench
+  (`decode_qcif_intra_q8`, `decode_qcif_inter_chain_4_q8`,
+  `decode_cif_intra_q8`).
+
+Every benchmark synthesises its YUV source inline from a
+deterministic striped pattern plus low-amplitude xorshift noise
+(no on-disk fixtures, no third-party CLI, no `docs/` files at
+bench time); the decode benches drive their input through the
+in-crate encoder first so they always test against a
+well-formed elementary stream.
+
+```sh
+# Compile-only smoke test (CI uses this).
+cargo bench -p oxideav-h261 --no-run
+
+# Quick fast run (~10 s total — short measurement window).
+cargo bench -p oxideav-h261 -- --quick
+
+# Full criterion run (default 5 s warm-up + 10 s measure per bench).
+cargo bench -p oxideav-h261 --bench transform
+cargo bench -p oxideav-h261 --bench encode
+cargo bench -p oxideav-h261 --bench decode
+
+# Filter to one sub-scenario.
+cargo bench -p oxideav-h261 --bench encode -- qcif_intra
+```
+
+The bench suite is `harness = false` (criterion replaces the
+default `libtest` harness), so `cargo bench --no-run` doubles as
+a compile-only regression guard the CI matrix already exercises
+via the `cargo build --benches`-equivalent path of the reusable
+crate workflow.
+
 ## Quick use
 
 ```rust

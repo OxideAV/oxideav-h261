@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Criterion benchmark suite** (`benches/transform`, `benches/encode`,
+  `benches/decode`). Round 175 (depth-mode) wires up `criterion = "0.5"`
+  as a dev-dependency and registers three `harness = false` bench
+  binaries so future optimisation rounds have a recorded baseline to
+  A/B against:
+  * `transform` times the 8×8 inverse / forward DCT block hot path —
+    `fdct_intra` + `fdct_signed` (encoder forward pass) and
+    `idct_intra` + `idct_signed` (decoder inverse pass). One block per
+    iteration; throughput reported in samples so per-sample cycle-
+    equivalents land naturally.
+  * `encode` times whole-picture encode through the production
+    `encode_intra_picture` / `H261Encoder::encode_frame` paths in four
+    scenarios: QCIF intra-only (no ME), single-P from a pre-built I
+    reference, I + 3 P chain (full rate-controller carryover), and CIF
+    intra (the 4× area test).
+  * `decode` times whole-picture decode through `H261Decoder::send_packet`
+    + `receive_frame`, mirroring the encode scenarios. Each decode
+    bench runs the in-crate encoder once during setup to produce a
+    real elementary stream, so the timed loop measures the decoder
+    alone.
+  Every benchmark synthesises its YUV source inline from a
+  deterministic striped pattern plus low-amplitude xorshift noise —
+  no on-disk fixtures, no third-party CLI, no `docs/` files read at
+  bench time. `cargo bench -p oxideav-h261 --no-run` doubles as a
+  compile-only CI regression guard via the existing matrix.
+
 - **Second `cargo-fuzz` target — RTCP compound parser.** New
   `parse_rtcp_compound` fuzz target drives arbitrary fuzz-supplied bytes
   through the public RTCP parser surface (`parse_compound`,
