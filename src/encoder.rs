@@ -80,11 +80,11 @@
 //!
 //! §4.2.3.4 mandates the MV predictor be reset to `(0, 0)` for MBs 1, 12,
 //! and 23 (start of each MB row in a GOB), at MBA discontinuity, and when
-//! the previous MB was not MC-coded. The encoder follows the spec exactly
-//! so ffmpeg interop holds. To keep the local decoder byte-tight (which
-//! does not row-reset on its own) we force the MV at MBs 11 and 22 to
-//! `(0, 0)` so `prev_was_mc` is false going into MBs 12 / 23 — both
-//! decoders then derive the same predictor.
+//! the previous MB was not MC-coded. The encoder follows §4.2.3.4 exactly
+//! so any spec-conformant decoder derives the same predictor. To keep the
+//! in-crate decoder byte-tight (which does not row-reset on its own) we
+//! force the MV at MBs 11 and 22 to `(0, 0)` so `prev_was_mc` is false
+//! going into MBs 12 / 23 — both decoders then derive the same predictor.
 
 use std::collections::VecDeque;
 
@@ -1186,7 +1186,8 @@ fn motion_estimate_luma(
 /// half are rounded up").
 ///
 /// This MUST match the decoder's `apply_loop_filter` byte-for-byte for
-/// local-recon to stay tight with self-decode and ffmpeg interop.
+/// local-recon to stay tight with self-decode (any spec-conformant decoder
+/// derives the same recon).
 fn apply_loop_filter_block(src: &[u8; 64]) -> [u8; 64] {
     // Horizontal pass — store as i32 to keep precision into the vertical pass.
     let mut h = [0i32; 64];

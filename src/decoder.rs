@@ -197,8 +197,8 @@ impl H261Decoder {
         // Queue the raw decoded `Picture` for later draining. Arena
         // leasing happens at `receive_arena_frame` time so the pool
         // doesn't sit checked out across multiple decoded pictures
-        // when the caller drives the decoder send-many-then-drain
-        // (typical for ffmpeg-style elementary-stream tests).
+        // when the caller drives the decoder in a send-many-then-drain
+        // pattern (typical for elementary-stream tests).
         self.ready_frames.push_back((pic.clone(), self.pending_pts));
         self.reference = Some(pic);
         Ok(())

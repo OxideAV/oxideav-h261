@@ -482,10 +482,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Inter+MC+FIL` MTYPEs (loop filter §3.2.3, separable 1/4-1/2-1/4 with
   edge-pel passthrough). Each P-MB picks the cheapest of skip / Inter /
   Inter+MC{-only,+CBP} / Inter+MC+FIL{-only,+CBP} via a bit-cost estimator
-  comparing MTYPE + MVD + CBP + a residual proxy. ffmpeg interop holds on
-  the FIL stream (`ffmpeg_decodes_our_fil_p_pictures`). On testsrc QCIF
-  the pipeline lifts ffmpeg-roundtrip PSNR from r12's 39.27 dB / 8680 B
-  to 39.40 dB / 8546 B (–1.5 % bytes, +0.13 dB).
+  comparing MTYPE + MVD + CBP + a residual proxy. The FIL stream
+  passes the third-party-decoder roundtrip test
+  (`ffmpeg_decodes_our_fil_p_pictures`). On testsrc QCIF the pipeline
+  lifts the third-party-decoder roundtrip PSNR from r12's 39.27 dB /
+  8680 B to 39.40 dB / 8546 B (–1.5 % bytes, +0.13 dB).
 - Encoder: per-GOB MQUANT-delta rate controller (§4.2.3.3). Tracks
   cumulative bits within each GOB and nudges the quantiser ±1 step (within
   a ±6 window around GQUANT) when an MB lands far over the linear bit
@@ -506,7 +507,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the start-code peek when ≥16 bits remain and otherwise let the VLC
   decoder consume what's there. Self-decode of a 5-frame P-chain on
   testsrc QCIF jumps from 25–28 dB PSNR (drift from misdecoded final
-  MBs) to a clean 36–37 dB matching ffmpeg byte-for-byte.
+  MBs) to a clean 36–37 dB; the third-party-decoder roundtrip is now
+  byte-tight on the affected GOB.
 
 ## [0.0.2](https://github.com/OxideAV/oxideav-h261/compare/v0.0.1...v0.0.2) - 2026-04-25
 
