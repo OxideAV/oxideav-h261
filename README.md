@@ -332,13 +332,36 @@ assert_eq!(offered.max_frame_rate(SourceFormat::Cif), Some((2997, 200)));
 The §6.2.1 offer/answer helpers round out the module: `validate` enforces
 "SHALL specify at least one supported picture size", `rfc2032_fallback` returns
 the §6.2.1 default (QCIF at MPI=1) assumed for a peer that sends no picture-size
-parameter, and `max_frame_rate` / `mpi` / `supports` read out the advertised
-capability per `SourceFormat`. The SDP offer/answer state machine itself and
-the rest of the session description (`v=` / `o=` / `c=` / `t=`) stay caller-side
-— this module owns only the H.261-specific `rtpmap` / `fmtp` attribute wire
-format. The RFC 2032 H.261-specific RTCP control packets (FIR / NACK) are
-deliberately not implemented: RFC 4587 §7.1 mandates that "new implementations
-SHALL ignore them, and they SHALL NOT be used by new implementations."
+parameter, `preferred_picture_size` returns the §6.2.1 "Parameters offered first
+are the most preferred" mode (CIF when advertised, else QCIF), and `max_frame_rate`
+/ `mpi` / `supports` read out the advertised capability per `SourceFormat`. The
+free function `negotiate_answer(offer, our_capability)` computes the §6.2.1
+**answer** by intersecting both peers' picture sizes, taking `max(offer.MPI,
+our.MPI)` per shared size (the more restrictive frame-rate bound binds), gating
+`D=1` on both sides advertising Annex D, and applying the RFC 2032
+fallback (`QCIF=1`) when the offer omits picture sizes. The SDP offer/answer
+state machine itself and the rest of the session description (`v=` / `o=` /
+`c=` / `t=`) stay caller-side — this module owns only the H.261-specific
+`rtpmap` / `fmtp` attribute wire format. The RFC 2032 H.261-specific RTCP
+control packets (FIR / NACK) are deliberately not implemented: RFC 4587 §7.1
+mandates that "new implementations SHALL ignore them, and they SHALL NOT be
+used by new implementations."
+
+```rust
+use oxideav_h261::sdp::{H261FmtpParams, negotiate_answer};
+// Peer A offers CIF=2 (≤ 14.985 fps), QCIF=1 (≤ 29.97 fps), Annex D supported.
+let offer = H261FmtpParams { cif: Some(2), qcif: Some(1), d: Some(true) };
+// We can decode CIF at MPI=2 (≤ 14.985 fps), QCIF at MPI=2 (≤ 14.985 fps);
+// we don't support Annex D.
+let ours = H261FmtpParams { cif: Some(2), qcif: Some(2), d: None };
+let answer = negotiate_answer(&offer, &ours).unwrap();
+// CIF survives at MPI=2 (both sides agree); QCIF tightens to MPI=2 (the
+// answer must satisfy both peers' upper rate bounds); D drops because we
+// didn't advertise it.
+assert_eq!(answer.cif, Some(2));
+assert_eq!(answer.qcif, Some(2));
+assert_eq!(answer.d, None);
+```
 
 ### Daily fuzzing
 

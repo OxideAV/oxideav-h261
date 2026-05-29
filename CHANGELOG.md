@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SDP offer/answer negotiation helper** (RFC 4587 §6.2.1). The
+  `sdp` module gains the free function `negotiate_answer(offer,
+  our_capability) -> Result<H261FmtpParams, SdpError>` that computes
+  the §6.2.1 **answer** parameters from a received offer and our
+  local capability:
+  * **Picture-size intersection.** Only sizes both peers advertise
+    survive into the answer; a disjoint pair (e.g. CIF-only offer vs
+    QCIF-only capability) errors with `SdpError::NoPictureSize`,
+    matching §6.2.1's "SHALL specify at least one supported picture
+    size".
+  * **MPI per shared size.** §6.1.1's MPI is the *minimum picture
+    interval*, so `29.97 / MPI` is the **upper bound** on frame rate.
+    The answer carries `MPI = max(offer.MPI, our.MPI)` per shared
+    size, i.e. the more restrictive bound binds.
+  * **Annex D (`D`).** §6.2.1: "This option MUST NOT appear unless
+    the sender of this SDP message is able to decode this option."
+    The answer's `D=1` requires both `offer.d == Some(true)` AND
+    `our_capability.d == Some(true)`; otherwise `D` is omitted from
+    the answer (matching §6.1.1's "SHOULD NOT be used … if not
+    supported").
+  * **RFC 2032 fallback.** §6.2.1: "If the receiver does not specify
+    the picture size/MPI parameter … assume that such a receiver is
+    able to support reception of QCIF resolution with MPI=1." The
+    helper applies that fallback automatically (equivalent to
+    `H261FmtpParams::rfc2032_fallback()`) when the offer carries no
+    picture-size parameter. The fallback is **not** applied to
+    `our_capability` — that side is local and should be supplied
+    explicitly.
+
+  The companion method `H261FmtpParams::preferred_picture_size()`
+  returns the preferred receiver mode per §6.2.1 ("Parameters offered
+  first are the most preferred") — `Some(SourceFormat::Cif)` when CIF
+  is advertised (matching `format_value`'s CIF-before-QCIF emission
+  order from the §6.2.1 worked example), `Some(SourceFormat::Qcif)`
+  when only QCIF is, else `None`. Eight new tests cover the
+  intersection / MPI-max / disjoint-sizes / Annex-D / RFC-2032-
+  fallback / format round-trip / max-frame-rate / validate-passes
+  paths; the negotiation example also runs as a doctest.
+
 ### Fixed
 
 - **Decoder panic on a truncated `1?` TCOEFF prefix** (round 175,

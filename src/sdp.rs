@@ -225,6 +225,33 @@ impl H261FmtpParams {
         Ok(())
     }
 
+    /// Preferred picture mode advertised by these parameters per §6.2.1
+    /// ("Parameters offered first are the most preferred picture mode to be
+    /// received").
+    ///
+    /// The struct does not record the literal token order observed during
+    /// parsing — it stores `cif` and `qcif` as independent
+    /// `Option<u8>` fields, and [`format_value`](Self::format_value) emits
+    /// CIF before QCIF to match the §6.2.1 worked example
+    /// (`a=fmtp:31 CIF=2;QCIF=1;D=1`). To preserve that round trip,
+    /// [`preferred_picture_size`](Self::preferred_picture_size) returns
+    /// CIF when CIF is advertised (preferring it over QCIF), QCIF when
+    /// only QCIF is advertised, and `None` when neither is.
+    ///
+    /// Callers that need to track literal offer-side preference order for a
+    /// peer that emits `QCIF=…;CIF=…` (the spec uses CIF-first but the
+    /// `parse_value` token order is otherwise unconstrained) should record
+    /// that order separately from the parsed parameters.
+    pub fn preferred_picture_size(&self) -> Option<SourceFormat> {
+        if self.cif.is_some() {
+            Some(SourceFormat::Cif)
+        } else if self.qcif.is_some() {
+            Some(SourceFormat::Qcif)
+        } else {
+            None
+        }
+    }
+
     /// Emit the bare semicolon-separated parameter string for the `a=fmtp`
     /// line, e.g. `"CIF=2;QCIF=1;D=1"` (§6.1.1 / §6.2).
     ///
@@ -311,6 +338,93 @@ impl H261FmtpParams {
 
         Ok(out)
     }
+}
+
+/// Compute the SDP offer/answer **answer** parameters from a received
+/// offer and our local capability, per RFC 4587 §6.2.1.
+///
+/// The two sides have to agree on a common picture size and a common
+/// frame-rate bound. Each `H261FmtpParams` describes one peer's view
+/// using the §6.1.1 `CIF` / `QCIF` MPI parameters:
+///
+/// * **Picture size intersection.** Only picture sizes both peers
+///   advertise survive into the answer. A CIF advertisement from one
+///   side and a QCIF-only advertisement from the other yields no
+///   common size — surface as [`SdpError::NoPictureSize`] so the caller
+///   can reject the offer cleanly (§6.2.1: "SHALL specify at least one
+///   supported picture size").
+/// * **Frame-rate bound (MPI per size).** §6.1.1's `value` parameter is
+///   the *minimum picture interval*, so `29.97 / MPI` is the **upper
+///   bound** on frame rate the receiver advertises. The sender must
+///   satisfy **both** peers' upper bounds, i.e. the negotiated rate
+///   must not exceed `29.97 / max(offer_MPI, our_MPI)`. The answer
+///   therefore carries `MPI = max(offer.MPI, our.MPI)` for each shared
+///   size.
+/// * **Annex D (`D`).** §6.2.1: "This option MUST NOT appear unless
+///   the sender of this SDP message is able to decode this option."
+///   Annex D is a still-image decoder capability; the answer's `D=1`
+///   requires both `offer.d == Some(true)` AND
+///   `our_capability.d == Some(true)`. Otherwise the answer omits `D`
+///   (matching §6.1.1's "SHOULD NOT be used … if not supported").
+/// * **RFC 2032 fallback.** If `offer` advertises no picture size at
+///   all, §6.2.1 says it "is safe to assume … reception of QCIF
+///   resolution with MPI=1". The negotiation applies that fallback
+///   automatically (equivalent to [`H261FmtpParams::rfc2032_fallback`])
+///   before intersecting with our capability. The same fallback is
+///   **not** applied to `our_capability` — that side is local and
+///   should be supplied explicitly.
+///
+/// The answer is constructed so [`format_value`](H261FmtpParams::format_value)
+/// emits the §6.2.1 CIF-before-QCIF order, matching the spec example
+/// `a=fmtp:31 CIF=2;QCIF=1;D=1`.
+///
+/// ```
+/// use oxideav_h261::sdp::{H261FmtpParams, negotiate_answer};
+/// // Peer A offers CIF=2 (≤ 15 fps), QCIF=1 (≤ 29.97 fps), Annex D.
+/// let offer = H261FmtpParams { cif: Some(2), qcif: Some(1), d: Some(true) };
+/// // We can decode CIF at ≤ 14.985 fps (MPI=2) and QCIF at ≤ 14.985 fps
+/// // (MPI=2). We don't support Annex D.
+/// let ours = H261FmtpParams { cif: Some(2), qcif: Some(2), d: None };
+/// let answer = negotiate_answer(&offer, &ours).unwrap();
+/// // Both peers can do CIF at MPI=2 → answer CIF=2.
+/// assert_eq!(answer.cif, Some(2));
+/// // Offer caps QCIF at MPI=1 (≤ 29.97 fps) and we cap it at MPI=2
+/// // (≤ 14.985 fps); the answer must satisfy both ⇒ MPI=2.
+/// assert_eq!(answer.qcif, Some(2));
+/// // Our side cannot decode Annex D ⇒ D omitted from the answer.
+/// assert_eq!(answer.d, None);
+/// ```
+pub fn negotiate_answer(
+    offer: &H261FmtpParams,
+    our_capability: &H261FmtpParams,
+) -> Result<H261FmtpParams, SdpError> {
+    // §6.2.1 RFC 2032 fallback: an offer with no picture-size parameters
+    // is treated as QCIF=1.
+    let effective_offer = if offer.cif.is_none() && offer.qcif.is_none() {
+        H261FmtpParams::rfc2032_fallback()
+    } else {
+        *offer
+    };
+
+    let cif = match (effective_offer.cif, our_capability.cif) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        _ => None,
+    };
+    let qcif = match (effective_offer.qcif, our_capability.qcif) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        _ => None,
+    };
+
+    if cif.is_none() && qcif.is_none() {
+        return Err(SdpError::NoPictureSize);
+    }
+
+    let d = match (effective_offer.d, our_capability.d) {
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    };
+
+    Ok(H261FmtpParams { cif, qcif, d })
 }
 
 /// Parse a CIF/QCIF MPI value, enforcing the §6.1.1 range 1..=4.
@@ -806,6 +920,208 @@ mod tests {
         assert_eq!(map.clock_rate, CLOCK_RATE);
         let back = parse_fmtp(&fmtp, map.payload_type).unwrap().unwrap();
         assert_eq!(back, params);
+    }
+
+    #[test]
+    fn preferred_picture_size_picks_cif_when_advertised() {
+        let both = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: None,
+        };
+        assert_eq!(both.preferred_picture_size(), Some(SourceFormat::Cif));
+        let qcif_only = H261FmtpParams {
+            cif: None,
+            qcif: Some(1),
+            d: None,
+        };
+        assert_eq!(qcif_only.preferred_picture_size(), Some(SourceFormat::Qcif));
+        let cif_only = H261FmtpParams {
+            cif: Some(3),
+            qcif: None,
+            d: None,
+        };
+        assert_eq!(cif_only.preferred_picture_size(), Some(SourceFormat::Cif));
+        let neither = H261FmtpParams::default();
+        assert_eq!(neither.preferred_picture_size(), None);
+    }
+
+    #[test]
+    fn negotiate_answer_intersects_picture_sizes() {
+        // Offer: CIF=2, QCIF=1; ours: QCIF=1 only ⇒ answer: QCIF=1.
+        let offer = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: None,
+        };
+        let ours = H261FmtpParams {
+            cif: None,
+            qcif: Some(1),
+            d: None,
+        };
+        let ans = negotiate_answer(&offer, &ours).unwrap();
+        assert_eq!(ans.cif, None);
+        assert_eq!(ans.qcif, Some(1));
+        assert_eq!(ans.d, None);
+    }
+
+    #[test]
+    fn negotiate_answer_picks_max_mpi_per_size() {
+        // §6.2.1: receiver advertises an upper bound on rate via MPI.
+        // The sender must satisfy both upper bounds ⇒ answer MPI =
+        // max(offer.MPI, our.MPI) = the more restrictive bound.
+        let offer = H261FmtpParams {
+            cif: Some(1),
+            qcif: Some(1),
+            d: None,
+        };
+        let ours = H261FmtpParams {
+            cif: Some(3),
+            qcif: Some(2),
+            d: None,
+        };
+        let ans = negotiate_answer(&offer, &ours).unwrap();
+        assert_eq!(ans.cif, Some(3));
+        assert_eq!(ans.qcif, Some(2));
+    }
+
+    #[test]
+    fn negotiate_answer_disjoint_sizes_errors() {
+        // Offer: CIF-only; ours: QCIF-only ⇒ no common size.
+        let offer = H261FmtpParams {
+            cif: Some(2),
+            qcif: None,
+            d: None,
+        };
+        let ours = H261FmtpParams {
+            cif: None,
+            qcif: Some(1),
+            d: None,
+        };
+        assert_eq!(
+            negotiate_answer(&offer, &ours),
+            Err(SdpError::NoPictureSize)
+        );
+    }
+
+    #[test]
+    fn negotiate_answer_annex_d_needs_both_sides() {
+        // D=1 only when both sides signal D=1.
+        let off_d = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: Some(true),
+        };
+        let our_d = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: Some(true),
+        };
+        let our_no_d = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: None,
+        };
+        let our_d_zero = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: Some(false),
+        };
+        assert_eq!(negotiate_answer(&off_d, &our_d).unwrap().d, Some(true));
+        assert_eq!(negotiate_answer(&off_d, &our_no_d).unwrap().d, None);
+        assert_eq!(negotiate_answer(&off_d, &our_d_zero).unwrap().d, None);
+        // Offer omits D ⇒ answer omits D even when we support it.
+        let off_no_d = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: None,
+        };
+        assert_eq!(negotiate_answer(&off_no_d, &our_d).unwrap().d, None);
+    }
+
+    #[test]
+    fn negotiate_answer_rfc2032_fallback_for_offerless_picture_size() {
+        // §6.2.1: an offer with no picture-size parameters is assumed
+        // to support QCIF at MPI=1 (RFC 2032 fallback).
+        let offer = H261FmtpParams::default(); // no CIF, no QCIF, no D.
+        let ours = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(2),
+            d: Some(true),
+        };
+        let ans = negotiate_answer(&offer, &ours).unwrap();
+        // Offer is treated as QCIF=1 ⇒ intersect with our QCIF=2 ⇒
+        // answer QCIF = max(1, 2) = 2.
+        assert_eq!(ans.cif, None);
+        assert_eq!(ans.qcif, Some(2));
+        // Offer doesn't carry D ⇒ answer must omit it.
+        assert_eq!(ans.d, None);
+    }
+
+    #[test]
+    fn negotiate_answer_round_trips_through_format_value() {
+        // The negotiated answer formats with CIF before QCIF — matching
+        // the §6.2.1 worked example.
+        let offer = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: Some(true),
+        };
+        let ours = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: Some(true),
+        };
+        let ans = negotiate_answer(&offer, &ours).unwrap();
+        assert_eq!(ans.format_value(), "CIF=2;QCIF=1;D=1");
+    }
+
+    #[test]
+    fn negotiate_answer_validate_passes() {
+        // A successful negotiation always satisfies validate().
+        let offer = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: None,
+        };
+        let ours = H261FmtpParams {
+            cif: Some(2),
+            qcif: None,
+            d: None,
+        };
+        let ans = negotiate_answer(&offer, &ours).unwrap();
+        assert!(ans.validate().is_ok());
+    }
+
+    #[test]
+    fn negotiate_answer_full_offer_answer_max_frame_rate_satisfies_both_peers() {
+        // The answer's max_frame_rate for each size must be no greater
+        // than either peer's advertised max_frame_rate for that size.
+        let offer = H261FmtpParams {
+            cif: Some(1),
+            qcif: Some(4),
+            d: None,
+        };
+        let ours = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: None,
+        };
+        let ans = negotiate_answer(&offer, &ours).unwrap();
+        // CIF: offer 29.97 fps, ours 14.985 fps ⇒ answer must be the lower
+        // bound = 14.985 fps ⇒ MPI=2.
+        assert_eq!(ans.cif, Some(2));
+        // QCIF: offer 7.49 fps, ours 29.97 fps ⇒ answer must be the lower
+        // bound = 7.49 fps ⇒ MPI=4.
+        assert_eq!(ans.qcif, Some(4));
+        // Sanity: the answer's max rate per size is the min of the two
+        // peers' max rates.
+        // For CIF: min(29.97/1, 29.97/2) = 29.97/2 ⇒ MPI=2.
+        // For QCIF: min(29.97/4, 29.97/1) = 29.97/4 ⇒ MPI=4.
+        let (num_cif, den_cif) = ans.max_frame_rate(SourceFormat::Cif).unwrap();
+        assert_eq!((num_cif, den_cif), (2997, 200));
+        let (num_q, den_q) = ans.max_frame_rate(SourceFormat::Qcif).unwrap();
+        assert_eq!((num_q, den_q), (2997, 400));
     }
 
     #[test]
