@@ -56,3 +56,20 @@ name = "parse_rtcp_compound"
 path = "fuzz_targets/parse_rtcp_compound.rs"
 test = false
 doc = false
+
+# Third fuzz target — the H.261 §5.4 BCH (511, 493) FEC multiframe
+# parser. The framing layer is the second attacker-reachable media
+# parser an H.261 endpoint exposes (the first is the elementary-stream
+# decoder). Its lock-search loop sweeps 511 candidate bit offsets times
+# 24 framing-bit reads; once locked, every frame's 18-bit syndrome is
+# checked against the §5.4.2 generator polynomial and the inner 492
+# data bits are concatenated into the recovered stream. This target
+# drives `decode_multiframe` / `parity18` / `syndrome18` against raw
+# attacker bytes AND against an error-injection scenario where a
+# well-formed framed stream is corrupted by attacker-chosen bit-flips
+# before re-decoding.
+[[bin]]
+name = "decode_bch_multiframe"
+path = "fuzz_targets/decode_bch_multiframe.rs"
+test = false
+doc = false

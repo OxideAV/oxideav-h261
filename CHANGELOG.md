@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Third cargo-fuzz target: `decode_bch_multiframe`** drives arbitrary
+  fuzz-supplied bytes through the H.261 §5.4 BCH (511, 493) FEC
+  multiframe parser surface (`decode_multiframe` / `parity18` /
+  `syndrome18`). Covers the §5.4.4 lock-search candidate sweep (511
+  bit offsets × 24 framing-bit reads at a stride of `FRAME_BITS =
+  511`), the §5.4.2 GF(2) generator-polynomial long-division
+  shift-register, and the §5.4.3 per-frame `Fi` / 492-data-bit /
+  18-parity-bit walk against attacker-controlled bytes. The target
+  also runs an **error-injection mode**: frames a deterministic
+  synthetic payload via the in-crate `encode_multiframe`, then uses
+  the fuzz input as a bit-flip vector to corrupt up to 16
+  attacker-chosen bit positions in the framed stream before
+  re-decoding — driving the non-zero-syndrome `corrupted_frames`
+  branch and (when a flip lands inside the 24-bit lock window) the
+  lock-loss path. Contract under test: every call must *return* — no
+  panic, no abort, no integer overflow (in debug / ASAN builds), no
+  out-of-bounds index, no allocator OOM.
+- **Seed corpus** at `fuzz/corpus/decode_bch_multiframe/` (9 buffers,
+  ≈ 12.5 KB total): one and three multiframes of pure stuffing, three
+  multiframes of all-zeros / 0xC3 / pseudo-random payload, a payload-
+  then-fill mix that crosses the `Fi=1`-to-`Fi=0` boundary, a single-
+  bit-flipped 3-multiframe stream, a 4-bit-prefix-shifted stream that
+  forces the lock-search past `bit0 = 0`, a 2-multiframe input that
+  falls one frame short of the §5.4.4 lock window, and a 6-multiframe
+  `0x5A` payload (twice the lock window).
+- **Stable-CI seed test** `tests/fuzz_seed_corpus_bch.rs` (9 tests,
+  ≈ 10 ms) mirrors the fuzz target on stable Rust so the regular CI
+  matrix catches a regression in the BCH parser surface without
+  waiting for the daily fuzz run. Also drives empty / single-zero /
+  all-ones / pseudo-random adversarial buffers, a
+  one-byte-short-of-lock input, an attacker-chosen 32-bit parity
+  value, and a deterministic multi-bit injection that surfaces in
+  `corrupted_frames` without breaking lock.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-h261/compare/v0.0.5...v0.0.6) - 2026-05-29
 
 ### Other

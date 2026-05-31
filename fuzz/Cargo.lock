@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "oxideav-h261"
-version = "0.0.4"
+version = "0.0.6"
 dependencies = [
  "oxideav-core",
  "oxideav-pixfmt",
