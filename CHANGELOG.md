@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fourth cargo-fuzz target: `parse_rtp_payload`** drives arbitrary
+  fuzz-supplied bytes through the H.261 RTP data-path parser surface —
+  the network-receive parsers an endpoint runs on every received UDP
+  datagram **before** any H.261 bitstream layer sees a byte. Three
+  entry points are exercised: `parse_rtp_fixed_header` (RFC 3550 §5.1
+  — V / P / X / CC / M / PT / seq / ts / SSRC + 0..=15 CSRC entries,
+  bounds-checked against the attacker-controlled CC field, with V != 2
+  surfacing as `FieldOverflow` and an under-sized buffer surfacing as
+  `ShortHeader`), `unpack_header` (RFC 4587 §4.1 — the 4-byte H.261
+  RTP payload header with SBIT / EBIT / I / V / GOBN / MBAP / QUANT
+  / HMVD / VMVD and the §4.1 sign-extension of the two 5-bit MV
+  deltas), and `depacketize` (the multi-packet bit-walker that
+  honours per-packet SBIT/EBIT alignment and asserts the recovered
+  elementary stream contains at least one start code). The harness
+  carves the fuzz input into up to four synthetic `H261RtpPayload`s
+  with attacker-chosen header fields and attacker-chosen data
+  lengths, so the slow-path bit-walker, the `pack_header`/
+  `unpack_header` round-trip, and the final `iter_start_codes`
+  sanity check all stay covered against attacker-controlled bytes.
+  Contract under test: every call must *return* — no panic, no abort,
+  no integer overflow (in debug / ASAN builds), no out-of-bounds
+  index, no allocator OOM.
+- **Seed corpus** at `fuzz/corpus/parse_rtp_payload/` (9 buffers,
+  ≈ 257 B total): a 12-byte fixed-header-only packet (CC=0, empty
+  payload), a 16-byte fixed-header + empty H.261 payload header
+  boundary, a V=2 CC=0 fixed header + GOB-aligned H.261 header +
+  faked PSC stream, the same shape with CC=3 and CC=15 CSRC lists, a
+  non-GOB-aligned H.261 header carrying SBIT=3 / EBIT=5 / I=V=1 /
+  GOBN=7 / MBAP=12 / QUANT=17 / HMVD=-7 / VMVD=11, a marker=0 mid-
+  frame packet, an adversarial V=1 datagram, and an adversarial
+  CC=15 buffer truncated at 12 bytes that must surface as
+  `ShortHeader`.
+- **Stable-CI seed test** `tests/fuzz_seed_corpus_rtp.rs` (10 tests,
+  ≈ 10 ms) mirrors the fuzz target on stable Rust so the regular CI
+  matrix catches a regression in the RTP payload-parser surface
+  without waiting for the daily fuzz run. Also drives empty /
+  single-zero / all-ones / pseudo-random adversarial buffers, the
+  exact 12-byte fixed-header boundary, a CC=15 truncated input (must
+  return `ShortHeader`), a V=1 rejection (must return
+  `FieldOverflow`), a `pack_header` ↔ `unpack_header` round-trip on
+  the typical-fields header, and a `depacketize` SBIT+EBIT-overflow
+  input that exercises the `8 * data.len() - sbit - ebit` empty-
+  payload branch.
+
 - **Third cargo-fuzz target: `decode_bch_multiframe`** drives arbitrary
   fuzz-supplied bytes through the H.261 §5.4 BCH (511, 493) FEC
   multiframe parser surface (`decode_multiframe` / `parity18` /

@@ -73,3 +73,21 @@ name = "decode_bch_multiframe"
 path = "fuzz_targets/decode_bch_multiframe.rs"
 test = false
 doc = false
+
+# Fourth fuzz target — the RTP data-path parsers an endpoint runs on
+# every received UDP datagram before any H.261 bitstream layer sees a
+# byte. Drives `parse_rtp_fixed_header` (RFC 3550 §5.1: V / P / X / CC /
+# M / PT / seq / ts / SSRC + 0..=15 CSRC entries, bounds-checked
+# against an attacker-controlled CC field), `unpack_header` (RFC 4587
+# §4.1: 4-byte H.261 RTP payload header with SBIT / EBIT / I / V /
+# GOBN / MBAP / QUANT / HMVD / VMVD), and `depacketize` (multi-packet
+# bit-walker that honours per-packet SBIT/EBIT alignment and asserts
+# the recovered elementary stream contains a start code). The §4.1
+# header arrives from the network on every video packet; this target
+# is distinct from the three other fuzz surfaces (elementary-stream,
+# RTCP control channel, BCH FEC framing).
+[[bin]]
+name = "parse_rtp_payload"
+path = "fuzz_targets/parse_rtp_payload.rs"
+test = false
+doc = false
