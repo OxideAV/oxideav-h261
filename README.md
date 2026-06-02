@@ -27,6 +27,7 @@ oxideav-h261 = "0.0"
 | Macroblock layer (MBA / MTYPE / CBP / MVD)       | yes    | yes    |
 | TCOEFF VLC + escape                              | yes    | yes    |
 | 8×8 (I)DCT, (de)quantisation (Table 5/H.261)     | yes    | yes    |
+| Annex A IDCT accuracy conformance test            | yes    | yes    |
 | INTRA prediction (I-pictures)                    | yes    | yes    |
 | INTER prediction (P-pictures, no MC)             | yes    | yes    |
 | Integer-pel MC (spiral+diamond ME, ±15)          | yes    | yes    |
@@ -52,6 +53,34 @@ At the canonical H.261 target rate (64 kbit/s QCIF / 30 fps), the encoder
 achieves ≥ 45 dB PSNR_Y on smooth content and ≥ 39 dB on the standard
 `testsrc` test pattern (see `bench_testsrc_psnr`). ffmpeg cross-validates
 all P-picture, MC, and FIL streams cleanly.
+
+### IDCT accuracy (Annex A)
+
+Annex A of Recommendation H.261 is an integral part of the spec and defines a
+measurable conformance procedure for the inverse 8×8 DCT. The
+`tests/idct_annex_a.rs` integration test implements §A.1..§A.9 end-to-end:
+the §A.1 deterministic 32-bit LCG (`randx = randx * 1103515245 + 12345`, keep
+30 bits LSB-cleared, divide by `2^31`, scale by `L+H+1`, truncate, subtract
+`L`) generates 10 000 8×8 blocks per dataset; the §A.2 forward DCT and §A.4
+reference IDCT run in 64-bit float per the equations in §3.2.4; §A.3 rounds
+to nearest and clips to `[-2048, +2047]` for the 12-bit IDCT input; our
+`idct_signed` produces the test output, clipped to `[-256, +255]`. The §A.7
+thresholds are then asserted across all three §A.1 ranges and both polarities
+(§A.9 sign-flip), plus the §A.8 all-zero-in-all-zero-out invariant.
+
+Measured headroom against the §A.7 limits on the (L=256, H=255) dataset:
+
+| §A.7 statistic                | Limit  | Measured |
+|-------------------------------|-------:|---------:|
+| per-pel peak error            | ≤ 1    | 1        |
+| per-pel mean square error     | ≤ 0.06 | 1.0e-4   |
+| overall mean square error     | ≤ 0.02 | 6.0e-6   |
+| per-pel \|mean error\|        | ≤ 0.015| 1.0e-4   |
+| overall \|mean error\|        | ≤ 0.0015 | 3.0e-6 |
+
+The (L=H=5) and (L=H=300) datasets are equally well inside the spec
+margins. No external IDCT source is read: the f64 reference DCT and IDCT
+live in the test file and are written directly from §3.2.4 / Annex A.
 
 ### HRD buffer model (§5.2 + Annex B)
 

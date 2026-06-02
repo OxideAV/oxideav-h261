@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Annex A IDCT accuracy conformance test** (`tests/idct_annex_a.rs`)
+  implements the §A.1..§A.9 measurable conformance procedure that ITU-T
+  Recommendation H.261 mandates for every compliant inverse 8×8 DCT.
+  The §A.1 deterministic 32-bit LCG (`randx = randx * 1103515245 + 12345`,
+  keep 30 bits LSB-cleared, divide by `2^31`, scale by `L+H+1`, truncate to
+  int, subtract `L`) generates 10 000 8×8 pel blocks per dataset; the §A.2
+  forward DCT and §A.4 reference IDCT run in 64-bit float directly from the
+  equations in §3.2.4 (no third-party IDCT source is consulted); §A.3 rounds
+  each transform coefficient to the nearest integer and clips it to
+  `[-2048, +2047]` to produce the 12-bit IDCT input; our in-crate
+  `idct::idct_signed` is run on the same input and clipped to `[-256, +255]`
+  per §A.5; the §A.7 statistics (per-pel peak error, per-pel MSE, overall
+  MSE, per-pel \|mean error\|, overall \|mean error\|) are asserted against
+  the spec thresholds (≤ 1, ≤ 0.06, ≤ 0.02, ≤ 0.015, ≤ 0.0015 respectively)
+  across all three §A.1 ranges `(L=256, H=255)`, `(L=H=5)`, and `(L=H=300)`,
+  with the §A.9 sign-flipped rerun on each. §A.8 (all-zeros in produces
+  all-zeros out) and a smoke test on the §A.1 RNG round out the eight new
+  test cases. Measured margins on (L=256, H=255): peak=1 (limit ≤ 1),
+  per-pel MSE=1.0e-4 (limit ≤ 0.06), overall MSE=6.0e-6 (limit ≤ 0.02),
+  per-pel \|mean\|=1.0e-4 (limit ≤ 0.015), overall \|mean\|=3.0e-6 (limit
+  ≤ 0.0015); (L=H=5) is bit-exact against the reference (peak=0). The
+  reference f64 DCT/IDCT used as the §A.4 comparison oracle are coded
+  directly from the §3.2.4 equation; no external library is consulted.
+
 - **Fourth cargo-fuzz target: `parse_rtp_payload`** drives arbitrary
   fuzz-supplied bytes through the H.261 RTP data-path parser surface —
   the network-receive parsers an endpoint runs on every received UDP
