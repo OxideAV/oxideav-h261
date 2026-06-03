@@ -41,6 +41,7 @@ oxideav-h261 = "0.0"
 | RTCP SDES + BYE + compound (RFC 3550 §6.5/§6.6)  | yes    | yes    |
 | RTCP APP application-defined (RFC 3550 §6.7)     | yes    | yes    |
 | SDP rtpmap/fmtp media type (RFC 4587 §6.1.1/6.2) | yes    | yes    |
+| Annex D still-image sub-image transform (§D.2/§D.3) | yes | yes    |
 
 H.261 only permits integer-pel motion vectors (range ±15); there are no
 half-pel refinements, no B-pictures, and no start-code emulation prevention.
@@ -81,6 +82,69 @@ Measured headroom against the §A.7 limits on the (L=256, H=255) dataset:
 The (L=H=5) and (L=H=300) datasets are equally well inside the spec
 margins. No external IDCT source is read: the f64 reference DCT and IDCT
 live in the test file and are written directly from §3.2.4 / Annex A.
+
+### Annex D still-image transmission (§D.2 + §D.3)
+
+H.261 Annex D describes the procedure for transmitting still images at
+four times the normal video resolution by temporarily stopping the
+motion video and sending four 2:1 × 2:1 sub-sampled sub-images in
+sequential order. The `annex_d` module is the helper surface that
+wires this into the rest of the codec without disturbing the standard
+motion-video pipeline:
+
+- `SubImageIndex` — one of the four sub-images (0..3).
+- `still_image_tr(idx)` / `parse_still_image_tr(tr)` — pack / parse
+  the §D.3 5-bit `TR` field (top 3 bits = 0, low 2 bits = `idx`).
+- `still_image_dimensions(fmt)` — §D.2 4× video-format size (QCIF
+  video ⇒ 352×288 still, CIF video ⇒ 704×576 still); chroma sizes
+  via `still_image_chroma_dimensions`.
+- `subsample_still_image(fmt, y, cb, cr)` — Figure D.1 2:1 × 2:1
+  sub-sample (origin map `0→(0,0)`, `1→(0,1)`, `2→(1,1)`, `3→(1,0)`
+  per 2×2 tile) producing four `SubImagePlanes` at the video-format
+  dimensions for `fmt`.
+- `reassemble_still_image(fmt, subs)` — inverse transform; bit-exact
+  round-trips `subsample_still_image` on both 4:2:0 chroma planes.
+- `PictureHeader::still_image_sub_index()` — convenience accessor
+  that returns `Ok(None)` for ordinary motion-video pictures and
+  `Ok(Some(idx))` for an Annex-D-signalled sub-image, surfacing the
+  §D.3 high-bits-must-be-zero violation as `Err`.
+- `encoder::write_picture_header_full` — header writer that lets the
+  caller drive the HI_RES bit (clear for an Annex-D sub-image,
+  set for normal motion video).
+
+`tests/annex_d.rs` round-trips the encoder + parser through every
+sub-image in both QCIF and CIF mode and round-trips the
+sub-sample/reassemble transform on full-size synthetic still images
+(luma + both chroma planes). H.261's per-frame bit cap (§5.2) still
+applies to each sub-image, the multiplex below the picture layer is
+unchanged (§D.5), and the §5.4 FEC layer is not affected.
+
+```rust
+use oxideav_h261::annex_d::{
+    subsample_still_image, reassemble_still_image, SubImageIndex,
+    still_image_tr, still_image_dimensions,
+};
+use oxideav_h261::picture::SourceFormat;
+
+let fmt = SourceFormat::Qcif;
+let (sw, sh) = still_image_dimensions(fmt); // (352, 288)
+let still_y: Vec<u8> = vec![0; (sw * sh) as usize];
+let still_cb: Vec<u8> = vec![128; ((sw / 2) * (sh / 2)) as usize];
+let still_cr: Vec<u8> = vec![128; ((sw / 2) * (sh / 2)) as usize];
+
+let subs = subsample_still_image(fmt, &still_y, &still_cb, &still_cr);
+for (i, sub) in subs.iter().enumerate() {
+    let idx = SubImageIndex::from_u8(i as u8);
+    let tr_for_picture = still_image_tr(idx); // top 3 bits = 0
+    // ... encode sub-image with `H261Encoder` and stamp `tr_for_picture`
+    // into the picture header via `write_picture_header_full(..., false)`.
+    let _ = (sub, tr_for_picture);
+}
+let (y, cb, cr) = reassemble_still_image(fmt, &subs);
+assert_eq!(y, still_y);
+assert_eq!(cb, still_cb);
+assert_eq!(cr, still_cr);
+```
 
 ### HRD buffer model (§5.2 + Annex B)
 

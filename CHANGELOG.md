@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Annex D still-image transmission helpers (§D.2 + §D.3).** New
+  `annex_d` module wires Annex D into the codec without disturbing the
+  motion-video pipeline. `SubImageIndex` is the 0..=3 sub-image
+  identifier; `still_image_tr` packs it into the 5-bit `TR` field with
+  the §D.3 invariants (low 2 bits = index, top 3 bits = 0), and
+  `parse_still_image_tr` enforces them on the receive path.
+  `still_image_dimensions` / `still_image_chroma_dimensions` derive the
+  §D.2 4× video-format sizes (QCIF ⇒ 352×288 still, CIF ⇒ 704×576).
+  `subsample_still_image` implements the Figure D.1 2:1 × 2:1 transform
+  (per-sub-image tile origin `0→(0,0)`, `1→(0,1)`, `2→(1,1)`,
+  `3→(1,0)`) over Y/Cb/Cr planes; `reassemble_still_image` is the
+  bit-exact inverse. `PictureHeader::still_image_sub_index` returns
+  `Ok(None)` for ordinary motion-video pictures and surfaces the §D.3
+  high-bits-must-be-zero violation when HI_RES=0 with malformed TR.
+  `encoder::write_picture_header_full` is a new explicit-HI_RES variant
+  of `write_picture_header`; the original 3-arg entry point is
+  preserved as a thin wrapper. Integration test `tests/annex_d.rs`
+  rounds-trips the picture header for every sub-image in both QCIF
+  and CIF mode and rounds-trips the sub-sample/reassemble transform
+  on full-size synthetic still images (luma + both chroma planes).
 - **Fifth cargo-fuzz target: `parse_sdp_fmtp`** drives arbitrary
   fuzz-supplied bytes through the H.261 Session Description Protocol
   parser surface — the attribute-line parsers an endpoint runs on every

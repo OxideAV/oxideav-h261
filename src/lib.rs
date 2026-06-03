@@ -48,6 +48,11 @@
 //!   (`CIF`, `QCIF`, `D`) to the SDP `a=rtpmap` / `a=fmtp` attribute lines,
 //!   with the §6.2.1 offer/answer helpers (per-format MPI frame-rate bound,
 //!   the "at least one picture size" invariant, the RFC-2032 QCIF fallback).
+//! * Annex D still-image transmission (§D.2 + §D.3): the [`annex_d`] module
+//!   exposes the [`annex_d::SubImageIndex`] mapping to / from the 5-bit `TR`
+//!   field, the still-image dimensions (4× the currently transmitted video
+//!   format), and the Figure D.1 2:1 × 2:1 sub-sample / reassemble transform
+//!   between a full-resolution still image and its four sub-images.
 //!
 //! Out of scope:
 //! * Single-bit correction of corrupted BCH (511,493) codewords — the
@@ -65,6 +70,7 @@
 #![allow(clippy::unusual_byte_groupings)]
 #![allow(clippy::unnecessary_cast)]
 
+pub mod annex_d;
 pub mod bch;
 pub mod block;
 pub mod decoder;

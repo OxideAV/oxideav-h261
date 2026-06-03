@@ -53,11 +53,35 @@ pub struct PictureHeader {
     pub document_camera: bool,
     pub freeze_release: bool,
     pub source_format: SourceFormat,
-    /// HI_RES still-image mode (Annex D). `true` when signalled off (bit = 1),
-    /// `false` when signalled on. We currently treat Annex D as a no-op.
+    /// HI_RES still-image mode (Annex D). `true` when signalled off (bit = 1,
+    /// the normal motion-video case), `false` when signalled on (bit = 0, the
+    /// sub-image of an Annex D still-image transmission). The Annex D
+    /// sub-image index lives in the low 2 bits of `temporal_reference`
+    /// when `hi_res_off == false`; see
+    /// [`PictureHeader::still_image_sub_index`] / [`crate::annex_d`] for the
+    /// helper surface.
     pub hi_res_off: bool,
     pub width: u32,
     pub height: u32,
+}
+
+impl PictureHeader {
+    /// If this picture is an Annex D still-image sub-image (i.e.
+    /// `hi_res_off == false`), return the sub-image index parsed from
+    /// the low 2 bits of `temporal_reference` per §D.3.
+    ///
+    /// Returns `Ok(None)` for ordinary motion-video pictures
+    /// (`hi_res_off == true`). Returns `Err(_)` when HI_RES is signalled
+    /// on but `temporal_reference` violates §D.3 (top 3 bits non-zero).
+    pub fn still_image_sub_index(
+        &self,
+    ) -> std::result::Result<Option<crate::annex_d::SubImageIndex>, crate::annex_d::AnnexDTrError>
+    {
+        if self.hi_res_off {
+            return Ok(None);
+        }
+        crate::annex_d::parse_still_image_tr(self.temporal_reference).map(Some)
+    }
 }
 
 /// Parse the picture header assuming `br` is positioned at the start of the
@@ -185,5 +209,62 @@ mod tests {
         assert!(p.hi_res_off);
         assert_eq!(p.width, 176);
         assert_eq!(p.height, 144);
+        // Motion-video header ⇒ no Annex D sub-image to expose.
+        assert_eq!(p.still_image_sub_index(), Ok(None));
+    }
+
+    #[test]
+    fn still_image_sub_index_motion_video_is_none() {
+        let h = PictureHeader {
+            temporal_reference: 12,
+            split_screen: false,
+            document_camera: false,
+            freeze_release: false,
+            source_format: SourceFormat::Qcif,
+            hi_res_off: true, // motion video
+            width: 176,
+            height: 144,
+        };
+        assert_eq!(h.still_image_sub_index(), Ok(None));
+    }
+
+    #[test]
+    fn still_image_sub_index_each_quadrant_round_trips() {
+        // §D.3: with HI_RES=0, low 2 bits of TR are the sub-image index;
+        // top 3 bits must be 0. PictureHeader stores `temporal_reference`
+        // as 0..=31 and the helper validates the §D.3 invariants.
+        use crate::annex_d::SubImageIndex;
+        for n in 0u8..4 {
+            let h = PictureHeader {
+                temporal_reference: n,
+                split_screen: false,
+                document_camera: false,
+                freeze_release: false,
+                source_format: SourceFormat::Cif,
+                hi_res_off: false, // Annex D still-image
+                width: 352,
+                height: 288,
+            };
+            assert_eq!(
+                h.still_image_sub_index(),
+                Ok(Some(SubImageIndex::from_u8(n)))
+            );
+        }
+    }
+
+    #[test]
+    fn still_image_sub_index_rejects_high_bits_in_tr() {
+        // HI_RES=0 but TR has non-zero high bits ⇒ malformed Annex D.
+        let h = PictureHeader {
+            temporal_reference: 0b00100,
+            split_screen: false,
+            document_camera: false,
+            freeze_release: false,
+            source_format: SourceFormat::Qcif,
+            hi_res_off: false,
+            width: 176,
+            height: 144,
+        };
+        assert!(h.still_image_sub_index().is_err());
     }
 }

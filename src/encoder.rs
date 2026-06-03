@@ -468,6 +468,17 @@ fn validate_inputs(
 
 /// Emit the 32-bit picture header (§4.2.1).
 pub fn write_picture_header(bw: &mut BitWriter, fmt: SourceFormat, tr: u8) {
+    write_picture_header_full(bw, fmt, tr, true);
+}
+
+/// Emit the 32-bit picture header (§4.2.1) with an explicit `HI_RES`
+/// bit. `hi_res_off = true` produces the canonical motion-video header
+/// (matches [`write_picture_header`]); `hi_res_off = false` produces an
+/// Annex D still-image sub-image header. The caller is responsible for
+/// passing a `tr` whose top 3 bits are zero per §D.3 (use
+/// [`crate::annex_d::still_image_tr`] to derive it from a sub-image
+/// index).
+pub fn write_picture_header_full(bw: &mut BitWriter, fmt: SourceFormat, tr: u8, hi_res_off: bool) {
     bw.write_u32(0x00010, 20); // PSC
     bw.write_u32(tr as u32, 5); // TR
                                 // PTYPE — six single-bit flags, MSB first.
@@ -483,8 +494,8 @@ pub fn write_picture_header(bw: &mut BitWriter, fmt: SourceFormat, tr: u8) {
         SourceFormat::Cif => 1,
     };
     bw.write_u32(fmt_bit, 1);
-    // bit5 HI_RES — "1 = off" (we don't use Annex D).
-    bw.write_u32(1, 1);
+    // bit5 HI_RES — "1 = off, 0 = on (Annex D still-image sub-image)".
+    bw.write_u32(if hi_res_off { 1 } else { 0 }, 1);
     // bit6 spare — per §4.1 unused bits are set to 1.
     bw.write_u32(1, 1);
     // PEI = 0 — no PSPARE.
