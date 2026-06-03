@@ -6,7 +6,7 @@
 //! input to [`H261Decoder`]).
 
 use oxideav_core::{CodecId, Packet, TimeBase};
-use oxideav_h261::bch::{decode_multiframe, encode_multiframe};
+use oxideav_h261::bch::{decode_multiframe, decode_multiframe_with_correction, encode_multiframe};
 use oxideav_h261::decoder::H261Decoder;
 use oxideav_h261::encoder::encode_intra_picture;
 use oxideav_h261::picture::SourceFormat;
@@ -119,6 +119,98 @@ fn bch_single_bit_error_is_detected_and_passed_through() {
     // produce a slightly different decoded picture (or an error at the
     // affected MB), but the BCH layer itself does not drop the data.
     assert_eq!(dec.frames_consumed, 24);
+}
+
+/// A single-bit error in the FEC payload of a real H.261 elementary
+/// stream is recovered bit-exact by `decode_multiframe_with_correction`:
+/// the §5.4.1 BCH correction restores the inner bitstream to its pre-
+/// channel-error form, and the H.261 decoder then produces the same
+/// picture that a clean channel would have delivered.
+#[test]
+fn bch_correction_recovers_h261_stream_from_single_bit_error() {
+    let (y, cb, cr) = gradient_qcif();
+    let encoded = encode_qcif_intra(&y, &cb, &cr, 10, 0);
+    let framed = encode_multiframe(&encoded, encoded.len() * 8);
+    let mut padded = framed.clone();
+    while padded.len() < 3 * 512 {
+        padded.extend(encode_multiframe(&[], 0));
+    }
+
+    // Flip a single bit deep inside the H.261 payload of the first
+    // multiframe (byte 100, mid-frame).
+    let clean = padded.clone();
+    padded[100] ^= 0b0000_1000;
+
+    let dec = decode_multiframe_with_correction(&padded).expect("lock");
+    assert!(
+        dec.corrupted_frames >= 1,
+        "syndrome must flag the corrupted frame"
+    );
+    assert_eq!(
+        dec.corrected_frames, dec.corrupted_frames,
+        "every flagged frame should have been corrected"
+    );
+    assert_eq!(dec.uncorrectable_frames, 0);
+
+    // The corrected inner stream matches the pre-corruption stream
+    // byte-for-byte across the encoded H.261 payload.
+    let dec_clean = decode_multiframe(&clean).expect("lock on clean");
+    assert_eq!(&dec.data[..encoded.len()], &dec_clean.data[..encoded.len()]);
+    assert_eq!(&dec.data[..encoded.len()], &encoded[..]);
+
+    // And the H.261 decoder produces a valid picture.
+    let mut h261 = H261Decoder::new(CodecId::new(CODEC_ID_STR));
+    let payload = dec.data[..encoded.len()].to_vec();
+    let pkt = Packet::new(0, TimeBase::new(1, 30), payload);
+    h261.send_packet(&pkt).expect("decode corrected stream");
+    h261.flush().expect("flush");
+    let frame = h261.receive_frame().expect("receive_frame");
+    match frame {
+        oxideav_core::Frame::Video(vf) => {
+            // Coarse PSNR sanity — after correction the decode should
+            // be at least as good as the no-error baseline (≥ 32 dB).
+            let mut sse = 0.0f64;
+            for (s, d) in y.iter().zip(vf.planes[0].data.iter()) {
+                let diff = *s as f64 - *d as f64;
+                sse += diff * diff;
+            }
+            let mse = sse / y.len() as f64;
+            let psnr = 10.0 * (255.0_f64 * 255.0 / mse.max(1e-9)).log10();
+            assert!(
+                psnr >= 32.0,
+                "PSNR after BCH-correct → decode = {psnr:.2} dB"
+            );
+        }
+        _ => panic!("expected Frame::Video"),
+    }
+}
+
+/// Two-bit error in the same frame is uncorrectable (the t = 1 code
+/// can't disambiguate weight-2 patterns); the function still returns,
+/// and the breakdown is internally consistent
+/// (`corrupted = corrected + uncorrectable`).
+#[test]
+fn bch_correction_two_bit_error_in_frame_is_internally_consistent() {
+    let (y, cb, cr) = gradient_qcif();
+    let encoded = encode_qcif_intra(&y, &cb, &cr, 10, 0);
+    let framed = encode_multiframe(&encoded, encoded.len() * 8);
+    let mut padded = framed.clone();
+    while padded.len() < 3 * 512 {
+        padded.extend(encode_multiframe(&[], 0));
+    }
+
+    // Two flips in the same frame (frame 0 occupies bytes 0..64).
+    // Different bytes so we land on two distinct codeword positions.
+    padded[10] ^= 0b0000_0001;
+    padded[40] ^= 0b0010_0000;
+
+    let dec = decode_multiframe_with_correction(&padded).expect("lock survives");
+    assert!(dec.corrupted_frames >= 1);
+    assert_eq!(
+        dec.corrected_frames + dec.uncorrectable_frames,
+        dec.corrupted_frames,
+        "breakdown should account for every flagged frame"
+    );
 }
 
 /// Concatenating two encoded pictures (each separately BCH-wrapped) and

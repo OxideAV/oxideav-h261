@@ -33,7 +33,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_h261::bch::{
-    decode_multiframe, encode_multiframe, parity18, syndrome18, FRAME_BITS, MULTIFRAME_FRAMES,
+    decode_multiframe, decode_multiframe_with_correction, encode_multiframe, locate_single_error,
+    parity18, syndrome18, FRAME_BITS, MULTIFRAME_FRAMES,
 };
 
 fn corpus_dir() -> PathBuf {
@@ -46,6 +47,10 @@ fn corpus_dir() -> PathBuf {
 fn drive(bytes: &[u8]) {
     // §5.4.4 lock + per-frame syndrome + data extraction.
     let _ = decode_multiframe(bytes);
+
+    // §5.4.1 lock + per-frame syndrome + t = 1 single-bit correction +
+    // data extraction.
+    let _ = decode_multiframe_with_correction(bytes);
 
     // §5.4.2 GF(2) long division on a 62-byte zero-padded slice.
     let mut padded = [0u8; 62];
@@ -66,11 +71,18 @@ fn drive(bytes: &[u8]) {
     let attacker_parity = (((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32)) & 0x3_FFFF;
     let _ = syndrome18(&padded, attacker_parity);
 
+    // Drive the §5.4.1 single-bit-error position lookup against an
+    // attacker-controlled 18-bit syndrome candidate. The function
+    // bounds its walk at 511 iterations, so the run time is constant
+    // regardless of the value of `attacker_parity`.
+    let _ = locate_single_error(attacker_parity);
+
     // Edge-of-lock-window slice.
     let lock_span_bits = (3 * MULTIFRAME_FRAMES * FRAME_BITS) as usize;
     let edge_len = lock_span_bits.div_ceil(8);
     if bytes.len() >= edge_len {
         let _ = decode_multiframe(&bytes[..edge_len]);
+        let _ = decode_multiframe_with_correction(&bytes[..edge_len]);
     }
 }
 
@@ -184,4 +196,58 @@ fn header_with_attacker_high_parity_value_is_handled() {
     let msg = [0u8; 62];
     let _ = syndrome18(&msg, 0xFFFF_FFFF);
     let _ = syndrome18(&msg, 0x8000_0000);
+}
+
+#[test]
+fn correction_path_round_trips_clean_input() {
+    // The minimum lock input — three multiframes of payload, no
+    // corruption — through the correction path: no flagged frames,
+    // no corrections fired, payload bit-exact.
+    let payload = vec![0x42u8; 11_808 / 8];
+    let framed = encode_multiframe(&payload, payload.len() * 8);
+    let dec = decode_multiframe_with_correction(&framed).expect("lock on minimum input");
+    assert_eq!(dec.frames_consumed, 24);
+    assert_eq!(dec.corrupted_frames, 0);
+    assert_eq!(dec.corrected_frames, 0);
+    assert_eq!(dec.uncorrectable_frames, 0);
+    assert_eq!(&dec.data[..payload.len()], &payload[..]);
+}
+
+#[test]
+fn correction_path_recovers_single_bit_data_error_byte_exact() {
+    // Frame a payload, flip a single bit, verify the correction path
+    // restores the payload bit-exact and the counts are
+    // (corrupted=1, corrected=1, uncorrectable=0).
+    let payload = vec![0xC3u8; 11_808 / 8];
+    let mut framed = encode_multiframe(&payload, payload.len() * 8);
+    framed[700] ^= 0b0001_0000;
+    let dec = decode_multiframe_with_correction(&framed).expect("lock survives single-bit error");
+    assert_eq!(dec.corrupted_frames, 1);
+    assert_eq!(dec.corrected_frames, 1);
+    assert_eq!(dec.uncorrectable_frames, 0);
+    assert_eq!(&dec.data[..payload.len()], &payload[..]);
+}
+
+#[test]
+fn locate_single_error_attacker_syndromes_dont_loop() {
+    // Drive `locate_single_error` against a hand-rolled adversarial
+    // set: zero (must report no error), all-ones (a syndrome value
+    // that almost certainly doesn't correspond to any single-bit
+    // error pattern), an 18-bit-saturated value, and the syndrome of
+    // each of a handful of known single-bit errors (must round-trip).
+    assert_eq!(locate_single_error(0), None);
+    let _ = locate_single_error(0xFFFF_FFFF);
+    let _ = locate_single_error(0x3_FFFF);
+
+    for &p in &[0usize, 1, 5, 100, 492, 493, 510] {
+        let mut scratch = [0u8; 62];
+        let mut par: u32 = 0;
+        if p < 493 {
+            scratch[p / 8] |= 1 << (7 - (p & 7));
+        } else {
+            par |= 1 << (17 - (p - 493));
+        }
+        let s = syndrome18(&scratch, par);
+        assert_eq!(locate_single_error(s), Some(p as u32));
+    }
 }

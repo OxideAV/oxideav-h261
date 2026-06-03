@@ -34,7 +34,7 @@ oxideav-h261 = "0.0"
 | Loop filter (FIL, §3.2.3) with per-MB RDO        | yes    | yes    |
 | Per-GOB MQUANT rate control (§4.2.3.3)           | n/a    | yes    |
 | Encoder registry (`first_encoder` / `bit_rate`)  | n/a    | yes    |
-| BCH (511,493) FEC framing (§5.4)                 | yes    | yes    |
+| BCH (511,493) FEC framing (§5.4) + t = 1 correction | yes | yes    |
 | HRD buffer model (§5.2 + Annex B)                | yes    | yes    |
 | RTP payload format (RFC 4587 §4.1)               | yes    | yes    |
 | RTCP SR / RR reports (RFC 3550 §6.4)             | yes    | yes    |
@@ -193,19 +193,46 @@ multiframe carries a 1-bit framing bit `Si`, a 1-bit fill indicator `Fi`,
 total). The parity is computed via the generator polynomial
 `g(x) = (x^9 + x^4 + 1)(x^9 + x^6 + x^4 + x^3 + 1)`. Frame lock requires
 three complete multiframes of `(00011011)` alignment-pattern bits per
-§5.4.4. Single-bit-error detection is wired through the per-frame
-syndrome and reported back to the caller; single-bit correction is left
-to the inner H.261 GOB-resync path, which is typically cheaper than
-acting on the corrected bit at the FEC layer.
+§5.4.4. The module exposes both a detection-only path
+(`decode_multiframe`, raw syndrome surfaced as `corrupted_frames`) and
+the spec-mandated `t = 1` single-bit correction path
+(`decode_multiframe_with_correction`, which additionally maps each
+non-zero syndrome to the corresponding 511-bit codeword position via
+`locate_single_error` and flips that bit before emitting the data
+field). The correction sweep test in `src/bch.rs` walks every of the
+511 protected bit positions in a frame (Fi + 492 data + 18 parity),
+flipping one at a time, and verifies the recovered payload matches the
+original bit-exact.
 
 ```rust
-use oxideav_h261::bch::{encode_multiframe, decode_multiframe};
+use oxideav_h261::bch::{
+    encode_multiframe, decode_multiframe, decode_multiframe_with_correction,
+};
 
 let coded_video: Vec<u8> = /* your H.261 elementary stream */ vec![];
 let framed = encode_multiframe(&coded_video, coded_video.len() * 8);
+
+// Detection-only path.
 let unwrapped = decode_multiframe(&framed).expect("frame lock");
 assert_eq!(&unwrapped.data[..coded_video.len()], &coded_video[..]);
+
+// `t = 1` correction path: corrects a single bit flip per frame, surfaces
+// uncorrectable (weight ≥ 2) frames via `uncorrectable_frames`.
+let corrected = decode_multiframe_with_correction(&framed).expect("lock");
+assert_eq!(corrected.corrupted_frames, corrected.corrected_frames + corrected.uncorrectable_frames);
 ```
+
+For a `t = 1` BCH code the syndrome of a single-bit error at
+codeword position `p` (where `p = 0` is `Fi`, `p = 1..493` are the
+492 data bits, `p = 493..511` are the 18 parity bits) equals
+`x^(510 − p) mod g(x)`. `locate_single_error` walks `x^i mod g(x)`
+for `i = 0..511` and stops when the running power matches the
+syndrome; a non-zero syndrome that doesn't match any single-bit
+pattern reports `None` (weight ≥ 2 error the code cannot resolve).
+Per H.261 §5.4.1 the spec explicitly labels the outer layer an
+"error correcting code" and the BCH (511, 493) code with this
+generator polynomial supports `t = 1` correction; the inner H.261
+GOB-resync remains the recovery path for weight-2-or-denser noise.
 
 ### RTP payload format (RFC 4587)
 

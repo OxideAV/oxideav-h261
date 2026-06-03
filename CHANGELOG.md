@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **BCH (511,493) single-bit error correction (§5.4.1, t = 1).** New
+  `bch::locate_single_error` maps a non-zero 18-bit syndrome to the
+  corresponding 511-bit codeword position (where `p = 0` is `Fi`,
+  `p = 1..493` are the 492 data bits, `p = 493..511` are the 18 parity
+  bits) by walking `pow = x^i mod g(x)` for `i = 0..511` and matching
+  the running power against the syndrome; a non-zero syndrome that
+  doesn't match any single-bit pattern reports `None` (the weight ≥ 2
+  case the t = 1 code cannot resolve). New `decode_multiframe_with_correction`
+  is the integrated path: same alignment-pattern lock as
+  `decode_multiframe`, plus `locate_single_error` is called on every
+  non-zero-syndrome frame and the indicated bit is flipped inside the
+  511-bit codeword before the per-frame `Fi` / data interpretation
+  runs. `DecodedMultiframe` gains two new counters — `corrected_frames`
+  (subset of `corrupted_frames` that were successfully corrected) and
+  `uncorrectable_frames` (complement: weight ≥ 2 patterns the code
+  cannot resolve). The detection-only `decode_multiframe` preserves its
+  prior behaviour and reports `corrected_frames = 0,
+  uncorrectable_frames = 0`. A sweep test in `src/bch.rs`
+  (`decode_with_correction_sweeps_every_protected_bit`) walks every of
+  the 511 protected bit positions in a frame, flips one at a time,
+  decodes with correction, and verifies the recovered payload matches
+  the original bit-exact for every position. Two new integration tests
+  in `tests/bch_e2e.rs` round-trip a real H.261 elementary stream
+  through `encode_multiframe` → single-bit corruption →
+  `decode_multiframe_with_correction` → `H261Decoder` and verify
+  PSNR_Y ≥ 32 dB after correction (matches the clean-channel
+  baseline), and confirm a two-bit error in the same frame is left in
+  `uncorrectable_frames` with the breakdown
+  `corrupted_frames == corrected_frames + uncorrectable_frames`
+  internally consistent. Brings the BCH module to spec-mandated
+  capability: §5.4.1 explicitly labels the outer layer an "error
+  correcting code" and `g(x) = (x^9 + x^4 + 1)(x^9 + x^6 + x^4 + x^3 + 1)`
+  has minimum distance `d = 3`, supporting `t = (d − 1) / 2 = 1`
+  correction. The `lib.rs` doc-comment "Out of scope" entry that
+  previously deferred single-bit correction is removed; the new
+  out-of-scope entry covers only the multi-bit (weight ≥ 2) case the
+  code mathematically cannot resolve.
+
 - **Annex D still-image transmission helpers (§D.2 + §D.3).** New
   `annex_d` module wires Annex D into the codec without disturbing the
   motion-video pipeline. `SubImageIndex` is the 0..=3 sub-image

@@ -66,7 +66,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_h261::bch::{
-    decode_multiframe, encode_multiframe, parity18, syndrome18, FRAME_BITS, MULTIFRAME_FRAMES,
+    decode_multiframe, decode_multiframe_with_correction, encode_multiframe, locate_single_error,
+    parity18, syndrome18, FRAME_BITS, MULTIFRAME_FRAMES,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -77,6 +78,24 @@ fuzz_target!(|data: &[u8]| {
     // a small fraction will spuriously lock on a coincidental
     // `(00011011)^3` and drive the per-frame loop.
     let _ = decode_multiframe(data);
+
+    // Exercise the §5.4.1 single-bit correction path on the same raw
+    // attacker bytes. Most inputs won't lock; the small fraction that
+    // do drive the per-frame correction loop including
+    // `locate_single_error` for every non-zero syndrome encountered.
+    let _ = decode_multiframe_with_correction(data);
+
+    // Drive `locate_single_error` on attacker-controlled syndromes
+    // directly: read the first 3 bytes as an 18-bit syndrome
+    // candidate. The function must return for every input value in
+    // 0..2^18 (no panic, no infinite loop). The 511 walked iterations
+    // bound the run time independent of the syndrome value.
+    let mut sb = [0u8; 3];
+    let take = core::cmp::min(data.len(), sb.len());
+    sb[..take].copy_from_slice(&data[..take]);
+    let synd =
+        (((sb[0] as u32) << 16) | ((sb[1] as u32) << 8) | (sb[2] as u32)) & 0x3_FFFF;
+    let _ = locate_single_error(synd);
 
     // `parity18` requires at least 62 bytes (493 bits) of input. The
     // function's debug_assert guards that; in release we still want
@@ -146,6 +165,7 @@ fuzz_target!(|data: &[u8]| {
         i += 2;
     }
     let _ = decode_multiframe(&framed);
+    let _ = decode_multiframe_with_correction(&framed);
 
     // ---- Mode C: raw bytes truncated / extended across the lock window. ----
     //
@@ -159,9 +179,11 @@ fuzz_target!(|data: &[u8]| {
     let edge_len = lock_span_bits.div_ceil(8);
     if data.len() >= edge_len {
         let _ = decode_multiframe(&data[..edge_len]);
+        let _ = decode_multiframe_with_correction(&data[..edge_len]);
     } else {
         let mut padded_edge = vec![0u8; edge_len];
         padded_edge[..data.len()].copy_from_slice(data);
         let _ = decode_multiframe(&padded_edge);
+        let _ = decode_multiframe_with_correction(&padded_edge);
     }
 });

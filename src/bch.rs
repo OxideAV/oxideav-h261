@@ -48,6 +48,10 @@
 //! * [`parity18`] — compute the 18-bit BCH parity over a 493-bit input.
 //! * [`syndrome18`] — compute the 18-bit syndrome over a 511-bit codeword;
 //!   zero ⇒ no error, non-zero ⇒ at least one bit error.
+//! * [`locate_single_error`] — for a non-zero syndrome, attempt to map it
+//!   to the position of a single-bit error in the 511-bit codeword. The
+//!   BCH (511, 493) code is a `t = 1` correcting code, so this is the
+//!   maximum-likelihood correction guaranteed by the spec.
 //! * [`encode_multiframe`] — wrap a slice of `coded_data: &[u8]` into an
 //!   integer number of 8-frame multiframes (4096 bits = 512 bytes each),
 //!   inserting alignment bits and `Fi`/fill frames as required by §5.4.3.
@@ -58,6 +62,10 @@
 //!   surfaces the inner data. A syndrome check is run on every frame and
 //!   the number of corrupted (non-zero-syndrome) frames is reported back
 //!   to the caller as a diagnostic.
+//! * [`decode_multiframe_with_correction`] — same as [`decode_multiframe`]
+//!   but additionally applies the `t = 1` BCH correction to every frame
+//!   with a non-zero syndrome, reporting per-frame correction success /
+//!   failure separately from the raw `corrupted_frames` detection count.
 //!
 //! The H.261 video bitstream the rest of this crate emits / consumes is
 //! oblivious to this layer. Callers that need framed output (e.g. for
@@ -134,12 +142,13 @@ pub fn parity18(data: &[u8]) -> u32 {
 ///
 /// A zero return value means the codeword is consistent with the BCH
 /// generator polynomial. A non-zero return value means at least one bit
-/// was corrupted (and for ≤ t = 1 single-bit errors, the syndrome
-/// identifies the position; this module currently surfaces the syndrome
-/// to the caller and does not perform single-bit correction in the
-/// decoder path — the inner H.261 video VLC layer is robust to occasional
-/// MB-level slips and historically deployments either passed corrupted
-/// frames through or dropped them).
+/// was corrupted. For ≤ t = 1 single-bit errors the syndrome uniquely
+/// identifies the position via [`locate_single_error`]; the integrated
+/// correction path is [`decode_multiframe_with_correction`]. Callers
+/// that want only detection (or are confident that frame-rate drop-out
+/// from the inner H.261 VLC's GOB resync is cheaper than acting on the
+/// corrected bit) use [`decode_multiframe`], which surfaces the syndrome
+/// via `corrupted_frames` without correcting.
 pub fn syndrome18(data: &[u8], parity: u32) -> u32 {
     let mut reg: u32 = 0;
     for i in 0..(DATA_BITS as usize) {
@@ -158,6 +167,54 @@ pub fn syndrome18(data: &[u8], parity: u32) -> u32 {
         }
     }
     reg & ((1 << PARITY_BITS) - 1)
+}
+
+/// Attempt to locate a single-bit error in a 511-bit BCH codeword from its
+/// 18-bit syndrome.
+///
+/// The BCH (511, 493) code defined by `g(x)` has minimum distance `d = 3`
+/// and corrects up to `t = (d − 1) / 2 = 1` errors. For a clean codeword
+/// `c(x)` we have `c(x) mod g(x) == 0`. For a single-bit error at
+/// position `p` (0 = first transmitted protected bit = `Fi`, 510 = last
+/// parity bit), the error polynomial is `e(x) = x^(510 − p)` and the
+/// syndrome equals `x^(510 − p) mod g(x)`.
+///
+/// This function returns `Some(p)` if the syndrome exactly matches a
+/// single-bit error pattern; otherwise it returns `None` (either the
+/// syndrome was zero — no error — or it corresponds to an error pattern
+/// of weight ≥ 2 that the t = 1 code cannot uniquely resolve). A
+/// `None` return for a non-zero syndrome is the spec's documented
+/// behaviour: §5.4 promises single-bit correction only; multi-bit
+/// patterns must be passed through for the inner H.261 GOB-resync to
+/// recover.
+///
+/// The implementation walks `pow = x^i mod g(x)` for `i = 0..511` and
+/// stops when `pow == syndrome`. The walk costs at most 511 18-bit
+/// shift-XOR steps and allocates nothing.
+pub fn locate_single_error(syndrome: u32) -> Option<u32> {
+    let mask = (1u32 << PARITY_BITS) - 1;
+    let synd = syndrome & mask;
+    if synd == 0 {
+        return None;
+    }
+    // pow tracks x^i mod g(x), starting at i = 0 ⇒ x^0 = 1.
+    let mut pow: u32 = 1;
+    for i in 0..(FRAME_BITS - 1) as u32 {
+        if pow == synd {
+            // Found: error position p such that (510 - p) == i.
+            return Some((FRAME_BITS - 2) - i);
+        }
+        // pow := (pow << 1) mod g(x).
+        pow <<= 1;
+        if (pow >> PARITY_BITS) & 1 != 0 {
+            pow ^= GEN_POLY;
+        }
+        pow &= mask;
+    }
+    // After 511 iterations the syndrome did not match any single-bit
+    // error pattern: must be a multi-bit error the t = 1 code can't
+    // correct.
+    None
 }
 
 /// Wrap `coded_data` (an MSB-first packed bitstream) into FEC multiframes
@@ -269,7 +326,7 @@ pub fn encode_multiframe(coded_data: &[u8], coded_data_bits: usize) -> Vec<u8> {
     out
 }
 
-/// Outcome of [`decode_multiframe`].
+/// Outcome of [`decode_multiframe`] and [`decode_multiframe_with_correction`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedMultiframe {
     /// The recovered inner coded video bitstream, MSB-first packed.
@@ -283,11 +340,24 @@ pub struct DecodedMultiframe {
     /// Number of frames whose 18-bit syndrome was non-zero (i.e. at
     /// least one bit error was detected). Surfaced to the caller for
     /// diagnostics; the data from those frames is included in `data`
-    /// regardless, because dropping it would create a longer drop-out
-    /// than letting the inner H.261 video resync at the next GOB.
+    /// regardless. With [`decode_multiframe`] this is the only error
+    /// signal; with [`decode_multiframe_with_correction`] the breakdown
+    /// is reported via `corrected_frames` + `uncorrectable_frames`.
     pub corrupted_frames: usize,
     /// Number of fill-only frames skipped (Fi=0 / inner data all ones).
     pub fill_frames: usize,
+    /// Number of frames whose single-bit error was successfully located
+    /// and flipped by [`locate_single_error`] before the data was
+    /// emitted. Always `0` for [`decode_multiframe`] (which never
+    /// corrects). A subset of `corrupted_frames`.
+    pub corrected_frames: usize,
+    /// Number of frames with a non-zero syndrome that could not be
+    /// resolved as a single-bit error (i.e. weight ≥ 2 errors that the
+    /// `t = 1` code cannot correct). Always `0` for
+    /// [`decode_multiframe`]. The complement of `corrected_frames`
+    /// within `corrupted_frames`: `corrupted_frames == corrected_frames
+    /// + uncorrectable_frames` after correction.
+    pub uncorrectable_frames: usize,
 }
 
 /// Strip the BCH-framing layer from `framed`, beginning at bit 0.
@@ -402,6 +472,170 @@ pub fn decode_multiframe(framed: &[u8]) -> Option<DecodedMultiframe> {
         frames_consumed,
         corrupted_frames,
         fill_frames,
+        corrected_frames: 0,
+        uncorrectable_frames: 0,
+    })
+}
+
+/// Like [`decode_multiframe`] but actively performs the `t = 1` BCH
+/// single-bit correction the (511, 493) code guarantees.
+///
+/// For every frame whose 18-bit syndrome is non-zero,
+/// [`locate_single_error`] is called to map the syndrome to a candidate
+/// error position. If a position is found, the bit at that position
+/// inside the 511-bit codeword (`Fi || 492-bit data || 18-bit parity`)
+/// is flipped before the per-frame `Fi` / data interpretation runs, and
+/// the frame counts toward `corrected_frames`. If the syndrome cannot
+/// be resolved as a single-bit error (i.e. it does not appear in the
+/// 511 single-bit-error pattern set — implying weight ≥ 2 errors that
+/// the t = 1 code cannot correct), the frame is left unmodified and
+/// counts toward `uncorrectable_frames` as well as `corrupted_frames`.
+///
+/// `corrupted_frames` still reports the total non-zero-syndrome count
+/// (so callers comparing channel raw-error rates against pre- and
+/// post-correction outputs see the same denominator). Frame lock is
+/// established via the alignment-pattern criterion exactly as in
+/// [`decode_multiframe`]; correction does not change the §5.4.4 lock
+/// search.
+///
+/// Spec rationale: H.261 §5.4.1 explicitly labels the outer layer an
+/// "error correcting code", and §5.4.2 specifies the BCH (511, 493)
+/// generator polynomial that mathematically supports `t = 1`
+/// correction. [`decode_multiframe`] surfaces the syndrome without
+/// acting on it; this function actually applies the correction the
+/// spec sanctions.
+pub fn decode_multiframe_with_correction(framed: &[u8]) -> Option<DecodedMultiframe> {
+    let total_bits = framed.len() * 8;
+    let lock_frames = 3 * MULTIFRAME_FRAMES as usize;
+    let lock_span_bits = lock_frames * FRAME_BITS as usize;
+    if total_bits < lock_span_bits {
+        return None;
+    }
+
+    let read_bit = |pos: usize| -> u8 { (framed[pos / 8] >> (7 - (pos & 7))) & 1 };
+
+    let mut lock: Option<usize> = None;
+    'outer: for bit0 in 0..FRAME_BITS as usize {
+        if bit0 + lock_span_bits > total_bits {
+            break;
+        }
+        for k in 0..lock_frames {
+            let s = read_bit(bit0 + k * FRAME_BITS as usize);
+            if s != ALIGNMENT_PATTERN[k % MULTIFRAME_FRAMES as usize] {
+                continue 'outer;
+            }
+        }
+        lock = Some(bit0);
+        break;
+    }
+
+    let bit0 = lock?;
+
+    let mut data: Vec<u8> = Vec::new();
+    let mut data_bits = 0usize;
+    let mut put_data_bit = |bit: u8| {
+        if data_bits % 8 == 0 {
+            data.push(0);
+        }
+        let byte_idx = data_bits / 8;
+        let shift = 7 - (data_bits & 7);
+        data[byte_idx] |= (bit & 1) << shift;
+        data_bits += 1;
+    };
+
+    let mut frames_consumed = 0usize;
+    let mut corrupted_frames = 0usize;
+    let mut corrected_frames = 0usize;
+    let mut uncorrectable_frames = 0usize;
+    let mut fill_frames = 0usize;
+
+    // 493-bit working buffer for the Fi || data field of each frame.
+    // The codeword positions used by `locate_single_error` are:
+    //   pos 0           → Fi
+    //   pos 1..493      → data bits 0..491
+    //   pos 493..511    → parity bits 0..17
+    let coded_per_frame = (DATA_BITS - 1) as usize; // 492
+
+    let mut cursor = bit0;
+    while cursor + FRAME_BITS as usize <= total_bits {
+        // Skip the S bit (not part of the 511-bit BCH codeword).
+        let _s = read_bit(cursor);
+        let mut fi = read_bit(cursor + 1);
+
+        // Pack Fi || 492 data bits into `scratch` for the syndrome /
+        // correction calculation; bit 0 of `scratch[0]` (MSB-first) is
+        // Fi, bits 1..493 are the data field.
+        let mut scratch = [0u8; 62];
+        scratch[0] = fi << 7;
+        let data_start = cursor + 2;
+        for j in 0..coded_per_frame {
+            let bit = read_bit(data_start + j);
+            let pos = j + 1;
+            scratch[pos / 8] |= bit << (7 - (pos & 7));
+        }
+        let mut par = 0u32;
+        let par_start = data_start + coded_per_frame;
+        for j in 0..(PARITY_BITS as usize) {
+            par = (par << 1) | read_bit(par_start + j) as u32;
+        }
+
+        let synd = syndrome18(&scratch, par);
+        if synd != 0 {
+            corrupted_frames += 1;
+            if let Some(p) = locate_single_error(synd) {
+                let p = p as usize;
+                if p == 0 {
+                    // Error in Fi: flip it.
+                    fi ^= 1;
+                    scratch[0] ^= 0x80;
+                } else if p < (DATA_BITS as usize) {
+                    // Error in data bit (p - 1) of the 492-bit data field.
+                    let bit_in_scratch = p; // pos within Fi || data = p
+                    scratch[bit_in_scratch / 8] ^= 1 << (7 - (bit_in_scratch & 7));
+                } else {
+                    // Error in parity bit (p - 493). The parity isn't
+                    // emitted to `data`, but we flip it for completeness
+                    // so a downstream caller running a verification
+                    // syndrome on the corrected codeword sees zero.
+                    let par_bit = p - DATA_BITS as usize;
+                    par ^= 1 << (PARITY_BITS as usize - 1 - par_bit);
+                }
+                corrected_frames += 1;
+                // Sanity check: the corrected codeword's syndrome is zero.
+                debug_assert_eq!(
+                    syndrome18(&scratch, par),
+                    0,
+                    "post-correction syndrome should be zero (p={p})"
+                );
+            } else {
+                uncorrectable_frames += 1;
+            }
+        }
+
+        if fi == 1 {
+            // Emit the (possibly-corrected) 492 coded-data bits from
+            // `scratch` (positions 1..493).
+            for j in 0..coded_per_frame {
+                let pos = j + 1;
+                let bit = (scratch[pos / 8] >> (7 - (pos & 7))) & 1;
+                put_data_bit(bit);
+            }
+        } else {
+            fill_frames += 1;
+        }
+
+        frames_consumed += 1;
+        cursor += FRAME_BITS as usize;
+    }
+
+    Some(DecodedMultiframe {
+        data,
+        data_bits,
+        frames_consumed,
+        corrupted_frames,
+        fill_frames,
+        corrected_frames,
+        uncorrectable_frames,
     })
 }
 
@@ -656,5 +890,247 @@ mod tests {
         assert_eq!(decoded.fill_frames, 24);
         assert_eq!(decoded.data_bits, 0);
         assert_eq!(decoded.corrupted_frames, 0);
+    }
+
+    // ---------- §5.4.1 single-bit BCH correction tests ----------
+
+    /// `locate_single_error(0)` must report no error (the empty syndrome
+    /// is reserved for the "codeword unchanged" case).
+    #[test]
+    fn locate_single_error_zero_syndrome_returns_none() {
+        assert_eq!(locate_single_error(0), None);
+    }
+
+    /// `locate_single_error` covers every position `0..511` and only
+    /// those positions: for each position `p`, compute the syndrome of
+    /// the all-zero codeword with bit `p` flipped, then verify that
+    /// `locate_single_error(syndrome) == Some(p)`. This is the
+    /// fundamental invariant of the t = 1 lookup.
+    #[test]
+    fn locate_single_error_round_trips_every_codeword_position() {
+        for p in 0..((FRAME_BITS - 1) as usize) {
+            // Build a 511-bit codeword that is all zeros except for a 1
+            // at position `p` (where p=0 is Fi, p=1..493 is data bit
+            // p-1, p=493..511 is parity bit p-493).
+            let mut scratch = [0u8; 62];
+            let mut par: u32 = 0;
+            if p < (DATA_BITS as usize) {
+                scratch[p / 8] |= 1 << (7 - (p & 7));
+            } else {
+                let pb = p - DATA_BITS as usize;
+                par |= 1 << (PARITY_BITS as usize - 1 - pb);
+            }
+            let s = syndrome18(&scratch, par);
+            assert_ne!(s, 0, "non-zero error must yield non-zero syndrome (p={p})");
+            assert_eq!(
+                locate_single_error(s),
+                Some(p as u32),
+                "syndrome 0x{s:X} should map to position {p}"
+            );
+        }
+    }
+
+    /// For weight-2 error patterns the t = 1 code cannot guarantee
+    /// correction. Some weight-2 syndromes coincidentally equal
+    /// weight-1 syndromes (the code's minimum distance is 3, so two
+    /// errors can never look like zero errors but can look like one
+    /// error). `locate_single_error` is documented to return *some*
+    /// position for those — that's the unavoidable miscorrection
+    /// hazard for a t = 1 code over a busy channel. We assert here
+    /// only that the return is well-defined (no panic, no infinite
+    /// loop) for a representative set of weight-2 patterns.
+    #[test]
+    fn locate_single_error_handles_weight_two_patterns() {
+        for (a, b) in [(0, 5), (3, 200), (100, 492), (1, 510), (0, 510)] {
+            let mut scratch = [0u8; 62];
+            let mut par: u32 = 0;
+            for &p in &[a, b] {
+                if p < (DATA_BITS as usize) {
+                    scratch[p / 8] ^= 1 << (7 - (p & 7));
+                } else {
+                    let pb = p - DATA_BITS as usize;
+                    par ^= 1 << (PARITY_BITS as usize - 1 - pb);
+                }
+            }
+            let s = syndrome18(&scratch, par);
+            // s could be zero only if the two errors map to the same
+            // syndrome — impossible for d = 3, but the loop here just
+            // confirms the function returns without crashing.
+            let _ = locate_single_error(s);
+        }
+    }
+
+    /// `decode_multiframe_with_correction` recovers the original
+    /// payload bit-exact when the framed buffer is clean (the
+    /// correction path is a no-op on zero-syndrome frames).
+    #[test]
+    fn decode_with_correction_no_error_round_trip() {
+        let mut payload = vec![0u8; 11_808 / 8];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        let framed = encode_multiframe(&payload, payload.len() * 8);
+        let decoded = decode_multiframe_with_correction(&framed).expect("lock on clean stream");
+        assert_eq!(decoded.frames_consumed, 24);
+        assert_eq!(decoded.corrupted_frames, 0);
+        assert_eq!(decoded.corrected_frames, 0);
+        assert_eq!(decoded.uncorrectable_frames, 0);
+        assert_eq!(&decoded.data[..payload.len()], &payload[..]);
+    }
+
+    /// A single-bit flip inside the data field of one frame is
+    /// detected and corrected: the recovered payload matches the
+    /// pre-corruption original bit-exact, and the counts are
+    /// `corrupted_frames = 1, corrected_frames = 1,
+    /// uncorrectable_frames = 0`.
+    #[test]
+    fn decode_with_correction_recovers_single_bit_data_error() {
+        let payload = vec![0xC3u8; (3 * 3936) / 8];
+        let framed_clean = encode_multiframe(&payload, payload.len() * 8);
+        assert_eq!(framed_clean.len(), 3 * 512);
+        // Flip bit 12 of byte 700 (deep in the second multiframe).
+        let mut framed = framed_clean.clone();
+        framed[700] ^= 0b0001_0000;
+        let decoded =
+            decode_multiframe_with_correction(&framed).expect("lock survives single-bit error");
+        assert_eq!(decoded.frames_consumed, 24);
+        assert_eq!(decoded.corrupted_frames, 1);
+        assert_eq!(decoded.corrected_frames, 1);
+        assert_eq!(decoded.uncorrectable_frames, 0);
+        // The corrected payload bit-exactly matches the original.
+        assert_eq!(&decoded.data[..payload.len()], &payload[..]);
+    }
+
+    /// A single-bit flip in the parity field is detected and the
+    /// (data) payload is recovered bit-exact. (The parity bit itself
+    /// isn't emitted; the corrected codeword is internally consistent
+    /// but the data field was never wrong.)
+    #[test]
+    fn decode_with_correction_recovers_single_bit_parity_error() {
+        let payload = vec![0x5Au8; (3 * 3936) / 8];
+        let framed_clean = encode_multiframe(&payload, payload.len() * 8);
+        let mut framed = framed_clean.clone();
+        // Frame 0 starts at bit 0; its parity field is at bits
+        // 494..512. Flip a bit there (byte 62, mid-parity).
+        framed[62] ^= 0b0000_1000;
+        let decoded =
+            decode_multiframe_with_correction(&framed).expect("lock survives parity flip");
+        assert_eq!(decoded.corrupted_frames, 1);
+        assert_eq!(decoded.corrected_frames, 1);
+        assert_eq!(decoded.uncorrectable_frames, 0);
+        assert_eq!(&decoded.data[..payload.len()], &payload[..]);
+    }
+
+    /// A single-bit flip of the `Fi` flag in a Fi=1 (carrying-data)
+    /// frame is correctable: the corrected Fi reads back as 1 and the
+    /// 492 data bits are emitted unchanged. (If we incorrectly took Fi
+    /// as 0, the frame would be dropped as fill.)
+    #[test]
+    fn decode_with_correction_recovers_single_bit_fi_error() {
+        let payload = vec![0xA5u8; (3 * 3936) / 8];
+        let framed_clean = encode_multiframe(&payload, payload.len() * 8);
+        let mut framed = framed_clean.clone();
+        // Fi for frame 0 is at bit 1 (after the S bit at bit 0). Flip
+        // it: bit position 1 in the framed stream ⇒ byte 0, mask 0x40.
+        framed[0] ^= 0b0100_0000;
+        let decoded = decode_multiframe_with_correction(&framed).expect("lock survives Fi flip");
+        assert_eq!(decoded.corrupted_frames, 1);
+        assert_eq!(decoded.corrected_frames, 1);
+        assert_eq!(decoded.uncorrectable_frames, 0);
+        // All Fi=1 frames recovered: payload survives byte-exact.
+        assert_eq!(&decoded.data[..payload.len()], &payload[..]);
+        // Fill count should still be zero (frame 0 wasn't mis-classified
+        // as fill).
+        assert_eq!(decoded.fill_frames, 0);
+    }
+
+    /// Two bit flips inside the same frame's protected region exceed
+    /// the t = 1 code's correction capability. The decoder must either
+    /// (a) report the frame as uncorrectable when the weight-2 syndrome
+    /// doesn't accidentally collide with a weight-1 pattern, or (b)
+    /// miscorrect to a different codeword (the unavoidable hazard of a
+    /// t = 1 code over a busy channel). Either way, no panic, no
+    /// silent dropping.
+    #[test]
+    fn decode_with_correction_two_bit_error_does_not_panic() {
+        let payload = vec![0x33u8; (3 * 3936) / 8];
+        let framed_clean = encode_multiframe(&payload, payload.len() * 8);
+        let mut framed = framed_clean.clone();
+        // Two flips in the same frame (bytes 5 and 25 both within
+        // frame 0: bytes 0..64). Spaced apart in different bytes so we
+        // hit two different data positions.
+        framed[5] ^= 0b0000_0001;
+        framed[25] ^= 0b0010_0000;
+        let decoded =
+            decode_multiframe_with_correction(&framed).expect("frame lock survives weight-2 error");
+        assert_eq!(decoded.frames_consumed, 24);
+        assert_eq!(decoded.corrupted_frames, 1);
+        // The weight-2 syndrome may or may not look like a weight-1
+        // pattern, so either branch is valid here; the invariant we
+        // care about is that the function returns and the breakdown
+        // is internally consistent.
+        assert_eq!(
+            decoded.corrected_frames + decoded.uncorrectable_frames,
+            decoded.corrupted_frames
+        );
+    }
+
+    /// `decode_multiframe_with_correction` correctly handles the
+    /// stuffing-frame path: an idle channel (Fi=0 in every frame, 492
+    /// fill bits all 1s) is detected, recovered as zero payload, and
+    /// no spurious corrections fire.
+    #[test]
+    fn decode_with_correction_stuffing_only_path() {
+        let mut framed = encode_multiframe(&[], 0);
+        framed.extend(encode_multiframe(&[], 0));
+        framed.extend(encode_multiframe(&[], 0));
+        let decoded = decode_multiframe_with_correction(&framed).expect("stuffing locks");
+        assert_eq!(decoded.frames_consumed, 24);
+        assert_eq!(decoded.fill_frames, 24);
+        assert_eq!(decoded.data_bits, 0);
+        assert_eq!(decoded.corrupted_frames, 0);
+        assert_eq!(decoded.corrected_frames, 0);
+        assert_eq!(decoded.uncorrectable_frames, 0);
+    }
+
+    /// Sweep every protected bit position in a single frame: flip one
+    /// bit, decode with correction, verify the payload is recovered
+    /// bit-exact and the position-count invariants hold. This is the
+    /// stress test that proves every protected bit (Fi + 492 data + 18
+    /// parity = 511 positions) is correctable end-to-end through the
+    /// per-frame public API.
+    #[test]
+    fn decode_with_correction_sweeps_every_protected_bit() {
+        // 3 multiframes of payload (the minimum for lock). All Fi=1.
+        let payload = vec![0x9Cu8; (3 * 3936) / 8];
+        let framed_clean = encode_multiframe(&payload, payload.len() * 8);
+
+        // Sweep every of the 511 protected bit positions within frame 0
+        // (which occupies bits 0..512 of `framed_clean`). The S bit at
+        // codeword-bit 0 is unprotected, so we start at codeword-bit 1
+        // (Fi) and run through codeword-bit 511 (last parity bit).
+        for protected_pos in 0..((FRAME_BITS - 1) as usize) {
+            // Map protected_pos (0..511, Fi at 0, parity at 493..511) to
+            // its bit index in `framed_clean`: skip the S bit (bit 0).
+            let bit_idx = 1 + protected_pos;
+            let mut framed = framed_clean.clone();
+            framed[bit_idx / 8] ^= 1 << (7 - (bit_idx & 7));
+            let decoded = decode_multiframe_with_correction(&framed)
+                .unwrap_or_else(|| panic!("lock at pos {protected_pos}"));
+            assert_eq!(
+                decoded.corrupted_frames, 1,
+                "exactly one frame should be flagged (pos {protected_pos})"
+            );
+            assert_eq!(
+                decoded.corrected_frames, 1,
+                "single-bit error must be corrected (pos {protected_pos})"
+            );
+            assert_eq!(decoded.uncorrectable_frames, 0);
+            assert_eq!(
+                &decoded.data[..payload.len()],
+                &payload[..],
+                "payload should match after correction at pos {protected_pos}"
+            );
+        }
     }
 }

@@ -19,7 +19,11 @@
 //!   MQUANT rate control, FIL loop-filter RDO, full §4.2.3.4 MV-pred.
 //! * BCH (511,493) error-correction framing (§5.4): the [`bch`] module
 //!   wraps / unwraps the outer FEC multiframe layer (alignment pattern,
-//!   `Fi` bit, BCH parity computation and per-frame syndrome check).
+//!   `Fi` bit, BCH parity computation and per-frame syndrome check), and
+//!   implements the spec-mandated `t = 1` single-bit error correction
+//!   via [`bch::locate_single_error`] /
+//!   [`bch::decode_multiframe_with_correction`]. Sweep-tested across all
+//!   511 protected bit positions per frame.
 //! * Hypothetical Reference Decoder buffer model (§5.2 + Annex B): the
 //!   [`hrd`] module exposes the per-picture bit cap (256 kbits CIF /
 //!   64 kbits QCIF) and the HRD buffer-occupancy walk used to verify
@@ -55,12 +59,13 @@
 //!   between a full-resolution still image and its four sub-images.
 //!
 //! Out of scope:
-//! * Single-bit correction of corrupted BCH (511,493) codewords — the
-//!   [`bch`] module computes parity/syndromes and frames/unframes the
-//!   multiframe layer, but a non-zero syndrome is surfaced to the caller
-//!   rather than acted on (in practice the inner H.261 video VLC resyncs
-//!   at the next GOB start code, which is cheaper than relying on the
-//!   single-bit correction the BCH code formally provides).
+//! * Multi-bit (weight ≥ 2) BCH (511,493) error correction. The
+//!   generator polynomial has minimum distance `d = 3`, so the spec's
+//!   `t = (d − 1) / 2 = 1` correction capability is the upper bound;
+//!   weight-2 or denser error patterns are flagged
+//!   (`uncorrectable_frames` in [`bch::DecodedMultiframe`]) but cannot
+//!   be uniquely resolved by this code on its own — the inner H.261
+//!   video VLC layer handles those via GOB resync.
 //!
 //! No runtime dependencies beyond `oxideav-core`, `oxideav-codec`, and
 //! `oxideav-pixfmt`.
