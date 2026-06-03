@@ -394,8 +394,8 @@ assert_eq!(answer.d, None);
 
 ### Daily fuzzing
 
-A `cargo-fuzz` harness lives under `fuzz/`. Four targets cover the
-four distinct attack surfaces an H.261 endpoint exposes:
+A `cargo-fuzz` harness lives under `fuzz/`. Five targets cover the
+five distinct attack surfaces an H.261 endpoint exposes:
 
 * **`decode_h261`** drives arbitrary fuzz-supplied bytes through the
   decoder's full public surface (`send_packet` → drain `receive_frame`
@@ -443,8 +443,28 @@ four distinct attack surfaces an H.261 endpoint exposes:
   synthetic `H261RtpPayload`s with attacker-chosen header fields and
   attacker-chosen data lengths, so the slow-path bit-walker and the
   final `iter_start_codes` sanity check both stay covered.
+* **`parse_sdp_fmtp`** drives arbitrary fuzz-supplied bytes through
+  the SDP signalling parser surface — the attribute-line parsers an
+  endpoint runs on every received Session Description Protocol offer
+  or answer at session setup **before** any RTP / RTCP / H.261 layer
+  sees a byte. Four entry points are exercised: `parse_rtpmap`
+  (RFC 4587 §6.2 — `a=rtpmap:<pt> H261/90000` with case-insensitive
+  encoding-name match, payload-type and clock-rate integer bounds),
+  `parse_fmtp` (RFC 4587 §6.2 — `a=fmtp:<pt> CIF=…;QCIF=…;D=…` with
+  payload-type match), `H261FmtpParams::parse_value` (RFC 4587 §6.1.1
+  — semicolon-separated key=value list with CIF/QCIF MPI ∈ 1..=4
+  and D ∈ {0,1} validation, duplicate-parameter rejection, forward-
+  compatible unknown-parameter skip), and `negotiate_answer` (RFC
+  4587 §6.2.1 offer/answer rules — per-shared-size `max(MPI)` upper
+  bound, RFC 2032 QCIF=1 fallback for an offer with no picture size,
+  both-sides-required Annex-D survival). The harness decodes the fuzz
+  input as UTF-8 lossily, drives each parser standalone, then splits
+  the input on `|` and feeds the `(offer, our)` halves to the
+  negotiator; for any input that parses cleanly the formatter output
+  is reparsed back through `parse_value` so a round-trip mismatch
+  trips the daily run.
 
-The contract under test is the same for all four targets: every
+The contract under test is the same for all five targets: every
 call must *return* — no panic, no abort, no integer overflow (in
 debug / ASAN builds), no out-of-bounds index, no allocator OOM.
 
@@ -478,34 +498,54 @@ a single-bit flip inside a data field (drives the non-zero-syndrome
 branch), a 4-bit-prefix-shifted stream that forces the lock-search
 past `bit0 = 0`, a 2-multiframe input that falls one frame short of
 the §5.4.4 lock window, and a 6-multiframe stream of `0x5A` payload
-(twice the lock window).
+(twice the lock window). The seed corpus for `parse_sdp_fmtp`
+(`fuzz/corpus/parse_sdp_fmtp/`) contains ten text buffers: the §6.2
+worked-example `a=rtpmap:31 H261/90000` and `a=fmtp:31 CIF=2;QCIF=1;D=1`
+lines, a dynamic-payload-type rtpmap (PT=96), a QCIF-only fmtp, a
+forward-compatible fmtp with an unknown parameter, a lowercase-key
+fmtp (case-insensitive match per §6.1.1), a `|`-split offer/our pair
+for `negotiate_answer`, an empty-offer pair that exercises the §6.2.1
+RFC 2032 QCIF=1 fallback, a malformed parameter list (`CIF=5;QCIF=0;D=2`
+— every value out of range), and a non-H.261 rtpmap (`H264/90000`) the
+parser must reject.
 
 `tests/fuzz_seed_corpus.rs`, `tests/fuzz_seed_corpus_rtcp.rs`,
-`tests/fuzz_seed_corpus_bch.rs`, and `tests/fuzz_seed_corpus_rtp.rs`
-drive the same logic on stable Rust against each corpus so the regular
-CI matrix catches a regression in any public surface without waiting
-for the daily fuzz run. The RTCP stable-CI test also drives a handful
-of hand-crafted adversarial buffers — lying header length, zero-length
-advance, truncated compound, SDES PRIV length overflow, BYE reason
-overflow, APP at the 5-bit subtype maximum, unknown PT=205. The BCH
-stable-CI test drives empty / single-zero / all-ones / pseudo-random
-buffers, a one-byte-short-of-lock input, an attacker-chosen 32-bit
-parity, and a multi-bit deterministic injection that surfaces in
-`corrupted_frames` without breaking lock. The RTP stable-CI test
-drives empty / single-zero / all-ones / pseudo-random buffers, the
-12-byte fixed-header boundary, a CC=15 truncated input (must reject as
+`tests/fuzz_seed_corpus_bch.rs`, `tests/fuzz_seed_corpus_rtp.rs`,
+and `tests/fuzz_seed_corpus_sdp.rs` drive the same logic on stable
+Rust against each corpus so the regular CI matrix catches a regression
+in any public surface without waiting for the daily fuzz run. The
+RTCP stable-CI test also drives a handful of hand-crafted adversarial
+buffers — lying header length, zero-length advance, truncated
+compound, SDES PRIV length overflow, BYE reason overflow, APP at the
+5-bit subtype maximum, unknown PT=205. The BCH stable-CI test drives
+empty / single-zero / all-ones / pseudo-random buffers, a
+one-byte-short-of-lock input, an attacker-chosen 32-bit parity, and a
+multi-bit deterministic injection that surfaces in `corrupted_frames`
+without breaking lock. The RTP stable-CI test drives empty /
+single-zero / all-ones / pseudo-random buffers, the 12-byte
+fixed-header boundary, a CC=15 truncated input (must reject as
 `ShortHeader` rather than read past the buffer), a V=1 rejection (must
 return `FieldOverflow`), a `pack_header` ↔ `unpack_header` round-trip
 on the typical-fields header, and a `depacketize` SBIT+EBIT-overflow
 input (must return `EmptyPayload` rather than underflow on
-`8 * data.len() - sbit - ebit`). The parser-surface contracts stay
-covered even if the on-disk corpus is corrupted.
+`8 * data.len() - sbit - ebit`). The SDP stable-CI test drives empty /
+single-zero / all-ones / pseudo-random buffers, the §6.2 worked
+rtpmap + fmtp round trips, a non-H.261 rtpmap rejection, an u8
+payload-type and u32 clock-rate overflow rejection on `parse_rtpmap`,
+a payload-type mismatch on `parse_fmtp`, MPI-out-of-range / Annex-D
+non-binary / duplicate-CIF / duplicate-QCIF / missing-`=` rejections
+on `parse_value`, a forward-compatible unknown-parameter skip, the
+§6.2.1 disjoint-advertisement `NoPictureSize` rejection, the §6.2.1
+RFC 2032 QCIF=1 fallback, the §6.2.1 both-sides Annex-D rule, and a
+formatter → parser round-trip on the canonical `(CIF=4, QCIF=1, D=1)`
+shape. The parser-surface contracts stay covered even if the on-disk
+corpus is corrupted.
 
 The workflow at `.github/workflows/fuzz.yml` runs `cargo fuzz run
 decode_h261 -- -max_total_time=1800` (30-minute budget) once a day
 via the org-shared `crate-fuzz.yml` reusable workflow. The
-`parse_rtcp_compound`, `decode_bch_multiframe`, and
-`parse_rtp_payload` targets share the same workflow file once the
+`parse_rtcp_compound`, `decode_bch_multiframe`, `parse_rtp_payload`,
+and `parse_sdp_fmtp` targets share the same workflow file once the
 reusable workflow gains per-target sequencing; until then their
 stable-CI seed tests are the primary regression guard.
 
@@ -516,6 +556,7 @@ cargo +nightly fuzz run decode_h261 -- -max_total_time=60
 cargo +nightly fuzz run parse_rtcp_compound -- -max_total_time=60
 cargo +nightly fuzz run decode_bch_multiframe -- -max_total_time=60
 cargo +nightly fuzz run parse_rtp_payload -- -max_total_time=60
+cargo +nightly fuzz run parse_sdp_fmtp -- -max_total_time=60
 ```
 
 ### Benchmarks

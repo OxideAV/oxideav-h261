@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fifth cargo-fuzz target: `parse_sdp_fmtp`** drives arbitrary
+  fuzz-supplied bytes through the H.261 Session Description Protocol
+  parser surface — the attribute-line parsers an endpoint runs on every
+  received SDP offer or answer at session setup **before** any RTP /
+  RTCP / H.261 layer sees a byte. Four entry points are exercised:
+  `parse_rtpmap` (RFC 4587 §6.2: `a=rtpmap:<pt> H261/90000` with
+  case-insensitive encoding-name match, payload-type and clock-rate
+  integer bounds; a non-`H261` encoding name surfaces as `None`, an u8
+  payload-type overflow or u32 clock-rate overflow surfaces as `None`),
+  `parse_fmtp` (RFC 4587 §6.2: `a=fmtp:<pt> CIF=…;QCIF=…;D=…` with
+  payload-type match), `H261FmtpParams::parse_value` (RFC 4587 §6.1.1:
+  semicolon-separated key=value list with CIF/QCIF MPI ∈ 1..=4 and
+  D ∈ {0,1} validation, duplicate-parameter rejection, forward-
+  compatible unknown-parameter skip), and `negotiate_answer` (RFC 4587
+  §6.2.1 offer/answer rules: per-shared-size `max(MPI)` upper bound,
+  RFC 2032 QCIF=1 fallback for an offer with no picture size, both-
+  sides-required Annex-D survival). The harness decodes the fuzz input
+  as UTF-8 lossily once per iteration, drives each parser standalone,
+  splits the input on `|` and feeds the `(offer, our)` halves to the
+  negotiator, then runs a formatter → parser round trip on any input
+  that parses cleanly so a `format_value` / `parse_value` disagreement
+  trips the daily run. Contract under test: every call must *return*
+  — no panic, no abort, no integer overflow (in debug / ASAN builds),
+  no out-of-bounds index, no allocator OOM.
+- **Seed corpus** at `fuzz/corpus/parse_sdp_fmtp/` (10 text buffers,
+  ≈ 270 B total): the §6.2 worked-example `a=rtpmap:31 H261/90000` and
+  `a=fmtp:31 CIF=2;QCIF=1;D=1` lines, a dynamic-payload-type rtpmap
+  (PT=96), a QCIF-only fmtp, a forward-compatible fmtp with an unknown
+  parameter, a lowercase-key fmtp (case-insensitive match per §6.1.1),
+  a `|`-split offer/our pair for `negotiate_answer`, an empty-offer
+  pair that exercises the §6.2.1 RFC 2032 QCIF=1 fallback, a malformed
+  parameter list with every value out of range (`CIF=5;QCIF=0;D=2`),
+  and a non-H.261 rtpmap (`H264/90000`) the parser must reject.
+- **Stable-CI seed test** `tests/fuzz_seed_corpus_sdp.rs` (19 tests,
+  ≈ 1 ms) mirrors the fuzz target on stable Rust so the regular CI
+  matrix catches a regression in the SDP signalling parser surface
+  without waiting for the daily fuzz run. Also drives empty /
+  single-zero / all-ones (non-UTF-8 → U+FFFD lossy decode) /
+  pseudo-random adversarial buffers, the §6.2 worked rtpmap + fmtp
+  round trips, a non-H.261 rtpmap rejection, an u8 payload-type
+  and u32 clock-rate overflow rejection on `parse_rtpmap`, a
+  payload-type mismatch on `parse_fmtp`, MPI-out-of-range /
+  Annex-D non-binary / duplicate-CIF / duplicate-QCIF / missing-`=`
+  rejections on `parse_value`, a forward-compatible unknown-parameter
+  skip, the §6.2.1 disjoint-advertisement `NoPictureSize` rejection,
+  the §6.2.1 RFC 2032 QCIF=1 fallback, the §6.2.1 both-sides Annex-D
+  rule, and a formatter → parser round-trip on the canonical
+  `(CIF=4, QCIF=1, D=1)` shape.
+
 - **Annex A IDCT accuracy conformance test** (`tests/idct_annex_a.rs`)
   implements the §A.1..§A.9 measurable conformance procedure that ITU-T
   Recommendation H.261 mandates for every compliant inverse 8×8 DCT.

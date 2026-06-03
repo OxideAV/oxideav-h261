@@ -1,0 +1,1 @@
+a=fmtp:96 CIF=2;QCIF=2;D=0;FUTURE=42
