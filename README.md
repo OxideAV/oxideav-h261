@@ -652,11 +652,11 @@ cargo +nightly fuzz run parse_sdp_fmtp -- -max_total_time=60
 
 ### Benchmarks
 
-A `criterion` benchmark suite lives under `benches/`. Three targets
-cover the three layers of the codec pipeline so future optimisation
-rounds (e.g. a SIMD IDCT, a fixed-point FDCT, a precomputed CBP-
-prefix table, a faster spiral+diamond ME) have a baseline to A/B
-against:
+A `criterion` benchmark suite lives under `benches/`. Four targets
+cover the codec pipeline plus the §5.4 outer FEC layer so future
+optimisation rounds (e.g. a SIMD IDCT, a fixed-point FDCT, a
+precomputed CBP-prefix table, a faster spiral+diamond ME, a
+table-driven BCH parity) have a baseline to A/B against:
 
 * **`transform`** — single 8×8 block forward / inverse DCT. Four
   sub-scenarios (`fdct_intra` / `fdct_signed` / `idct_intra` /
@@ -673,6 +673,20 @@ against:
   + `receive_frame`. Sub-scenarios mirror the encode bench
   (`decode_qcif_intra_q8`, `decode_qcif_inter_chain_4_q8`,
   `decode_cif_intra_q8`).
+* **`bch`** — §5.4 BCH (511, 493) FEC layer. Sub-scenarios:
+  `parity18` / `syndrome18` (one 493-bit message through the
+  shift-register long-division primitives — the encoder / decoder
+  inner loop), `locate_single_error` worst-case / uncorrectable
+  (the §5.4.1 `t = 1` correction walk, fixed-cost 511-step), and
+  `encode_multiframe` / `decode_multiframe` clean +
+  one-bit-corrupted + `decode_multiframe_with_correction` on one
+  full 8-frame multiframe. Headline points on the round-233
+  baseline (release build, aarch64): `parity18` ≈ 350 ns / frame
+  (≈ 0.7 ns / data bit), `locate_single_error` ≈ 460 ns,
+  `encode_multiframe` ≈ 12 µs / multiframe, `decode_multiframe`
+  ≈ 24 µs, and the §5.4.1 correcting decode adds essentially no
+  overhead over the detection-only decode (within run-to-run
+  noise) when at most one frame in the multiframe is corrupted.
 
 Every benchmark synthesises its YUV source inline from a
 deterministic striped pattern plus low-amplitude xorshift noise
@@ -692,9 +706,11 @@ cargo bench -p oxideav-h261 -- --quick
 cargo bench -p oxideav-h261 --bench transform
 cargo bench -p oxideav-h261 --bench encode
 cargo bench -p oxideav-h261 --bench decode
+cargo bench -p oxideav-h261 --bench bch
 
 # Filter to one sub-scenario.
 cargo bench -p oxideav-h261 --bench encode -- qcif_intra
+cargo bench -p oxideav-h261 --bench bch -- parity18
 ```
 
 The bench suite is `harness = false` (criterion replaces the

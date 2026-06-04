@@ -45,3 +45,12 @@ harness = false
 [[bench]]
 name = "decode"
 harness = false
+
+# Round 233 — BCH (511, 493) §5.4 FEC layer bench. Round 230 added
+# the §5.4.1 single-bit correction path (`locate_single_error`,
+# `decode_multiframe_with_correction`); this bench gives that hot
+# path plus the existing detection-only encode/decode flow an A/B
+# baseline alongside the transform / encode / decode benches.
+[[bench]]
+name = "bch"
+harness = false

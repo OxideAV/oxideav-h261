@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Criterion bench for the §5.4 BCH (511, 493) FEC layer.** New
+  `benches/bch.rs` rounds out the round-175 `transform` / `encode` /
+  `decode` Criterion suite with the outer-coding hot path. Three
+  groups: `bch_primitives` covers `parity18` and `syndrome18` (the
+  493-bit shift-register long-division primitives, once each per
+  emitted / received §5.4.3 frame); `bch_correction` covers the
+  §5.4.1 `locate_single_error` walk on a worst-case syndrome
+  (constructed locally as `x^510 mod g(x)` so the walk takes the
+  full 511 iterations before returning `Some`) and on an
+  uncorrectable syndrome (weight ≥ 2, returns `None` after the same
+  511 iterations); `bch_multiframe` covers the integrated
+  `encode_multiframe` / `decode_multiframe` /
+  `decode_multiframe_with_correction` entry points on one full
+  8-frame §5.4.4 multiframe (clean + one-bit-corrupted variants).
+  Headline points on the round-233 baseline (release, aarch64):
+  `parity18` ≈ 350 ns / frame (≈ 0.7 ns / data bit), `syndrome18`
+  ≈ 346 ns / frame, `locate_single_error` worst-case ≈ 460 ns and
+  uncorrectable ≈ 448 ns, `encode_multiframe` ≈ 12.2 µs / multiframe,
+  `decode_multiframe` clean ≈ 24.5 µs, `decode_multiframe`
+  one-bit-corrupted ≈ 24.2 µs, and
+  `decode_multiframe_with_correction` one-bit-corrupted ≈ 24.0 µs
+  (the §5.4.1 correcting decoder adds essentially no overhead over
+  the detection-only decoder when at most one frame in the
+  multiframe is corrupted — the `locate_single_error` walk is dwarfed
+  by the per-frame syndrome work the decoder already does). All
+  inputs are synthesised in-bench from deterministic xorshift seeds;
+  no on-disk fixtures, no third-party tools, no `docs/` files are
+  read at bench time. `Cargo.toml` gains a fourth `[[bench]]` entry
+  (`bch`, `harness = false`); README's `### Benchmarks` section is
+  updated with the new target's sub-scenarios and headline numbers.
+
 - **BCH (511,493) single-bit error correction (§5.4.1, t = 1).** New
   `bch::locate_single_error` maps a non-zero 18-bit syndrome to the
   corresponding 511-bit codeword position (where `p = 0` is `Fi`,
