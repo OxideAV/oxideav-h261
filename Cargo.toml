@@ -54,3 +54,15 @@ harness = false
 [[bench]]
 name = "bch"
 harness = false
+
+# Round 238 — §4.1 / §4.2 start-code scanner bench. The bit-level
+# scanner (`find_next_start_code_bits`, `find_next_start_code`,
+# `iter_start_codes`) sits on the inner loop of every
+# `H261Decoder::send_packet`, every `rtp::packetize_gob_aligned`,
+# and the spec-mandated RFC 4587 §4 `rtp::depacketize` sanity
+# check. This bench gives the eventual SIMD pre-scan / table-driven
+# byte-aligned shortcut an A/B baseline alongside the BCH /
+# transform / encode / decode benches.
+[[bench]]
+name = "start_code"
+harness = false

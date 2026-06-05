@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Criterion bench for the §4.1 / §4.2 start-code scanner.** New
+  `benches/start_code.rs` adds a fifth Criterion bench to the
+  round-175 `transform` / `encode` / `decode` + round-233 `bch`
+  suite, covering the bit-by-bit scanner
+  (`find_next_start_code_bits`, `find_next_start_code`,
+  `iter_start_codes`) that sits on the inner loop of every
+  `H261Decoder::send_packet`, every `rtp::packetize_gob_aligned`,
+  and the spec-mandated RFC 4587 §4 `rtp::depacketize` sanity
+  check. Two groups: `h261_start_code_iter` walks one full QCIF
+  I-frame (1 PSC + 3 GBSCs), one full CIF I-frame (1 PSC + 12
+  GBSCs), and three concatenated QCIF I-frames; `h261_start_code_single`
+  covers `find_next_start_code` on the first-byte-aligned PSC
+  (best case),  `find_next_start_code_bits` starting at bit 3
+  (the §4.2 GOB-aligned packetizer's slow path when a GOB does
+  not land on a byte boundary), and `find_next_start_code` on a
+  pseudo-random 4 KiB buffer with every accidental `0x0001` window
+  flipped out (worst case — scan to end, return `None`, the cost
+  a misbehaving network endpoint can force on an RTP receiver per
+  fuzzed payload). Headline points on the round-238 baseline
+  (release, aarch64): the bit-by-bit scanner clocks ≈ 295–300 MiB/s
+  across all three full-stream walks (QCIF I-frame 15.1 µs at
+  295 MiB/s, CIF I-frame 60.2 µs at 297 MiB/s, three-QCIF 44.7 µs
+  at 300 MiB/s); a byte-aligned first-PSC hit costs ≈ 6 ns; a
+  3-bit-misaligned hit costs ≈ 18 ns; the worst-case 4 KiB no-hit
+  walk takes ≈ 13 µs (298 MiB/s). All inputs are synthesised
+  in-bench (encoder output for hit cases, xorshift + sweep-flip
+  for the no-hit case); no on-disk fixtures, no third-party tools,
+  no `docs/` files at bench time. `Cargo.toml` gains a fifth
+  `[[bench]]` entry (`start_code`, `harness = false`); the README's
+  `### Benchmarks` section is updated with the new target's
+  sub-scenarios and headline numbers. An eventual SIMD pre-scan
+  over byte-aligned `0x00 0x01` candidates plus the bit-walk on
+  the few near-hit windows is the obvious follow-up; this bench
+  gives that change its A/B baseline.
+
 - **Criterion bench for the §5.4 BCH (511, 493) FEC layer.** New
   `benches/bch.rs` rounds out the round-175 `transform` / `encode` /
   `decode` Criterion suite with the outer-coding hot path. Three

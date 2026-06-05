@@ -652,11 +652,12 @@ cargo +nightly fuzz run parse_sdp_fmtp -- -max_total_time=60
 
 ### Benchmarks
 
-A `criterion` benchmark suite lives under `benches/`. Four targets
-cover the codec pipeline plus the §5.4 outer FEC layer so future
-optimisation rounds (e.g. a SIMD IDCT, a fixed-point FDCT, a
-precomputed CBP-prefix table, a faster spiral+diamond ME, a
-table-driven BCH parity) have a baseline to A/B against:
+A `criterion` benchmark suite lives under `benches/`. Five targets
+cover the codec pipeline plus the §5.4 outer FEC layer and the
+§4.1 / §4.2 start-code scanner so future optimisation rounds (e.g.
+a SIMD IDCT, a fixed-point FDCT, a precomputed CBP-prefix table, a
+faster spiral+diamond ME, a table-driven BCH parity, a SIMD start-
+code pre-scan) have a baseline to A/B against:
 
 * **`transform`** — single 8×8 block forward / inverse DCT. Four
   sub-scenarios (`fdct_intra` / `fdct_signed` / `idct_intra` /
@@ -687,6 +688,28 @@ table-driven BCH parity) have a baseline to A/B against:
   ≈ 24 µs, and the §5.4.1 correcting decode adds essentially no
   overhead over the detection-only decode (within run-to-run
   noise) when at most one frame in the multiframe is corrupted.
+* **`start_code`** — §4.1 / §4.2 start-code scanner
+  (`find_next_start_code_bits`, `find_next_start_code`,
+  `iter_start_codes`). Inner loop of every
+  `H261Decoder::send_packet`, every `rtp::packetize_gob_aligned`,
+  and the spec-mandated RFC 4587 §4 `rtp::depacketize` sanity
+  check. Six sub-scenarios:
+  `iter_start_codes::{qcif_intra_one_frame,
+  cif_intra_one_frame, qcif_intra_three_frames}` (full
+  elementary-stream walks; expected 1 PSC + 3 / 12 / 9 GBSCs
+  respectively), `find_next_start_code::qcif_intra_first` (best
+  case — PSC at bit 0), `find_next_start_code_bits::
+  qcif_intra_misaligned_start` (the §4.2 packetizer's slow path
+  when a GOB does not land on a byte boundary), and
+  `find_next_start_code::no_start_code_in_buffer` (worst case —
+  4 KiB scanned end-to-end, no hit). Headline points on the
+  round-238 baseline (release build, aarch64): the bit-by-bit
+  scanner clocks ≈ 295–300 MiB/s across all three full-stream
+  walks; a byte-aligned hit costs ≈ 6 ns; a 3-bit misaligned hit
+  costs ≈ 18 ns; the worst-case 4 KiB no-hit walk takes ≈ 13 µs.
+  An eventual SIMD pre-scan over byte-aligned `0x00 0x01`
+  candidates plus the bit-walk on the few near-hit windows is the
+  obvious follow-up; this bench gives that change its A/B.
 
 Every benchmark synthesises its YUV source inline from a
 deterministic striped pattern plus low-amplitude xorshift noise
@@ -707,10 +730,12 @@ cargo bench -p oxideav-h261 --bench transform
 cargo bench -p oxideav-h261 --bench encode
 cargo bench -p oxideav-h261 --bench decode
 cargo bench -p oxideav-h261 --bench bch
+cargo bench -p oxideav-h261 --bench start_code
 
 # Filter to one sub-scenario.
 cargo bench -p oxideav-h261 --bench encode -- qcif_intra
 cargo bench -p oxideav-h261 --bench bch -- parity18
+cargo bench -p oxideav-h261 --bench start_code -- iter_start_codes
 ```
 
 The bench suite is `harness = false` (criterion replaces the
