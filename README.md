@@ -419,6 +419,11 @@ setup. The `a=rtpmap` line is fixed: encoding name `H261`, clock rate `90000`
 (`ENCODING_NAME` / `CLOCK_RATE`), media name `video` for the `m=` line.
 `format_rtpmap(pt)` emits it; `parse_rtpmap` reads one back and confirms it is
 H.261 (case-insensitively on the encoding name, rejecting other codecs).
+`parse_rtpmap` preserves the wire `clock_rate` verbatim so a misbehaving peer
+can be diagnosed; the typed `RtpMap::is_rfc4587_compliant` accessor reports
+whether the §6.2 MUST (clock rate `= 90000`) holds, and
+`parse_rtpmap_strict` is the single-call wrapper that returns `None` for any
+non-conformant line.
 
 The three optional `a=fmtp` parameters from §6.1.1 — `CIF`, `QCIF`, and `D` —
 are modelled by `H261FmtpParams`. `CIF` / `QCIF` carry an integer 1..=4 (the

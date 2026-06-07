@@ -485,13 +485,30 @@ pub struct RtpMap {
     pub clock_rate: u32,
 }
 
+impl RtpMap {
+    /// Whether the parsed map is RFC 4587 §6.2 compliant.
+    ///
+    /// §6.2 mandates `clock_rate == 90000` (the encoding-name and
+    /// `m=video` invariants are already enforced by [`parse_rtpmap`]). A
+    /// receiver that requires strict conformance should reject any map
+    /// for which this returns `false`. The lenient [`parse_rtpmap`]
+    /// parser preserves the wire `clock_rate` verbatim so a misbehaving
+    /// peer can be diagnosed; this accessor is the single-call
+    /// "did the peer follow §6.2?" check.
+    pub fn is_rfc4587_compliant(self) -> bool {
+        self.clock_rate == CLOCK_RATE
+    }
+}
+
 /// Parse an SDP `a=rtpmap` attribute line and confirm it describes H.261
 /// (§6.2). Accepts the line with or without the leading `a=`. Returns
 /// `None` if the line is not a well-formed H.261 rtpmap — wrong attribute,
 /// non-`H261` encoding name, or a non-numeric payload type. The encoding
 /// name match is case-insensitive (SDP attribute tokens are
 /// case-insensitive); the clock rate is reported as-parsed so a caller can
-/// reject a non-90000 value if it wants strict conformance.
+/// reject a non-90000 value if it wants strict conformance. Callers that
+/// always want strict §6.2 conformance can use [`parse_rtpmap_strict`] or
+/// [`RtpMap::is_rfc4587_compliant`] instead.
 pub fn parse_rtpmap(line: &str) -> Option<RtpMap> {
     let line = line.trim();
     let body = line.strip_prefix("a=").unwrap_or(line);
@@ -510,6 +527,21 @@ pub fn parse_rtpmap(line: &str) -> Option<RtpMap> {
         payload_type,
         clock_rate,
     })
+}
+
+/// Strict-conformance counterpart of [`parse_rtpmap`]: same parser, but
+/// also enforces the RFC 4587 §6.2 `clock_rate == 90000` MUST. Returns
+/// `None` if the line is not a well-formed H.261 rtpmap or carries any
+/// other clock rate. Use this on a receiver that wants to drop a peer
+/// whose advertised clock rate violates §6.2 without inspecting the
+/// parsed value separately.
+pub fn parse_rtpmap_strict(line: &str) -> Option<RtpMap> {
+    let m = parse_rtpmap(line)?;
+    if m.is_rfc4587_compliant() {
+        Some(m)
+    } else {
+        None
+    }
 }
 
 /// Parse an SDP `a=fmtp` attribute line whose payload type matches
@@ -588,6 +620,48 @@ mod tests {
         // valid H.261 rtpmap.
         let m = parse_rtpmap("a=rtpmap:31 H261/90000/1").unwrap();
         assert_eq!(m.clock_rate, 90_000);
+    }
+
+    #[test]
+    fn rtpmap_is_rfc4587_compliant_only_at_90000() {
+        // §6.2: "The clock rate in the `a=rtpmap` line MUST be 90000."
+        let ok = parse_rtpmap("a=rtpmap:31 H261/90000").unwrap();
+        assert!(ok.is_rfc4587_compliant());
+        // Lenient parser preserves the wire value, so callers can diagnose
+        // a non-conformant peer without losing the parsed payload type.
+        let too_low = parse_rtpmap("a=rtpmap:31 H261/8000").unwrap();
+        assert_eq!(too_low.clock_rate, 8_000);
+        assert!(!too_low.is_rfc4587_compliant());
+        let too_high = parse_rtpmap("a=rtpmap:96 H261/180000").unwrap();
+        assert_eq!(too_high.clock_rate, 180_000);
+        assert!(!too_high.is_rfc4587_compliant());
+        // RFC 2032's pre-§6.2 line happens to match the §6.2 MUST since
+        // the clock rate was already 90000 in the predecessor doc.
+        let legacy = parse_rtpmap("rtpmap:31 H261/90000").unwrap();
+        assert!(legacy.is_rfc4587_compliant());
+    }
+
+    #[test]
+    fn parse_rtpmap_strict_drops_non_compliant_clock_rate() {
+        // §6.2 MUST → strict parser returns None for any non-90000 rate.
+        assert_eq!(
+            parse_rtpmap_strict("a=rtpmap:31 H261/90000"),
+            Some(RtpMap {
+                payload_type: 31,
+                clock_rate: 90_000,
+            })
+        );
+        assert_eq!(parse_rtpmap_strict("a=rtpmap:31 H261/8000"), None);
+        assert_eq!(parse_rtpmap_strict("a=rtpmap:96 H261/45000"), None);
+        // Strict parser still rejects non-H.261 encoding names and
+        // malformed lines, inherited from `parse_rtpmap`.
+        assert_eq!(parse_rtpmap_strict("a=rtpmap:34 H263/90000"), None);
+        assert_eq!(parse_rtpmap_strict("a=fmtp:31 CIF=2"), None);
+        // Tolerates the optional third "<params>" field as long as the
+        // clock rate is the §6.2-mandated 90000.
+        let m = parse_rtpmap_strict("a=rtpmap:31 H261/90000/1").unwrap();
+        assert_eq!(m.payload_type, 31);
+        assert!(m.is_rfc4587_compliant());
     }
 
     #[test]

@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC 4587 §6.2 strict-conformance accessor for `RtpMap`.** §6.2
+  states "The clock rate in the `a=rtpmap` line MUST be 90000."
+  `parse_rtpmap` deliberately preserves the wire `clock_rate`
+  verbatim so a misbehaving peer can be diagnosed without losing the
+  parsed payload type; the typed accessor `RtpMap::is_rfc4587_compliant`
+  is the single-call check for "did the peer follow §6.2?", and the
+  new `parse_rtpmap_strict` free function combines parse +
+  conformance into one call (returns `None` for any well-formed but
+  non-90000 line, plus everything `parse_rtpmap` already rejects).
+  Two sweep tests in `src/sdp.rs` cover the §6.2 worked example
+  (`8000` and `180000` lenient-but-not-strict variants, an RFC 2032
+  rtpmap that happens to share §6.2's clock rate, the optional
+  third `<params>` field, payload-type and encoding-name rejections
+  inherited from `parse_rtpmap`); the existing fuzz target
+  `parse_sdp_fmtp` and the stable-CI `tests/fuzz_seed_corpus_sdp.rs`
+  driver now run a strict-vs-lenient oracle on every fuzz input
+  (`(Some(l), Some(s))` ⇒ `l == s` and `s.is_rfc4587_compliant()`;
+  `(Some(l), None)` ⇒ `!l.is_rfc4587_compliant()`; the
+  "strict succeeds where lenient fails" case panics) so a future
+  regression in either path trips the daily fuzz run. New seed
+  `fuzz/corpus/parse_sdp_fmtp/11_rtpmap_non_90000_clock_rate.txt`
+  carries the canonical lenient-but-not-strict input
+  (`a=rtpmap:31 H261/8000`). README's "SDP media type and
+  rtpmap/fmtp parameters" section is updated with the strict accessor.
+
 - **Criterion bench for the §4.1 / §4.2 start-code scanner.** New
   `benches/start_code.rs` adds a fifth Criterion bench to the
   round-175 `transform` / `encode` / `decode` + round-233 `bch`

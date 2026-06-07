@@ -40,7 +40,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use oxideav_h261::sdp::{negotiate_answer, parse_fmtp, parse_rtpmap, H261FmtpParams, SdpError};
+use oxideav_h261::sdp::{
+    negotiate_answer, parse_fmtp, parse_rtpmap, parse_rtpmap_strict, H261FmtpParams, SdpError,
+};
 
 fn corpus_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -54,8 +56,23 @@ fn drive(bytes: &[u8]) {
     let text = String::from_utf8_lossy(bytes);
     let s: &str = &text;
 
-    // ---- Mode A: `parse_rtpmap`. ----
-    let _ = parse_rtpmap(s);
+    // ---- Mode A: `parse_rtpmap` + `parse_rtpmap_strict`. ----
+    let lenient = parse_rtpmap(s);
+    let strict = parse_rtpmap_strict(s);
+    // §6.2 contract: a strict parse implies a lenient parse with a
+    // §6.2-compliant clock rate; a lenient parse with a non-compliant
+    // clock rate implies the strict parse returned `None`. Verify both
+    // directions on every fuzz input so a future regression in either
+    // path trips this oracle.
+    match (lenient, strict) {
+        (Some(l), Some(s2)) => {
+            assert_eq!(l, s2);
+            assert!(s2.is_rfc4587_compliant());
+        }
+        (Some(l), None) => assert!(!l.is_rfc4587_compliant()),
+        (None, Some(_)) => panic!("strict parse must not succeed where lenient parse fails"),
+        (None, None) => {}
+    }
 
     // ---- Mode B: `parse_fmtp` with a fuzzer-chosen payload type. ----
     let expected_pt = bytes.first().copied().unwrap_or(0);

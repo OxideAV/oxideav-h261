@@ -66,7 +66,9 @@
 //! regardless of how hostile the attacker's bytes are.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_h261::sdp::{negotiate_answer, parse_fmtp, parse_rtpmap, H261FmtpParams};
+use oxideav_h261::sdp::{
+    negotiate_answer, parse_fmtp, parse_rtpmap, parse_rtpmap_strict, H261FmtpParams,
+};
 
 fuzz_target!(|data: &[u8]| {
     // SDP is line-oriented text. The production parsers consume `&str`;
@@ -78,15 +80,28 @@ fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data);
     let s: &str = &text;
 
-    // ---- Mode A: `parse_rtpmap` against attacker-controlled text. ----
+    // ---- Mode A: `parse_rtpmap` + `parse_rtpmap_strict` oracle. ----
     //
     // The vast majority of random strings fail the `rtpmap:` prefix
     // check and short-circuit out as `None`. The strings that pass
     // exercise the payload-type integer parse (must reject `> 255`),
     // the encoding-name match (must reject non-`H261`
     // case-insensitively), and the clock-rate integer parse (must
-    // reject `> u32::MAX`).
-    let _ = parse_rtpmap(s);
+    // reject `> u32::MAX`). The §6.2 strict variant additionally
+    // enforces `clock_rate == 90000`; we check both parsers and assert
+    // the strict ⇔ lenient + §6.2 invariant on every input so a future
+    // divergence between the two paths trips the fuzz loop.
+    let lenient = parse_rtpmap(s);
+    let strict = parse_rtpmap_strict(s);
+    match (lenient, strict) {
+        (Some(l), Some(s2)) => {
+            assert_eq!(l, s2);
+            assert!(s2.is_rfc4587_compliant());
+        }
+        (Some(l), None) => assert!(!l.is_rfc4587_compliant()),
+        (None, Some(_)) => panic!("strict parse must not succeed where lenient parse fails"),
+        (None, None) => {}
+    }
 
     // ---- Mode B: `parse_fmtp` with a fuzzer-chosen payload type. ----
     //
