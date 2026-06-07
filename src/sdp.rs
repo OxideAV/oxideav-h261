@@ -274,6 +274,72 @@ impl H261FmtpParams {
         parts.join(";")
     }
 
+    /// The literal §6.2.1 "Parameters offered first are the most preferred
+    /// picture mode to be received" order observed in a raw `a=fmtp` value.
+    ///
+    /// [`parse_value`](Self::parse_value) discards token order — it stores
+    /// `cif` and `qcif` as independent `Option<u8>` fields — and
+    /// [`preferred_picture_size`](Self::preferred_picture_size) uses the
+    /// structural CIF-over-QCIF rule of [`format_value`](Self::format_value).
+    /// Neither captures a peer that advertises `QCIF=…;CIF=…` (QCIF first ⇒
+    /// QCIF is the preferred mode). This helper walks the same token list
+    /// `parse_value` does and returns each picture-size advertisement in the
+    /// order seen, with no validation: it skips unknown / malformed / Annex-D
+    /// tokens, ignores MPI range, and deduplicates so a repeated `CIF` or
+    /// `QCIF` token is reported only the first time it appears.
+    ///
+    /// Returns an empty slice when neither `CIF` nor `QCIF` is present
+    /// (the §6.2.1 RFC 2032 fallback case). Returns one entry when only one
+    /// picture size is advertised; up to two entries otherwise, ordered as
+    /// written. The first entry, if any, is the peer's preferred mode per
+    /// §6.2.1's "offered first" rule.
+    ///
+    /// ```
+    /// use oxideav_h261::picture::SourceFormat;
+    /// use oxideav_h261::sdp::H261FmtpParams;
+    /// // Spec worked example: CIF preferred over QCIF.
+    /// assert_eq!(
+    ///     H261FmtpParams::parse_preference_order("CIF=2;QCIF=1;D=1"),
+    ///     vec![SourceFormat::Cif, SourceFormat::Qcif],
+    /// );
+    /// // Peer prefers QCIF: `QCIF=1;CIF=2` ⇒ QCIF leads the preference list.
+    /// assert_eq!(
+    ///     H261FmtpParams::parse_preference_order("QCIF=1;CIF=2"),
+    ///     vec![SourceFormat::Qcif, SourceFormat::Cif],
+    /// );
+    /// // RFC 2032 fallback case ⇒ empty list (callers apply the QCIF=1
+    /// // default themselves).
+    /// assert!(H261FmtpParams::parse_preference_order("D=1").is_empty());
+    /// ```
+    pub fn parse_preference_order(s: &str) -> Vec<SourceFormat> {
+        let mut order: Vec<SourceFormat> = Vec::new();
+        let mut seen_cif = false;
+        let mut seen_qcif = false;
+        for raw in s.split(';') {
+            let token = raw.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let Some((key, _value)) = token.split_once('=') else {
+                continue;
+            };
+            // SDP attribute token names are case-insensitive; §6.1.1 spells
+            // CIF / QCIF in uppercase.
+            match key.trim().to_ascii_uppercase().as_str() {
+                "CIF" if !seen_cif => {
+                    seen_cif = true;
+                    order.push(SourceFormat::Cif);
+                }
+                "QCIF" if !seen_qcif => {
+                    seen_qcif = true;
+                    order.push(SourceFormat::Qcif);
+                }
+                _ => {}
+            }
+        }
+        order
+    }
+
     /// Parse the bare `a=fmtp` parameter string back into typed params.
     ///
     /// Accepts a semicolon-separated list of `key=value` tokens
@@ -1196,6 +1262,144 @@ mod tests {
         assert_eq!((num_cif, den_cif), (2997, 200));
         let (num_q, den_q) = ans.max_frame_rate(SourceFormat::Qcif).unwrap();
         assert_eq!((num_q, den_q), (2997, 400));
+    }
+
+    #[test]
+    fn parse_preference_order_spec_worked_example() {
+        // §6.2.1 worked example "CIF=2;QCIF=1;D=1" advertises CIF first ⇒
+        // CIF is the most preferred picture mode to be received.
+        assert_eq!(
+            H261FmtpParams::parse_preference_order("CIF=2;QCIF=1;D=1"),
+            vec![SourceFormat::Cif, SourceFormat::Qcif],
+        );
+    }
+
+    #[test]
+    fn parse_preference_order_qcif_first() {
+        // A peer that emits QCIF before CIF prefers QCIF — the structural
+        // CIF-over-QCIF rule of `preferred_picture_size` would mis-report.
+        assert_eq!(
+            H261FmtpParams::parse_preference_order("QCIF=1;CIF=2"),
+            vec![SourceFormat::Qcif, SourceFormat::Cif],
+        );
+        assert_eq!(
+            H261FmtpParams::parse_preference_order("QCIF=1;CIF=2;D=1"),
+            vec![SourceFormat::Qcif, SourceFormat::Cif],
+        );
+    }
+
+    #[test]
+    fn parse_preference_order_single_size() {
+        assert_eq!(
+            H261FmtpParams::parse_preference_order("CIF=2"),
+            vec![SourceFormat::Cif],
+        );
+        assert_eq!(
+            H261FmtpParams::parse_preference_order("QCIF=1"),
+            vec![SourceFormat::Qcif],
+        );
+        // Annex D and unknown parameters interleaved with the picture size
+        // don't affect the picture-size order.
+        assert_eq!(
+            H261FmtpParams::parse_preference_order("D=1;CIF=2;MAXBR=256"),
+            vec![SourceFormat::Cif],
+        );
+    }
+
+    #[test]
+    fn parse_preference_order_no_picture_size_is_empty() {
+        // §6.2.1 RFC 2032 fallback case ⇒ no picture-size token ⇒ empty
+        // list; the caller is responsible for substituting the QCIF=1
+        // default if it wants the §6.2.1 fallback applied.
+        assert!(H261FmtpParams::parse_preference_order("").is_empty());
+        assert!(H261FmtpParams::parse_preference_order("D=1").is_empty());
+        assert!(H261FmtpParams::parse_preference_order("D=0;MAXBR=256").is_empty());
+    }
+
+    #[test]
+    fn parse_preference_order_is_case_insensitive() {
+        // SDP attribute token names are case-insensitive.
+        assert_eq!(
+            H261FmtpParams::parse_preference_order("qcif=1;cif=2"),
+            vec![SourceFormat::Qcif, SourceFormat::Cif],
+        );
+        assert_eq!(
+            H261FmtpParams::parse_preference_order("Cif=2;Qcif=1"),
+            vec![SourceFormat::Cif, SourceFormat::Qcif],
+        );
+    }
+
+    #[test]
+    fn parse_preference_order_tolerates_whitespace_and_empty_tokens() {
+        assert_eq!(
+            H261FmtpParams::parse_preference_order(" CIF = 2 ; QCIF=1 "),
+            vec![SourceFormat::Cif, SourceFormat::Qcif],
+        );
+        // Leading / trailing / double semicolons are ignored — same as
+        // `parse_value`.
+        assert_eq!(
+            H261FmtpParams::parse_preference_order(";CIF=2;;QCIF=1;"),
+            vec![SourceFormat::Cif, SourceFormat::Qcif],
+        );
+    }
+
+    #[test]
+    fn parse_preference_order_dedupes_repeated_tokens() {
+        // A duplicate CIF / QCIF only contributes once — the first
+        // occurrence sets the preferred-order position. (parse_value
+        // rejects the duplicate as malformed; this helper is lenient
+        // because its purpose is to mine wire-order from a possibly-
+        // malformed offer.)
+        assert_eq!(
+            H261FmtpParams::parse_preference_order("CIF=2;CIF=3;QCIF=1"),
+            vec![SourceFormat::Cif, SourceFormat::Qcif],
+        );
+        assert_eq!(
+            H261FmtpParams::parse_preference_order("QCIF=1;CIF=2;QCIF=3"),
+            vec![SourceFormat::Qcif, SourceFormat::Cif],
+        );
+    }
+
+    #[test]
+    fn parse_preference_order_skips_malformed_tokens() {
+        // Missing '=' / unknown keys / out-of-range MPIs are all ignored
+        // here — by design — so the caller can inspect a malformed offer's
+        // preference order without parse_value rejecting it.
+        //
+        // `"CIF;QCIF=9;CIF=2"` ⇒ the bare `CIF` token is skipped (no `=`),
+        // `QCIF=9` is kept first (range is ignored here), then `CIF=2`.
+        assert_eq!(
+            H261FmtpParams::parse_preference_order("CIF;QCIF=9;CIF=2"),
+            vec![SourceFormat::Qcif, SourceFormat::Cif],
+        );
+        // Bare `QCIF` and out-of-range `CIF=9` survive: CIF wins because
+        // it has an `=` and is encountered first.
+        assert_eq!(
+            H261FmtpParams::parse_preference_order("QCIF;CIF=9;QCIF=1"),
+            vec![SourceFormat::Cif, SourceFormat::Qcif],
+        );
+    }
+
+    #[test]
+    fn parse_preference_order_agrees_with_parse_value_on_spec_example() {
+        // For the §6.2.1 worked example, the first entry of the preference
+        // order matches `preferred_picture_size` (both say CIF).
+        let p = H261FmtpParams::parse_value("CIF=2;QCIF=1;D=1").unwrap();
+        let order = H261FmtpParams::parse_preference_order("CIF=2;QCIF=1;D=1");
+        assert_eq!(p.preferred_picture_size(), order.first().copied());
+    }
+
+    #[test]
+    fn parse_preference_order_diverges_from_preferred_picture_size_on_qcif_first() {
+        // The structural accessor returns CIF when both are present; the
+        // wire-order helper honours the §6.2.1 "offered first" rule.
+        let value = "QCIF=1;CIF=2;D=1";
+        let p = H261FmtpParams::parse_value(value).unwrap();
+        let order = H261FmtpParams::parse_preference_order(value);
+        // Structural: CIF wins because it's advertised at all.
+        assert_eq!(p.preferred_picture_size(), Some(SourceFormat::Cif));
+        // Wire-order: QCIF wins because it's first in the offer.
+        assert_eq!(order.first().copied(), Some(SourceFormat::Qcif));
     }
 
     #[test]

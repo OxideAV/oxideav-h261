@@ -150,5 +150,26 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(params) = H261FmtpParams::parse_value(s) {
         let formatted = params.format_value();
         let _ = H261FmtpParams::parse_value(&formatted);
+
+        // ---- Mode F: §6.2.1 preference-order oracle. ----
+        //
+        // `parse_preference_order` is lenient by design (it skips
+        // malformed tokens so a caller can mine wire-order from a
+        // possibly-malformed offer), so we only oracle it when the
+        // input was already well-formed enough for `parse_value` to
+        // succeed. In that case the **set** of picture sizes reported
+        // by the order helper must equal the set of `Some(_)` picture
+        // size fields on `params` — both walkers see the same tokens.
+        let order = H261FmtpParams::parse_preference_order(s);
+        let order_has_cif = order.iter().any(|f| {
+            matches!(f, oxideav_h261::picture::SourceFormat::Cif)
+        });
+        let order_has_qcif = order.iter().any(|f| {
+            matches!(f, oxideav_h261::picture::SourceFormat::Qcif)
+        });
+        assert_eq!(order_has_cif, params.cif.is_some());
+        assert_eq!(order_has_qcif, params.qcif.is_some());
+        // No duplicates: at most one CIF and at most one QCIF entry.
+        assert!(order.len() <= 2);
     }
 });

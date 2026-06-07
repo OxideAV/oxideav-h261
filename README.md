@@ -457,8 +457,13 @@ assert_eq!(offered.max_frame_rate(SourceFormat::Cif), Some((2997, 200)));
 The §6.2.1 offer/answer helpers round out the module: `validate` enforces
 "SHALL specify at least one supported picture size", `rfc2032_fallback` returns
 the §6.2.1 default (QCIF at MPI=1) assumed for a peer that sends no picture-size
-parameter, `preferred_picture_size` returns the §6.2.1 "Parameters offered first
-are the most preferred" mode (CIF when advertised, else QCIF), and `max_frame_rate`
+parameter, `preferred_picture_size` returns the structural "CIF when advertised,
+else QCIF" mode (the order `format_value` emits), and
+`H261FmtpParams::parse_preference_order` returns the literal §6.2.1
+"Parameters offered first are the most preferred picture mode to be received"
+order observed in a raw `a=fmtp` value — so a peer that emits `QCIF=1;CIF=2`
+is recognised as QCIF-preferring even though the typed `H261FmtpParams` view
+loses token order. `max_frame_rate`
 / `mpi` / `supports` read out the advertised capability per `SourceFormat`. The
 free function `negotiate_answer(offer, our_capability)` computes the §6.2.1
 **answer** by intersecting both peers' picture sizes, taking `max(offer.MPI,

@@ -94,6 +94,24 @@ fn drive(bytes: &[u8]) {
     if let Ok(params) = H261FmtpParams::parse_value(s) {
         let formatted = params.format_value();
         let _ = H261FmtpParams::parse_value(&formatted);
+
+        // ---- Mode F: §6.2.1 preference-order oracle. ----
+        //
+        // When the input is well-formed enough for `parse_value` to
+        // succeed, the **set** of picture sizes reported by
+        // `parse_preference_order` must equal the set of `Some(_)`
+        // picture-size fields on `params` — both walkers see the
+        // same tokens.
+        let order = H261FmtpParams::parse_preference_order(s);
+        let order_has_cif = order
+            .iter()
+            .any(|f| matches!(f, oxideav_h261::picture::SourceFormat::Cif));
+        let order_has_qcif = order
+            .iter()
+            .any(|f| matches!(f, oxideav_h261::picture::SourceFormat::Qcif));
+        assert_eq!(order_has_cif, params.cif.is_some());
+        assert_eq!(order_has_qcif, params.qcif.is_some());
+        assert!(order.len() <= 2);
     }
 }
 
@@ -313,6 +331,25 @@ fn negotiate_annex_d_requires_both_sides() {
     assert_eq!(answer.d, None);
     let answer = negotiate_answer(&with_d, &with_d).expect("picture size intersects");
     assert_eq!(answer.d, Some(true));
+}
+
+#[test]
+fn preference_order_honours_wire_order() {
+    // RFC 4587 §6.2.1: "Parameters offered first are the most preferred
+    // picture mode to be received." The wire-order helper must therefore
+    // report the §6.2.1 worked example as `[CIF, QCIF]` (CIF preferred)
+    // and a QCIF-first offer as `[QCIF, CIF]` (QCIF preferred) — the
+    // structural `preferred_picture_size` accessor cannot distinguish
+    // those two cases.
+    use oxideav_h261::picture::SourceFormat;
+    assert_eq!(
+        H261FmtpParams::parse_preference_order("CIF=2;QCIF=1;D=1"),
+        vec![SourceFormat::Cif, SourceFormat::Qcif],
+    );
+    assert_eq!(
+        H261FmtpParams::parse_preference_order("QCIF=1;CIF=2;D=1"),
+        vec![SourceFormat::Qcif, SourceFormat::Cif],
+    );
 }
 
 #[test]

@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC 4587 §6.2.1 wire-order preference accessor for `a=fmtp`.**
+  §6.2.1 says "Parameters offered first are the most preferred picture
+  mode to be received", and the spec's worked example
+  `a=fmtp:31 CIF=2;QCIF=1;D=1` advertises CIF first ⇒ CIF is the
+  preferred mode. The existing structural `preferred_picture_size`
+  accessor cannot distinguish that case from a peer that emits
+  `QCIF=1;CIF=2` (QCIF preferred) because `H261FmtpParams` stores
+  `cif` and `qcif` as independent `Option<u8>` fields and discards
+  token order. The new `H261FmtpParams::parse_preference_order(&str)`
+  helper walks the same `;`-separated token list `parse_value` does
+  and returns `Vec<SourceFormat>` in wire order (skipping unknown /
+  malformed / Annex-D tokens, deduplicating, and ignoring MPI range
+  so the helper can mine wire-order from a possibly-malformed offer).
+  The first entry, if any, is the peer's preferred mode per §6.2.1's
+  "offered first" rule. New unit tests in `src/sdp.rs` cover the §6.2.1
+  worked example, the QCIF-first variant, single-size advertisements,
+  the RFC 2032 fallback (empty list ⇒ caller substitutes QCIF=1),
+  case-insensitive parameter names, whitespace tolerance, deduplication,
+  malformed-token skipping, and the divergence from
+  `preferred_picture_size` on a QCIF-first input. The existing fuzz
+  target `parse_sdp_fmtp` and the stable-CI `tests/fuzz_seed_corpus_sdp.rs`
+  driver gain a Mode F oracle: whenever `parse_value` succeeds, the
+  **set** of picture sizes reported by `parse_preference_order` must
+  equal the set of `Some(_)` picture-size fields on the parsed params
+  (the two walkers see the same tokens), and the order list never
+  exceeds two entries. New seed
+  `fuzz/corpus/parse_sdp_fmtp/12_fmtp_qcif_preferred_first.txt`
+  carries the canonical QCIF-first wire-order input. README's
+  SDP-media-type section is updated with the wire-order accessor.
+
 - **RFC 4587 §6.2 strict-conformance accessor for `RtpMap`.** §6.2
   states "The clock rate in the `a=rtpmap` line MUST be 90000."
   `parse_rtpmap` deliberately preserves the wire `clock_rate`
