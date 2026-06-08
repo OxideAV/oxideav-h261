@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC 4587 §6.2.1 strict-conformance `a=fmtp` parser.** §6.2.1
+  states "Implementations following this specification SHALL specify
+  at least one supported picture size." The lenient `parse_fmtp`
+  deliberately preserves a well-formed-but-§6.2.1-violating line
+  (e.g. `a=fmtp:31 D=1`) so a caller that wants to recover the
+  parsed `D` value from a slightly-non-conformant peer can still see
+  what the wire said; the new `parse_fmtp_strict(line, payload_type)`
+  free function chains lenient parse + `H261FmtpParams::validate()`
+  so an SDP front end that wants to drop a §6.2.1-violating offer
+  can do so with one call. Mirrors the existing `parse_rtpmap` /
+  `parse_rtpmap_strict` pair on the `a=rtpmap` side of §6.2:
+  malformed parameter lists still surface as `Some(Err(SdpError::…))`
+  (the §6.2.1 picture-size check runs only after a successful parse)
+  so typed error propagation is preserved on the strict path; the
+  §6.2.1 RFC-2032 fallback (assume QCIF=1) is **not** silently
+  applied during strict validation because that fallback is a
+  negotiation rule, not an advertisement-validation rule (callers
+  that want it combine `parse_fmtp` with
+  `H261FmtpParams::rfc2032_fallback()` themselves). Eight new unit
+  tests in `src/sdp.rs` cover the §6.2.1 worked example (strict ==
+  lenient), the empty-parameter-list rejection, the `D=1`-only
+  rejection, malformed-token error propagation, payload-type
+  mismatch, QCIF-only / CIF-only acceptance, "no fallback applied"
+  documentation, and a cross-cutting strict-implies-lenient sweep
+  on five §6.2.1-compliant lines. The existing fuzz target
+  `parse_sdp_fmtp` and the stable-CI `tests/fuzz_seed_corpus_sdp.rs`
+  driver gain a Mode B oracle: every fuzz input is run through both
+  `parse_fmtp` and `parse_fmtp_strict`, asserting `(Some(Ok(l)),
+  Some(Ok(s)))` ⇒ `l == s` and `s.validate().is_ok()`; `(Some(Ok(l)),
+  None)` ⇒ `l.validate() == Err(NoPictureSize)`; `(Some(Err(le)),
+  Some(Err(se)))` ⇒ `le == se`; and the four impossible
+  combinations panic (strict succeeding where lenient fails, strict
+  dropping a parse error, or the two paths disagreeing on Ok/Err).
+  New seed
+  `fuzz/corpus/parse_sdp_fmtp/13_fmtp_no_picture_size_strict_rejects.txt`
+  carries the canonical "lenient accepts / strict rejects"
+  `a=fmtp:31 D=1` input. README's SDP-media-type section is updated
+  with the strict-parser accessor.
+
 - **RFC 4587 §6.2.1 wire-order preference accessor for `a=fmtp`.**
   §6.2.1 says "Parameters offered first are the most preferred picture
   mode to be received", and the spec's worked example

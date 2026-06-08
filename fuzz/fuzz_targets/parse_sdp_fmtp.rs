@@ -31,15 +31,20 @@
 //! tolerates leading whitespace and an optional `a=` prefix, and
 //! must never panic on a malformed line.
 //!
-//! Mode B — **`parse_fmtp`** — drive the SDP `a=fmtp` line parser
-//! against arbitrary text plus a fuzzer-chosen payload type. The
-//! parser returns `None` if the line is not an `fmtp` attribute or
-//! its embedded payload type does not match; otherwise it delegates
-//! to `H261FmtpParams::parse_value` which walks the
-//! semicolon-separated `key=value` list, enforcing the §6.1.1
-//! ranges (CIF/QCIF MPI ∈ 1..=4, `D` ∈ {0, 1}), the §6.1.1
-//! duplicate-parameter rule, and the §6.1.1 forward-compatible
-//! "ignore unknown parameter" behaviour.
+//! Mode B — **`parse_fmtp`** + **`parse_fmtp_strict`** — drive the
+//! SDP `a=fmtp` line parser against arbitrary text plus a
+//! fuzzer-chosen payload type. The lenient parser returns `None` if
+//! the line is not an `fmtp` attribute or its embedded payload type
+//! does not match; otherwise it delegates to
+//! `H261FmtpParams::parse_value` which walks the semicolon-separated
+//! `key=value` list, enforcing the §6.1.1 ranges (CIF/QCIF MPI
+//! ∈ 1..=4, `D` ∈ {0, 1}), the §6.1.1 duplicate-parameter rule, and
+//! the §6.1.1 forward-compatible "ignore unknown parameter"
+//! behaviour. The §6.2.1 strict variant additionally enforces
+//! "Implementations following this specification SHALL specify at
+//! least one supported picture size"; we check both parsers and
+//! assert the strict ⇔ lenient + §6.2.1 invariant on every input so
+//! a future divergence between the two paths trips the fuzz loop.
 //!
 //! Mode C — **`H261FmtpParams::parse_value`** — feed the fuzz
 //! string straight at the bare parameter-list parser so the
@@ -58,7 +63,7 @@
 //! `(Some(true), Some(true)) ⇒ Some(true)` Annex-D rule, and the
 //! `NoPictureSize` rejection on a disjoint advertisement.
 //!
-//! The contract under test is uniform across all four modes:
+//! The contract under test is uniform across all modes:
 //! every parser call must *return* — a malformed input yields
 //! `None` / `Err(SdpError::…)`; a well-formed input yields
 //! `Some(…)` / `Ok(…)`. No path may panic, abort, integer-overflow
@@ -67,7 +72,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_h261::sdp::{
-    negotiate_answer, parse_fmtp, parse_rtpmap, parse_rtpmap_strict, H261FmtpParams,
+    negotiate_answer, parse_fmtp, parse_fmtp_strict, parse_rtpmap, parse_rtpmap_strict,
+    H261FmtpParams, SdpError,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -103,13 +109,41 @@ fuzz_target!(|data: &[u8]| {
         (None, None) => {}
     }
 
-    // ---- Mode B: `parse_fmtp` with a fuzzer-chosen payload type. ----
+    // ---- Mode B: `parse_fmtp` + `parse_fmtp_strict` oracle. ----
     //
     // The first byte of the fuzz input selects the expected payload
     // type modulo 256 so we hit both the "PT matches" and "PT
     // mismatches" branches. (An empty input falls back to PT=0.)
+    // §6.2.1 contract on the strict path: a strict success implies a
+    // lenient success with **equal** parsed params AND a passing
+    // `validate()`; a lenient success that fails `validate()` (no
+    // CIF/QCIF) implies the strict variant returned `None`; a parse
+    // error propagates byte-for-byte through both paths. We check all
+    // directions on every fuzz input so a future regression in either
+    // parser trips the fuzz loop.
     let expected_pt = data.first().copied().unwrap_or(0);
-    let _ = parse_fmtp(s, expected_pt);
+    let lenient_fmtp = parse_fmtp(s, expected_pt);
+    let strict_fmtp = parse_fmtp_strict(s, expected_pt);
+    match (&lenient_fmtp, &strict_fmtp) {
+        (Some(Ok(l)), Some(Ok(s2))) => {
+            assert_eq!(l, s2);
+            assert!(s2.validate().is_ok());
+        }
+        (Some(Ok(l)), None) => {
+            assert!(matches!(l.validate(), Err(SdpError::NoPictureSize)));
+        }
+        (Some(Err(le)), Some(Err(se))) => assert_eq!(le, se),
+        (None, None) => {}
+        (Some(Err(_)), None) => {
+            panic!("strict must propagate parse errors as Some(Err(_))");
+        }
+        (None, Some(_)) => {
+            panic!("strict must not succeed where lenient parse fails");
+        }
+        (Some(Ok(_)), Some(Err(_))) | (Some(Err(_)), Some(Ok(_))) => {
+            panic!("strict / lenient parse disagree on Ok/Err");
+        }
+    }
 
     // ---- Mode C: `H261FmtpParams::parse_value` against raw text. ----
     //
@@ -161,12 +195,12 @@ fuzz_target!(|data: &[u8]| {
         // by the order helper must equal the set of `Some(_)` picture
         // size fields on `params` — both walkers see the same tokens.
         let order = H261FmtpParams::parse_preference_order(s);
-        let order_has_cif = order.iter().any(|f| {
-            matches!(f, oxideav_h261::picture::SourceFormat::Cif)
-        });
-        let order_has_qcif = order.iter().any(|f| {
-            matches!(f, oxideav_h261::picture::SourceFormat::Qcif)
-        });
+        let order_has_cif = order
+            .iter()
+            .any(|f| matches!(f, oxideav_h261::picture::SourceFormat::Cif));
+        let order_has_qcif = order
+            .iter()
+            .any(|f| matches!(f, oxideav_h261::picture::SourceFormat::Qcif));
         assert_eq!(order_has_cif, params.cif.is_some());
         assert_eq!(order_has_qcif, params.qcif.is_some());
         // No duplicates: at most one CIF and at most one QCIF entry.

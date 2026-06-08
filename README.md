@@ -435,7 +435,13 @@ signals H.261 Annex D still-image support (`1` = yes, `0`/absent = no).
 includes the line only "if any"). `parse_value` / `parse_fmtp` reverse it,
 enforcing the 1..=4 MPI range and the `D ∈ {0,1}` rule, tolerating whitespace,
 matching parameter names case-insensitively, and skipping unknown parameters
-forward-compatibly.
+forward-compatibly. `parse_fmtp_strict` is the §6.2.1 single-call wrapper:
+it returns `None` for any well-formed line that violates the §6.2.1 "SHALL
+specify at least one supported picture size" MUST (so a `D`-only or empty
+parameter list is dropped cleanly), while preserving the typed
+`Some(Err(SdpError::…))` propagation on a malformed list so the caller still
+sees why the parse failed. Mirrors the `parse_rtpmap` / `parse_rtpmap_strict`
+pair on the `a=rtpmap` side of §6.2.
 
 ```rust
 use oxideav_h261::picture::SourceFormat;

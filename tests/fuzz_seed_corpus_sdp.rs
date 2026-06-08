@@ -41,7 +41,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_h261::sdp::{
-    negotiate_answer, parse_fmtp, parse_rtpmap, parse_rtpmap_strict, H261FmtpParams, SdpError,
+    negotiate_answer, parse_fmtp, parse_fmtp_strict, parse_rtpmap, parse_rtpmap_strict,
+    H261FmtpParams, SdpError,
 };
 
 fn corpus_dir() -> PathBuf {
@@ -74,9 +75,41 @@ fn drive(bytes: &[u8]) {
         (None, None) => {}
     }
 
-    // ---- Mode B: `parse_fmtp` with a fuzzer-chosen payload type. ----
+    // ---- Mode B: `parse_fmtp` + `parse_fmtp_strict` oracle. ----
+    //
+    // §6.2.1 contract on the strict path: a strict success implies a
+    // lenient success with **equal** parsed params AND a passing
+    // `validate()`; a lenient success that fails `validate()` (no
+    // CIF/QCIF) implies the strict variant returned `None`; a strict
+    // path may never produce a value the lenient path would reject as
+    // malformed (the `Err` arm must agree byte-for-byte). Verify all
+    // three directions on every fuzz input so a future regression in
+    // either parser trips this oracle.
     let expected_pt = bytes.first().copied().unwrap_or(0);
-    let _ = parse_fmtp(s, expected_pt);
+    let lenient_fmtp = parse_fmtp(s, expected_pt);
+    let strict_fmtp = parse_fmtp_strict(s, expected_pt);
+    match (&lenient_fmtp, &strict_fmtp) {
+        (Some(Ok(l)), Some(Ok(s2))) => {
+            assert_eq!(l, s2);
+            assert!(s2.validate().is_ok());
+        }
+        (Some(Ok(l)), None) => {
+            // Strict drops the §6.2.1-violating line — lenient must
+            // have observed no picture size.
+            assert!(matches!(l.validate(), Err(SdpError::NoPictureSize)));
+        }
+        (Some(Err(le)), Some(Err(se))) => assert_eq!(le, se),
+        (None, None) => {}
+        (Some(Err(_)), None) => {
+            panic!("strict must propagate parse errors as Some(Err(_))");
+        }
+        (None, Some(_)) => {
+            panic!("strict must not succeed where lenient parse fails");
+        }
+        (Some(Ok(_)), Some(Err(_))) | (Some(Err(_)), Some(Ok(_))) => {
+            panic!("strict / lenient parse disagree on Ok/Err");
+        }
+    }
 
     // ---- Mode C: `H261FmtpParams::parse_value` standalone. ----
     let _ = H261FmtpParams::parse_value(s);
@@ -350,6 +383,31 @@ fn preference_order_honours_wire_order() {
         H261FmtpParams::parse_preference_order("QCIF=1;CIF=2;D=1"),
         vec![SourceFormat::Qcif, SourceFormat::Cif],
     );
+}
+
+#[test]
+fn parse_fmtp_strict_rejects_no_picture_size_advertisement() {
+    // RFC 4587 §6.2.1: "Implementations following this specification
+    // SHALL specify at least one supported picture size." `parse_fmtp`
+    // accepts `a=fmtp:31 D=1` (the forward-compatible lenient parser
+    // preserves the `D` field for diagnostic recovery);
+    // `parse_fmtp_strict` MUST drop it as `None` so an SDP front end
+    // can refuse a §6.2.1-violating peer with one call.
+    let lenient = parse_fmtp("a=fmtp:31 D=1", 31).unwrap().unwrap();
+    assert!(matches!(lenient.validate(), Err(SdpError::NoPictureSize)));
+    assert!(parse_fmtp_strict("a=fmtp:31 D=1", 31).is_none());
+    // Lenient also returns `Ok(default)` for an empty parameter list;
+    // strict drops that too.
+    assert!(parse_fmtp_strict("a=fmtp:31 ", 31).is_none());
+    // A malformed parameter list propagates as `Some(Err(_))` through
+    // strict exactly like through lenient — the §6.2.1 picture-size
+    // check runs only after a successful parse, so a typed
+    // `SdpError::MalformedToken` is preserved for the caller.
+    let strict_err = parse_fmtp_strict("a=fmtp:31 CIF", 31);
+    assert!(matches!(
+        strict_err,
+        Some(Err(SdpError::MalformedToken { .. }))
+    ));
 }
 
 #[test]

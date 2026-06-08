@@ -93,8 +93,7 @@ fuzz_target!(|data: &[u8]| {
     let mut sb = [0u8; 3];
     let take = core::cmp::min(data.len(), sb.len());
     sb[..take].copy_from_slice(&data[..take]);
-    let synd =
-        (((sb[0] as u32) << 16) | ((sb[1] as u32) << 8) | (sb[2] as u32)) & 0x3_FFFF;
+    let synd = (((sb[0] as u32) << 16) | ((sb[1] as u32) << 8) | (sb[2] as u32)) & 0x3_FFFF;
     let _ = locate_single_error(synd);
 
     // `parity18` requires at least 62 bytes (493 bits) of input. The

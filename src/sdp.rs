@@ -627,6 +627,47 @@ pub fn parse_fmtp(line: &str, payload_type: u8) -> Option<Result<H261FmtpParams,
     Some(H261FmtpParams::parse_value(value.trim()))
 }
 
+/// Strict-conformance counterpart of [`parse_fmtp`]: same parser, but
+/// additionally enforces the RFC 4587 §6.2.1 invariant
+/// "Implementations following this specification SHALL specify at
+/// least one supported picture size."
+///
+/// The lenient [`parse_fmtp`] deliberately accepts a well-formed
+/// parameter list with neither `CIF` nor `QCIF` so a caller that wants
+/// to recover the parsed `D` value (or any future forward-compatible
+/// parameter) from a slightly-non-conformant peer can still see what
+/// the wire said; the typed
+/// [`H261FmtpParams::validate`](H261FmtpParams::validate) accessor is
+/// the single-call "did the peer follow §6.2.1?" check. This strict
+/// variant chains lenient parse + validate so an SDP front end that
+/// wants to drop a §6.2.1-violating offer without inspecting the
+/// parsed value separately can do so with one call. Mirrors the
+/// [`parse_rtpmap`] / [`parse_rtpmap_strict`] pair on the `a=rtpmap`
+/// side of §6.2.
+///
+/// Returns `None` if the line is not an `a=fmtp` attribute, its
+/// payload type does not match `payload_type`, or no picture-size
+/// parameter is advertised; returns `Some(Err(…))` if the parameter
+/// list is malformed (delegated to [`H261FmtpParams::parse_value`]);
+/// returns `Some(Ok(params))` only on a §6.2.1-compliant line.
+///
+/// The §6.2.1 RFC-2032 fallback ("if no picture size is specified,
+/// assume QCIF=1") is **not** silently applied here — that fallback
+/// is an interpretation rule for negotiation
+/// ([`negotiate_answer`]), not for validating an explicit
+/// advertisement. A peer that wants the fallback semantics can call
+/// [`parse_fmtp`] then [`H261FmtpParams::rfc2032_fallback`] on the
+/// empty case explicitly.
+pub fn parse_fmtp_strict(line: &str, payload_type: u8) -> Option<Result<H261FmtpParams, SdpError>> {
+    match parse_fmtp(line, payload_type)? {
+        Ok(params) => match params.validate() {
+            Ok(()) => Some(Ok(params)),
+            Err(_) => None,
+        },
+        Err(e) => Some(Err(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1400,6 +1441,133 @@ mod tests {
         assert_eq!(p.preferred_picture_size(), Some(SourceFormat::Cif));
         // Wire-order: QCIF wins because it's first in the offer.
         assert_eq!(order.first().copied(), Some(SourceFormat::Qcif));
+    }
+
+    #[test]
+    fn parse_fmtp_strict_accepts_spec_example() {
+        // §6.2.1 worked example "a=fmtp:31 CIF=2;QCIF=1;D=1" advertises
+        // both CIF and QCIF, so strict and lenient must agree.
+        let lenient = parse_fmtp("a=fmtp:31 CIF=2;QCIF=1;D=1", 31)
+            .unwrap()
+            .unwrap();
+        let strict = parse_fmtp_strict("a=fmtp:31 CIF=2;QCIF=1;D=1", 31)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lenient, strict);
+        // Sanity: both pickets see the §6.2.1 invariant.
+        assert!(strict.validate().is_ok());
+    }
+
+    #[test]
+    fn parse_fmtp_strict_rejects_no_picture_size() {
+        // §6.2.1: "Implementations following this specification SHALL
+        // specify at least one supported picture size." A well-formed
+        // line that only carries `D=1` is parseable by `parse_fmtp` (the
+        // forward-compatible lenient parser preserves the `D` field) but
+        // MUST be rejected by `parse_fmtp_strict` as `None`.
+        let lenient = parse_fmtp("a=fmtp:31 D=1", 31).unwrap().unwrap();
+        assert_eq!(lenient.cif, None);
+        assert_eq!(lenient.qcif, None);
+        assert_eq!(lenient.d, Some(true));
+        assert!(matches!(lenient.validate(), Err(SdpError::NoPictureSize)));
+        // Strict drops the §6.2.1-violating line cleanly.
+        assert!(parse_fmtp_strict("a=fmtp:31 D=1", 31).is_none());
+    }
+
+    #[test]
+    fn parse_fmtp_strict_rejects_only_unknown_parameter() {
+        // The forward-compatible §6.1.1 "ignore unknown parameter" rule
+        // means `parse_fmtp` returns `Ok(H261FmtpParams::default())`
+        // (all `None`) on a line that carries only a parameter this
+        // version does not model. `parse_fmtp_strict` MUST drop it
+        // because §6.2.1 requires at least one picture size.
+        let lenient = parse_fmtp("a=fmtp:31 FUTUREPARAM=hello", 31)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lenient, H261FmtpParams::default());
+        assert!(parse_fmtp_strict("a=fmtp:31 FUTUREPARAM=hello", 31).is_none());
+    }
+
+    #[test]
+    fn parse_fmtp_strict_propagates_malformed_token_error() {
+        // A malformed parameter list surfaces through `parse_fmtp_strict`
+        // as `Some(Err(…))` exactly like `parse_fmtp` — the §6.2.1
+        // picture-size rule is checked only after a successful parse.
+        // (So callers still get a typed `SdpError` instead of a silent
+        // `None` for "garbage was sent".)
+        let strict = parse_fmtp_strict("a=fmtp:31 CIF", 31);
+        assert!(matches!(strict, Some(Err(SdpError::MalformedToken { .. }))));
+    }
+
+    #[test]
+    fn parse_fmtp_strict_payload_type_mismatch_returns_none() {
+        // A wrong payload type means "this line is not for us"; both
+        // lenient and strict return `None` (the strict variant inherits
+        // this from `parse_fmtp`).
+        assert!(parse_fmtp_strict("a=fmtp:31 CIF=2", 96).is_none());
+    }
+
+    #[test]
+    fn parse_fmtp_strict_accepts_qcif_only_line() {
+        // §6.2.1 requires "at least one" picture size — a QCIF-only line
+        // satisfies the SHALL. The Annex D parameter is optional, so its
+        // absence does not affect the strict-conformance check.
+        let strict = parse_fmtp_strict("a=fmtp:31 QCIF=1", 31).unwrap().unwrap();
+        assert_eq!(strict.cif, None);
+        assert_eq!(strict.qcif, Some(1));
+        assert_eq!(strict.d, None);
+    }
+
+    #[test]
+    fn parse_fmtp_strict_accepts_cif_only_line() {
+        // Symmetric to the QCIF-only case: a CIF-only line satisfies the
+        // §6.2.1 SHALL on its own.
+        let strict = parse_fmtp_strict("a=fmtp:31 CIF=4", 31).unwrap().unwrap();
+        assert_eq!(strict.cif, Some(4));
+        assert_eq!(strict.qcif, None);
+        assert_eq!(strict.d, None);
+    }
+
+    #[test]
+    fn parse_fmtp_strict_does_not_apply_rfc2032_fallback() {
+        // §6.2.1's "assume QCIF=1" fallback is a negotiation rule, not a
+        // validation rule. `parse_fmtp_strict` MUST NOT silently rewrite
+        // a no-picture-size advertisement into a QCIF-1 advertisement —
+        // that would mask a peer's malformed offer. Callers that want
+        // the fallback semantics combine `parse_fmtp` with
+        // `H261FmtpParams::rfc2032_fallback()` themselves.
+        assert!(parse_fmtp_strict("a=fmtp:31 D=1", 31).is_none());
+        assert!(parse_fmtp_strict("a=fmtp:31 FUTUREPARAM=hello", 31).is_none());
+        // The fallback constructor still works for explicit caller use.
+        let fallback = H261FmtpParams::rfc2032_fallback();
+        assert_eq!(fallback.qcif, Some(1));
+    }
+
+    #[test]
+    fn parse_fmtp_strict_implies_lenient() {
+        // Cross-cutting invariant the fuzz-seed-corpus oracle also
+        // enforces: every input that strict accepts is one lenient
+        // also accepts (with equal parsed `H261FmtpParams`), and the
+        // parsed result passes `validate()`. A regression in either
+        // direction trips this test on stable CI.
+        for line in [
+            "a=fmtp:31 CIF=2;QCIF=1;D=1",
+            "a=fmtp:31 CIF=4",
+            "a=fmtp:31 QCIF=2",
+            "a=fmtp:31 QCIF=1;CIF=2",
+            "a=fmtp:96 CIF=1;D=0",
+        ] {
+            let pt: u8 = line["a=fmtp:".len()..line.find(' ').unwrap()]
+                .parse()
+                .unwrap();
+            let lenient = parse_fmtp(line, pt).unwrap().unwrap();
+            let strict = parse_fmtp_strict(line, pt).unwrap().unwrap();
+            assert_eq!(lenient, strict, "strict diverges from lenient: {line}");
+            assert!(
+                strict.validate().is_ok(),
+                "strict accepted §6.2.1-noncompliant line: {line}"
+            );
+        }
     }
 
     #[test]
