@@ -10,8 +10,8 @@ use oxideav_h261::decoder::H261Decoder;
 use oxideav_h261::encoder::{encode_intra_picture, H261Encoder};
 use oxideav_h261::picture::SourceFormat;
 use oxideav_h261::rtp::{
-    depacketize, packetize_gob_aligned, parse_rtp_fixed_header, unpack_header, H261RtpPayload,
-    RtpPacketizer, HEADER_LEN, RTP_FIXED_HEADER_LEN,
+    depacketize, packetize_gob_aligned, packetize_mb_fragmented, parse_rtp_fixed_header,
+    unpack_header, H261RtpPayload, RtpPacketizer, HEADER_LEN, RTP_FIXED_HEADER_LEN,
 };
 
 use oxideav_core::registry::codec::Decoder;
@@ -133,6 +133,106 @@ fn rtp_payload_header_packs_to_4_bytes_uniformly() {
         assert!(p.bytes.len() > HEADER_LEN);
         assert_eq!(HEADER_LEN, 4);
     }
+}
+
+// --------------------------------------------------------------------
+// MB-level fragmentation (RFC 4587 §4.2 RECOMMENDED packetization)
+// --------------------------------------------------------------------
+
+#[test]
+fn mb_fragmented_round_trip_decodes_end_to_end() {
+    // The §4.2 RECOMMENDED packetizer splits oversize GOBs on macroblock
+    // boundaries; continuation packets carry the §4.1 GOBN / MBAP /
+    // QUANT / HMVD / VMVD context and non-zero SBIT/EBIT. After the
+    // round trip the recovered stream must be byte-exact and still
+    // decode through the regular decoder API.
+    let (y, cb, cr) = gradient_qcif();
+    let bits = encode_qcif_intra(&y, &cb, &cr, 8, 0);
+    let pkts = packetize_mb_fragmented(&bits, 64, true, false).expect("mb fragment");
+    assert!(pkts.len() > 3, "expected several MB-boundary fragments");
+
+    let mut saw_continuation = false;
+    for p in &pkts {
+        assert!(p.bytes.len() <= 64, "payload exceeds budget");
+        let (h, _data) = unpack_header(&p.bytes).expect("unpack");
+        assert!(h.intra_only);
+        if h.gobn != 0 {
+            saw_continuation = true;
+            // Mid-GOB context invariants per RFC 4587 §4.1.
+            assert!((1..=12).contains(&h.gobn));
+            assert!((1..=31).contains(&h.quant));
+            assert!(h.mbap <= 31);
+        }
+    }
+    assert!(
+        saw_continuation,
+        "a 64-byte budget must force mid-GOB continuation packets"
+    );
+    let marker_count = pkts.iter().filter(|p| p.marker).count();
+    assert_eq!(marker_count, 1, "exactly one marker per picture");
+
+    let recovered = depacketize(&pkts).expect("depacketize");
+    assert_eq!(recovered, bits, "MB-fragmented round trip is byte-exact");
+
+    let mut dec = H261Decoder::new(CodecId::new(oxideav_h261::CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 30), recovered);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    match dec.receive_frame() {
+        Ok(Frame::Video(vf)) => {
+            assert_eq!(vf.planes[0].stride, 176);
+            assert_eq!(vf.planes[0].data.len(), 176 * 144);
+        }
+        Ok(other) => panic!("expected video frame, got {other:?}"),
+        Err(e) => panic!("decode failed after MB-fragmented round trip: {e}"),
+    }
+}
+
+#[test]
+fn rtp_packetizer_mb_fragmentation_end_to_end() {
+    // Full RTP wrap with MB fragmentation enabled: every packet fits the
+    // MTU, the receiver path (fixed-header parse → H.261 header unpack →
+    // depacketize) recovers the elementary stream byte-exactly, and it
+    // still decodes.
+    let (y, cb, cr) = gradient_qcif();
+    let bits = encode_qcif_intra(&y, &cb, &cr, 8, 0);
+    let mut pk = RtpPacketizer::new(96, 0x0BAD_F00D, 7, 96)
+        .with_intra_only(true)
+        .with_mb_fragmentation(true);
+    let packets = pk.pack_frame(&bits, 0);
+    assert!(!packets.is_empty());
+
+    let mut inner = Vec::new();
+    let mut saw_continuation = false;
+    for p in &packets {
+        assert!(p.bytes.len() <= 96, "RTP packet exceeds MTU");
+        let (rtp_hdr, rest) = parse_rtp_fixed_header(&p.bytes).expect("rtp parse");
+        assert_eq!(rtp_hdr.payload_type, 96);
+        let (h261_hdr, _payload) = unpack_header(rest).expect("h261 unpack");
+        if h261_hdr.gobn != 0 {
+            saw_continuation = true;
+        }
+        inner.push(H261RtpPayload {
+            header: h261_hdr,
+            bytes: rest.to_vec(),
+            marker: p.marker,
+        });
+    }
+    assert!(saw_continuation, "MTU 96 must force mid-GOB packets");
+    assert!(packets.last().unwrap().marker);
+    assert_eq!(packets.iter().filter(|p| p.marker).count(), 1);
+
+    let recovered = depacketize(&inner).expect("depacketize");
+    assert_eq!(recovered, bits);
+
+    let mut dec = H261Decoder::new(CodecId::new(oxideav_h261::CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 30), recovered);
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    assert!(
+        matches!(dec.receive_frame(), Ok(Frame::Video(_))),
+        "MB-fragmented RTP session output must decode"
+    );
 }
 
 // --------------------------------------------------------------------

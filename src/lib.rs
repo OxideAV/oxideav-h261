@@ -31,8 +31,11 @@
 //!   buffer at a given channel rate.
 //! * RTP payload-format wrapping (RFC 4587): the [`rtp`] module packs an
 //!   elementary stream into a sequence of GOB-aligned H.261 RTP payloads
-//!   (4-byte header + bitstream slice) and unpacks them back. The
-//!   `RtpPacketizer` glue wraps each payload in a full RFC 3550 §5.1
+//!   (4-byte header + bitstream slice) and unpacks them back, plus the
+//!   §4.2 RECOMMENDED MB-level fragmentation (`packetize_mb_fragmented`)
+//!   that parses the Huffman layer to split oversize GOBs on macroblock
+//!   boundaries with the full §4.1 GOBN/MBAP/QUANT/HMVD/VMVD context.
+//!   The `RtpPacketizer` glue wraps each payload in a full RFC 3550 §5.1
 //!   RTP fixed header (V/P/X/CC/M/PT/seq/timestamp/SSRC) so callers can
 //!   hand `pack_frame` output straight to UDP / DTLS / SRTP.
 //! * RTCP report packets (RFC 3550 §6.4): the [`rtcp`] module builds and

@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC 4587 §4.2 MB-level fragmentation.** The RTP module previously
+  shipped only the "cheap" GOB-aligned packetizer; a GOB larger than
+  the payload budget was split at arbitrary byte boundaries with
+  zeroed context fields, so its continuation packets were not
+  independently decodable after a loss — the exact problem the §4.1
+  H.261 header exists to solve. The new
+  `rtp::packetize_mb_fragmented` implements the §4.2 RECOMMENDED
+  packetization: a single Huffman-layer walk over the elementary
+  stream (`walk_mb_split_points` — MBA/MTYPE/MQUANT/MVD/CBP/TCOEFF
+  VLCs parsed, nothing dequantised or transformed, per §4.2 "it is
+  not necessary to decompress the stream fully") records every legal
+  split point with its §4.1 context, then packets are filled greedily
+  (multiple GOBs/MBs per packet when they fit, per §3.2) under the
+  §3.2 rules: an MB is never split across packets, the stream is
+  never fragmented between a GOB header and MB 1, and no packet
+  crosses a PSC. Mid-GOB packets carry non-zero SBIT/EBIT plus the
+  GOBN / MBAP (biased -1) / QUANT / HMVD / VMVD context; the walker
+  tracks the §4.2.3.4 MV predictor (including the consecutive-MBA
+  and last-MB-was-MC rules) so the reference MVD is exact.
+  `RtpPacketizer::with_mb_fragmentation(true)` routes `pack_frame`
+  through the new path with an automatic fallback to the byte-split
+  cheap packetizer when no MB-boundary split exists, and two new
+  `RtpError` variants (`MalformedStream`, `FragmentTooLarge`) surface
+  walk/budget failures on the direct path. Eleven new tests cover
+  it: the Huffman-layer walk is checked bit-for-bit against a
+  real-decoder (`decode_macroblock`) oracle on I-pictures across a
+  quantiser sweep and on a P-picture with live motion vectors; round
+  trips at multiple budgets are byte-exact through `depacketize`
+  (which already handled non-zero SBIT/EBIT); fragment chains are
+  verified bit-contiguous (shared split byte,
+  `next.SBIT == (8 - prev.EBIT) % 8`); continuation headers are
+  matched back to walker split points; the PSC-crossing ban, the
+  whole-frame-in-one-packet case, the `FragmentTooLarge` path, and
+  two end-to-end RTP-session decodes (`tests/rtp_e2e.rs`) round it
+  out.
+
 - **RFC 4587 §6.2.1 preference-aware `a=fmtp` formatter.** §6.2.1
   states "Parameters offered first are the most preferred picture
   mode to be received" — an endpoint expresses its receive preference

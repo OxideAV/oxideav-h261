@@ -51,18 +51,22 @@
 //!   (GOBN=0, MBAP=0, QUANT=0, HMVD=VMVD=0); SBIT/EBIT are zero because
 //!   GOB headers are bit-byte-aligned by construction in the elementary
 //!   stream emitted by this crate's encoder.
+//! * [`packetize_mb_fragmented`] — the §4.2 RECOMMENDED MB-level
+//!   fragmenting packetizer. GOBs that exceed the payload budget are
+//!   parsed at the Huffman layer ("it is not necessary to decompress
+//!   the stream fully") to locate macroblock boundaries; each
+//!   continuation packet starts on an MB boundary with non-zero
+//!   SBIT/EBIT and carries the §4.1 GOBN / MBAP / QUANT / HMVD / VMVD
+//!   context in effect at its first bit, so a receiver can resume
+//!   decoding mid-GOB after losing the preceding packet. Per §3.2 "an
+//!   MB cannot be split across multiple packets" and "the bit stream
+//!   cannot be fragmented between a GOB header and MB 1 of that GOB".
 //! * [`depacketize`] — reassemble an elementary stream from a sequence
 //!   of payloads, honouring per-packet SBIT/EBIT and concatenating the
 //!   inner bits to a single byte buffer.
 //!
 //! ## What it does **not** do
 //!
-//! * MB-level fragmentation (§4.2 RECOMMENDED for hardware codecs whose
-//!   GOBs exceed the MTU). Our software encoder typically produces GOBs
-//!   well under 1 KiB at canonical p×64 kbit/s rates, so GOB-aligned
-//!   packets fit comfortably below an IPv4 MTU. The header builder is
-//!   nonetheless general enough that a caller can hand-construct an MB-
-//!   fragmented packetizer on top of [`pack_header`] / [`unpack_header`].
 //! * RTCP, SDP offer/answer, payload-type negotiation. The PT, SSRC,
 //!   initial sequence number, and per-frame RTP timestamp are passed in
 //!   by the caller from its SDP / clock state.
@@ -75,7 +79,16 @@
 //! for RTP. The two modules are mutually exclusive consumers of an H.261
 //! elementary stream.
 
-use crate::start_code::{iter_start_codes, GN_PICTURE};
+use oxideav_core::bits::BitReader;
+
+use crate::gob::parse_gob_header;
+use crate::mb::{decode_mba_diff, reconstruct_mv, MbContext};
+use crate::picture::parse_picture_header;
+use crate::start_code::{find_next_start_code_bits, iter_start_codes, GN_PICTURE};
+use crate::tables::{
+    decode_tcoeff, decode_vlc, MtypeInfo, MvdSym, Prediction, TcoeffSym, CBP_TABLE, MTYPE_TABLE,
+    MVD_TABLE,
+};
 
 /// Length of the H.261 RTP payload header in bytes (RFC 4587 §4.1).
 pub const HEADER_LEN: usize = 4;
@@ -155,6 +168,24 @@ pub enum RtpError {
     /// The depacketizer found no GOB or PSC start codes in the
     /// reconstructed stream — the packet sequence is non-recoverable.
     NoStartCodes,
+    /// The MB-level fragmenter could not parse the elementary stream's
+    /// Huffman layer. RFC 4587 §4.2 requires parsing the variable-length
+    /// codes (not a full decode) to locate macroblock boundaries; a
+    /// stream that fails that parse cannot be MB-fragmented.
+    MalformedStream {
+        /// Parse-failure detail from the VLC layer.
+        detail: String,
+    },
+    /// A single unfragmentable unit — a picture header, a GOB header +
+    /// MB 1, or one macroblock run — needs more bytes than the per-packet
+    /// payload budget allows, so no MB-boundary split exists (RFC 4587
+    /// §3.2: "an MB cannot be split across multiple packets").
+    FragmentTooLarge {
+        /// Bytes the smallest legal fragment would need.
+        needed: usize,
+        /// Maximum data bytes available per packet after the 4-byte header.
+        max: usize,
+    },
 }
 
 impl core::fmt::Display for RtpError {
@@ -176,6 +207,15 @@ impl core::fmt::Display for RtpError {
             RtpError::EmptyPayload => write!(f, "h261 RTP: empty payload"),
             RtpError::NoStartCodes => {
                 write!(f, "h261 RTP: depacketized stream contains no start codes")
+            }
+            RtpError::MalformedStream { detail } => {
+                write!(f, "h261 RTP: MB fragmenter VLC parse failed: {detail}")
+            }
+            RtpError::FragmentTooLarge { needed, max } => {
+                write!(
+                    f,
+                    "h261 RTP: smallest legal fragment needs {needed} bytes but the payload budget is {max}"
+                )
             }
         }
     }
@@ -450,6 +490,438 @@ pub fn packetize_gob_aligned(
     payloads
 }
 
+/// RFC 4587 §4.1 context at a mid-GOB packet split point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FragCtx {
+    /// GN of the GOB being continued (1..=12).
+    pub(crate) gobn: u8,
+    /// MBA of the macroblock that just ended (1..=32). This is the §4.1
+    /// "macroblock address predictor" — the last MBA encoded in the
+    /// previous packet when a fragment starts here (the header carries
+    /// it biased -1).
+    pub(crate) last_mba: u8,
+    /// Quantizer (GQUANT or MQUANT) in effect after this MB (1..=31).
+    pub(crate) quant: u8,
+    /// Reference MVD for the next MB's §4.2.3.4 prediction: the MV of
+    /// the MB that just ended if it was MC-coded, `(0, 0)` otherwise
+    /// (§4.1: HMVD/VMVD are zero "when the MTYPE of the last MB encoded
+    /// in the previous packet was not motion compensation").
+    pub(crate) mv: (i32, i32),
+}
+
+/// One legal packet split point inside an H.261 elementary stream, as
+/// recorded by [`walk_mb_split_points`].
+///
+/// A split point is either the first bit of a start code (PSC or GBSC —
+/// a packet starting there begins with a header, so its §4.1 context
+/// fields are all zero per the RFC) or the first bit after a macroblock
+/// (a mid-GOB continuation carrying `ctx`). The encoder bit-packs GOB
+/// headers, so split points sit at arbitrary bit offsets — SBIT/EBIT
+/// carry the sub-byte alignment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SplitPoint {
+    /// Absolute bit offset from the start of the elementary stream.
+    pub(crate) bit: u64,
+    /// True when this split point is the first bit of a PSC. Packets
+    /// from different video frames must not share an RTP packet (their
+    /// timestamps differ per §4.1), so a PSC is a *mandatory* cut.
+    pub(crate) is_psc: bool,
+    /// Mid-GOB continuation context, or `None` when the split point is
+    /// a start code (all §4.1 context fields zero).
+    pub(crate) ctx: Option<FragCtx>,
+}
+
+fn walk_err(e: oxideav_core::Error) -> RtpError {
+    RtpError::MalformedStream {
+        detail: e.to_string(),
+    }
+}
+
+/// Skip the TCOEFF run/level + EOB sequence of one 8x8 block without
+/// dequantising or transforming anything — RFC 4587 §4.2: "only the
+/// Huffman encoding must be parsed and ... it is not necessary to
+/// decompress the stream fully". Mirrors the bit consumption of
+/// `crate::block::decode_ac_coeffs` exactly (including the run-overflow
+/// and forbidden-escape-level checks, so a stream the decoder would
+/// reject also fails the walk instead of desyncing it).
+fn skip_ac_coeffs(
+    br: &mut BitReader<'_>,
+    start: usize,
+    is_first_inter: bool,
+) -> oxideav_core::Result<()> {
+    let mut idx = start;
+    let mut first = is_first_inter;
+    loop {
+        let sym = decode_tcoeff(br, first)?;
+        first = false;
+        match sym {
+            TcoeffSym::Eob => return Ok(()),
+            TcoeffSym::RunLevel { run, .. } => {
+                let _sign = br.read_u1()?;
+                idx = idx.saturating_add(run as usize);
+                if idx > 63 {
+                    return Err(oxideav_core::Error::invalid(format!(
+                        "h261 block: AC run overflow (idx={idx}, run={run})"
+                    )));
+                }
+                idx += 1;
+            }
+            TcoeffSym::Escape => {
+                let run = br.read_u32(6)? as u8;
+                let raw = br.read_u32(8)?;
+                if raw == 0 || raw == 0x80 {
+                    return Err(oxideav_core::Error::invalid(
+                        "h261 escape: forbidden level FLC",
+                    ));
+                }
+                idx = idx.saturating_add(run as usize);
+                if idx > 63 {
+                    return Err(oxideav_core::Error::invalid(format!(
+                        "h261 escape: run overflow (idx={idx}, run={run})"
+                    )));
+                }
+                idx += 1;
+            }
+        }
+    }
+}
+
+/// Parse one macroblock at the Huffman layer only (no pixel work),
+/// tracking the same `quant` / MV-predictor state the real decoder
+/// keeps (`crate::mb::decode_macroblock`). Bit consumption is
+/// bit-identical to the decoder's by construction.
+fn skip_macroblock(
+    br: &mut BitReader<'_>,
+    mba: u8,
+    quant: &mut u32,
+    ctx: &mut MbContext,
+) -> oxideav_core::Result<()> {
+    let mtype: MtypeInfo = decode_vlc(br, MTYPE_TABLE)?;
+
+    if mtype.mquant {
+        let q = br.read_u32(5)?;
+        if q == 0 {
+            return Err(oxideav_core::Error::invalid("h261 MB: MQUANT == 0"));
+        }
+        *quant = q;
+    }
+
+    let mut mv = (0i32, 0i32);
+    if mtype.mvd {
+        let pred = if ctx.prev_was_mc && ctx.prev_mba != 0 && mba == ctx.prev_mba + 1 {
+            ctx.mv
+        } else {
+            (0, 0)
+        };
+        let sym_x: MvdSym = decode_vlc(br, MVD_TABLE)?;
+        let sym_y: MvdSym = decode_vlc(br, MVD_TABLE)?;
+        mv = (reconstruct_mv(pred.0, sym_x), reconstruct_mv(pred.1, sym_y));
+    }
+
+    let cbp: u8 = if mtype.cbp {
+        decode_vlc(br, CBP_TABLE)?
+    } else if mtype.prediction == Prediction::Intra {
+        0b111111
+    } else {
+        0
+    };
+
+    if mtype.prediction == Prediction::Intra {
+        for _ in 0..6 {
+            // INTRA DC FLC (Table 6) — validated like the decoder so a
+            // forbidden value fails the walk instead of desyncing it.
+            let dc = br.read_u32(8)?;
+            if dc == 0x00 || dc == 0x80 {
+                return Err(oxideav_core::Error::invalid(
+                    "h261 INTRA DC: forbidden bitstream value",
+                ));
+            }
+            skip_ac_coeffs(br, 1, false)?;
+        }
+        ctx.mv = (0, 0);
+        ctx.prev_was_mc = false;
+        ctx.prev_mba = mba;
+        return Ok(());
+    }
+
+    let block_coded = [
+        (cbp >> 5) & 1 != 0,
+        (cbp >> 4) & 1 != 0,
+        (cbp >> 3) & 1 != 0,
+        (cbp >> 2) & 1 != 0,
+        (cbp >> 1) & 1 != 0,
+        cbp & 1 != 0,
+    ];
+    for coded in block_coded {
+        if coded && mtype.tcoeff {
+            skip_ac_coeffs(br, 0, true)?;
+        }
+    }
+
+    ctx.mv = mv;
+    ctx.prev_was_mc = matches!(
+        mtype.prediction,
+        Prediction::InterMc | Prediction::InterMcFil
+    );
+    ctx.prev_mba = mba;
+    Ok(())
+}
+
+/// Walk an entire H.261 elementary stream at the Huffman layer and
+/// record every legal packet split point with its RFC 4587 §4.1
+/// context: each start code (PSC / GBSC, zero context) and the first
+/// bit after every macroblock whose MBA is 1..=32 (mid-GOB continuation
+/// context; MBAP cannot encode a predictor of 33, and nothing but the
+/// next start code follows MB 33 anyway).
+///
+/// The walk consumes exactly the bits the real decoder consumes (same
+/// VLC tables, same validation), so each recorded `bit` is a legal
+/// packet split point per §3.2 ("Packets must start and end on an MB
+/// boundary"; "the bit stream cannot be fragmented between a GOB header
+/// and MB 1" holds because no point is recorded between a GBSC and the
+/// end of MB 1).
+pub(crate) fn walk_mb_split_points(data: &[u8]) -> Result<Vec<SplitPoint>, RtpError> {
+    let mut br = BitReader::new(data);
+    let mut points = Vec::new();
+
+    loop {
+        // Seek to the next start code (the reader sits just past the
+        // previous picture header / GOB; only stuffing or byte-align
+        // padding separates it from the next start code).
+        let pos = br.bit_position();
+        let Some(sc) = find_next_start_code_bits(data, pos) else {
+            break;
+        };
+        if sc.bit_pos > pos {
+            br.skip((sc.bit_pos - pos) as u32).map_err(walk_err)?;
+        }
+
+        if sc.gn == GN_PICTURE {
+            points.push(SplitPoint {
+                bit: sc.bit_pos,
+                is_psc: true,
+                ctx: None,
+            });
+            parse_picture_header(&mut br).map_err(walk_err)?;
+            continue;
+        }
+
+        points.push(SplitPoint {
+            bit: sc.bit_pos,
+            is_psc: false,
+            ctx: None,
+        });
+        let gob_hdr = parse_gob_header(&mut br).map_err(walk_err)?;
+        let mut quant = gob_hdr.gquant as u32;
+        let mut ctx = MbContext::reset();
+        let mut current_mba: i32 = 0;
+        loop {
+            let remaining = br.bits_remaining();
+            if remaining == 0 {
+                break;
+            }
+            // GOBs are bit-contiguous, so the next start code begins
+            // exactly where the last MB (plus any stuffing consumed by
+            // `decode_mba_diff`) ends; mirror the decoder's peek-16
+            // guard.
+            if remaining >= 16 && br.peek_u32(16).map_err(walk_err)? == 0x0001 {
+                break;
+            }
+            let diff = match decode_mba_diff(&mut br).map_err(walk_err)? {
+                Some(d) => d as i32,
+                None => break,
+            };
+            let new_mba = current_mba + diff;
+            if !(1..=33).contains(&new_mba) {
+                return Err(RtpError::MalformedStream {
+                    detail: format!(
+                        "MBA out of range {new_mba} (GN={}, prev_mba={current_mba})",
+                        gob_hdr.gn
+                    ),
+                });
+            }
+            current_mba = new_mba;
+            skip_macroblock(&mut br, new_mba as u8, &mut quant, &mut ctx).map_err(walk_err)?;
+            if new_mba <= 32 {
+                points.push(SplitPoint {
+                    bit: br.bit_position(),
+                    is_psc: false,
+                    ctx: Some(FragCtx {
+                        gobn: gob_hdr.gn,
+                        last_mba: new_mba as u8,
+                        quant: quant as u8,
+                        mv: if ctx.prev_was_mc { ctx.mv } else { (0, 0) },
+                    }),
+                });
+            }
+        }
+    }
+    Ok(points)
+}
+
+/// Packetize an H.261 elementary stream with MB-level fragmentation
+/// (RFC 4587 §4.2 RECOMMENDED packetization).
+///
+/// The stream is parsed once at the Huffman layer (no pixel decode —
+/// §4.2: "it is not necessary to decompress the stream fully") to
+/// collect every legal split point: each start code and each macroblock
+/// boundary. Packets are then filled greedily — as many GOBs / MBs as
+/// fit per packet, per §3.2 ("Multiple MBs may be carried in a single
+/// packet ... This practice is recommended to reduce the packet send
+/// rate") — under three rules:
+///
+/// * every payload is at most `max_payload` bytes;
+/// * every packet starts and ends on an MB or start-code boundary
+///   (§3.2: "an MB cannot be split across multiple packets"; "the bit
+///   stream cannot be fragmented between a GOB header and MB 1");
+/// * no packet crosses a PSC (packets of different video frames must
+///   carry different RTP timestamps per §4.1).
+///
+/// A packet that starts with a PSC or GBSC has all-zero context fields;
+/// a mid-GOB continuation packet carries the full §4.1 context:
+///
+/// * `SBIT` / `EBIT` — the split bit's offset within its byte
+///   (consecutive fragments share the split byte, since the encoder
+///   bit-packs GOB headers and macroblocks);
+/// * `GOBN` — the GN of the GOB being continued;
+/// * `MBAP` — the last MBA encoded in the previous packet, biased -1;
+/// * `QUANT` — the GQUANT/MQUANT in effect prior to the packet;
+/// * `HMVD` / `VMVD` — the reference MVD of the last MB of the previous
+///   packet, or zero when that MB was not MC-coded.
+///
+/// The RTP marker hint is set on the last payload of each video frame,
+/// as in [`packetize_gob_aligned`]. [`depacketize`] reassembles the
+/// output byte-exactly (the SBIT/EBIT bit-walk handles the shared split
+/// bytes).
+///
+/// Returns an empty vector if `data` contains no start codes.
+///
+/// # Errors
+///
+/// * [`RtpError::MalformedStream`] — the Huffman-layer walk failed (the
+///   stream would not decode either).
+/// * [`RtpError::FragmentTooLarge`] — some unfragmentable unit (picture
+///   header + GOB header + MB 1, or a single MB run) needs more than
+///   `max_payload - 4` bytes. Callers wanting a never-fails path can
+///   fall back to [`packetize_gob_aligned`], which splits at byte
+///   boundaries without per-packet decodability.
+///
+/// # Panics
+///
+/// Panics if `max_payload < HEADER_LEN + 1`, like [`packetize_gob_aligned`].
+pub fn packetize_mb_fragmented(
+    data: &[u8],
+    max_payload: usize,
+    intra_only: bool,
+    motion_vectors: bool,
+) -> Result<Vec<H261RtpPayload>, RtpError> {
+    assert!(
+        max_payload > HEADER_LEN,
+        "max_payload must accommodate the 4-byte H.261 RTP header + at least 1 data byte"
+    );
+
+    let mut payloads = Vec::new();
+    let points = walk_mb_split_points(data)?;
+    if points.is_empty() {
+        return Ok(payloads);
+    }
+
+    let max_data = max_payload - HEADER_LEN;
+    let total_bits = (data.len() as u64) * 8;
+
+    // Current fragment start: bit position + §4.1 context (None = the
+    // fragment begins with a start code, all context fields zero).
+    let mut s = points[0].bit;
+    let mut s_ctx: Option<FragCtx> = None;
+    // Index of the first candidate point not yet behind `s`.
+    let mut search_from = 0usize;
+
+    loop {
+        let start_byte = (s / 8) as usize;
+        while search_from < points.len() && points[search_from].bit <= s {
+            search_from += 1;
+        }
+
+        // The current frame ends at the next PSC, or at the stream end.
+        let frame_end = points[search_from..]
+            .iter()
+            .find(|p| p.is_psc)
+            .map(|p| p.bit)
+            .unwrap_or(total_bits);
+
+        // Furthest split point (bounded by the frame end) whose byte
+        // span still fits the budget. Spans are monotone in `bit`, so
+        // the scan can stop at the first overflow. When two points share
+        // a bit (an MB boundary that coincides with the next GBSC), the
+        // later one — the start code, with zero context — wins.
+        let mut chosen: Option<(u64, Option<FragCtx>)> = None;
+        let mut first_span: Option<usize> = None;
+        for p in points[search_from..]
+            .iter()
+            .take_while(|p| p.bit <= frame_end)
+        {
+            let span = (p.bit.div_ceil(8) as usize) - start_byte;
+            if first_span.is_none() {
+                first_span = Some(span);
+            }
+            if span > max_data {
+                break;
+            }
+            chosen = Some((p.bit, p.ctx));
+        }
+        if frame_end == total_bits {
+            // The stream end is a candidate too (it is not in `points`).
+            let span = data.len() - start_byte;
+            if first_span.is_none() {
+                first_span = Some(span);
+            }
+            if span <= max_data {
+                chosen = Some((total_bits, None));
+            }
+        }
+
+        let Some((frag_end_bit, next_ctx)) = chosen else {
+            // Even the nearest split point overflows the budget: the
+            // unit between `s` and it cannot be fragmented legally.
+            return Err(RtpError::FragmentTooLarge {
+                needed: first_span.unwrap_or(data.len() - start_byte),
+                max: max_data,
+            });
+        };
+
+        let hdr = H261RtpHeader {
+            sbit: (s % 8) as u8,
+            ebit: ((8 - (frag_end_bit % 8)) % 8) as u8,
+            intra_only,
+            motion_vectors,
+            gobn: s_ctx.map_or(0, |c| c.gobn),
+            mbap: s_ctx.map_or(0, |c| c.last_mba - 1),
+            quant: s_ctx.map_or(0, |c| c.quant),
+            hmvd: s_ctx.map_or(0, |c| c.mv.0 as i8),
+            vmvd: s_ctx.map_or(0, |c| c.mv.1 as i8),
+        };
+        let end_byte = frag_end_bit.div_ceil(8) as usize;
+        let mut bytes = Vec::with_capacity(HEADER_LEN + (end_byte - start_byte));
+        bytes.extend_from_slice(&pack_header(&hdr).expect("hdr packs"));
+        bytes.extend_from_slice(&data[start_byte..end_byte]);
+        payloads.push(H261RtpPayload {
+            header: hdr,
+            bytes,
+            // Last packet of its video frame: ends exactly at the next
+            // PSC or at the stream end.
+            marker: frag_end_bit == frame_end,
+        });
+
+        if frag_end_bit >= total_bits {
+            break;
+        }
+        s = frag_end_bit;
+        s_ctx = next_ctx;
+    }
+
+    Ok(payloads)
+}
+
 /// Reassemble an H.261 elementary stream from a sequence of
 /// [`H261RtpPayload`]s.
 ///
@@ -594,6 +1066,10 @@ pub struct RtpPacketizer {
     max_payload: usize,
     intra_only: bool,
     motion_vectors: bool,
+    /// Use the RFC 4587 §4.2 RECOMMENDED MB-level fragmentation for GOBs
+    /// that exceed the payload budget (with a GOB-aligned byte-split
+    /// fallback when the Huffman-layer walk fails). Off by default.
+    mb_fragmentation: bool,
     /// Running count of RTP data packets emitted by `pack_frame`, for the
     /// SR "sender's packet count" field (RFC 3550 §6.4.1). Wraps mod 2^32.
     packet_count: u32,
@@ -639,6 +1115,7 @@ impl RtpPacketizer {
             max_payload: max_rtp_packet_size,
             intra_only: false,
             motion_vectors: true,
+            mb_fragmentation: false,
             packet_count: 0,
             octet_count: 0,
             last_rtp_timestamp: None,
@@ -658,6 +1135,21 @@ impl RtpPacketizer {
     /// the meaning of this bit must not change across the session.
     pub fn with_motion_vectors(mut self, motion_vectors: bool) -> Self {
         self.motion_vectors = motion_vectors;
+        self
+    }
+
+    /// Enable the RFC 4587 §4.2 RECOMMENDED MB-level fragmentation.
+    ///
+    /// When enabled, [`Self::pack_frame`] routes each frame through
+    /// [`packetize_mb_fragmented`]: a GOB exceeding the per-packet
+    /// budget is split on macroblock boundaries and every continuation
+    /// packet carries the §4.1 GOBN / MBAP / QUANT / HMVD / VMVD
+    /// context, so a receiver can resume decoding mid-GOB after packet
+    /// loss. If the MB-level walk fails (malformed stream, or a single
+    /// MB run larger than the budget), `pack_frame` falls back to the
+    /// GOB-aligned byte-split path so it never drops a frame.
+    pub fn with_mb_fragmentation(mut self, mb_fragmentation: bool) -> Self {
+        self.mb_fragmentation = mb_fragmentation;
         self
     }
 
@@ -694,12 +1186,32 @@ impl RtpPacketizer {
     /// well-formed H.261 picture).
     pub fn pack_frame(&mut self, frame_bytes: &[u8], rtp_timestamp_90khz: u32) -> Vec<RtpPacket> {
         let inner_budget = self.max_payload - RTP_FIXED_HEADER_LEN;
-        let h261_payloads = packetize_gob_aligned(
-            frame_bytes,
-            inner_budget,
-            self.intra_only,
-            self.motion_vectors,
-        );
+        let h261_payloads = if self.mb_fragmentation {
+            // §4.2 RECOMMENDED path; fall back to the GOB-aligned
+            // byte-split when no MB-boundary split exists so a frame is
+            // never dropped on the floor.
+            packetize_mb_fragmented(
+                frame_bytes,
+                inner_budget,
+                self.intra_only,
+                self.motion_vectors,
+            )
+            .unwrap_or_else(|_| {
+                packetize_gob_aligned(
+                    frame_bytes,
+                    inner_budget,
+                    self.intra_only,
+                    self.motion_vectors,
+                )
+            })
+        } else {
+            packetize_gob_aligned(
+                frame_bytes,
+                inner_budget,
+                self.intra_only,
+                self.motion_vectors,
+            )
+        };
 
         if h261_payloads.is_empty() {
             return Vec::new();
@@ -1524,5 +2036,415 @@ mod tests {
         }
         let recovered = depacketize(&inner).unwrap();
         assert_eq!(recovered, frame);
+    }
+
+    // ------------------------------------------------------------------
+    // MB-level fragmentation (RFC 4587 §4.2 RECOMMENDED packetization)
+    // ------------------------------------------------------------------
+
+    /// Deterministic textured QCIF planes — enough AC energy that the
+    /// coded picture is several KiB at quant 8 (forces MB-level splits).
+    fn textured_qcif() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let (w, h) = (176usize, 144usize);
+        let mut y = vec![0u8; w * h];
+        let mut state = 0x2545_F491u32;
+        for j in 0..h {
+            for i in 0..w {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let base = 40 + ((i * 160) / w + (j * 40) / h) as u32;
+                y[j * w + i] = (base + (state & 0x3F)).min(255) as u8;
+            }
+        }
+        let mut cb = vec![128u8; (w / 2) * (h / 2)];
+        let mut cr = vec![128u8; (w / 2) * (h / 2)];
+        for (idx, v) in cb.iter_mut().enumerate() {
+            *v = 100 + ((idx * 7) % 56) as u8;
+        }
+        for (idx, v) in cr.iter_mut().enumerate() {
+            *v = 110 + ((idx * 11) % 36) as u8;
+        }
+        (y, cb, cr)
+    }
+
+    fn encode_textured_qcif_intra(quant: u32) -> Vec<u8> {
+        let (y, cb, cr) = textured_qcif();
+        crate::encoder::encode_intra_picture(
+            crate::picture::SourceFormat::Qcif,
+            &y,
+            176,
+            &cb,
+            88,
+            &cr,
+            88,
+            quant,
+            0,
+        )
+        .expect("encode_intra_picture")
+    }
+
+    /// Re-walk an elementary stream with the REAL decoder
+    /// (`decode_macroblock`, full pixel reconstruction) recording the
+    /// same split-point list `walk_mb_split_points` produces. This is
+    /// the independent oracle the Huffman-layer skip walk is checked
+    /// against: if the skip path consumed even one bit more or less
+    /// than the decode path, the positions (and thus every §4.1 context
+    /// field) would diverge.
+    fn decoder_walk_oracle(data: &[u8]) -> Vec<SplitPoint> {
+        use crate::gob::{cif_gob_origin_luma, qcif_gob_origin_luma};
+        use crate::mb::{decode_macroblock, Picture};
+        use crate::picture::SourceFormat;
+
+        let mut br = BitReader::new(data);
+        let mut points = Vec::new();
+        let mut fmt = SourceFormat::Qcif;
+        let mut pic = Picture::new(176, 144);
+        loop {
+            let pos = br.bit_position();
+            let Some(sc) = find_next_start_code_bits(data, pos) else {
+                break;
+            };
+            if sc.bit_pos > pos {
+                br.skip((sc.bit_pos - pos) as u32).unwrap();
+            }
+            if sc.gn == GN_PICTURE {
+                points.push(SplitPoint {
+                    bit: sc.bit_pos,
+                    is_psc: true,
+                    ctx: None,
+                });
+                let hdr = parse_picture_header(&mut br).unwrap();
+                fmt = hdr.source_format;
+                pic = Picture::new(hdr.width as usize, hdr.height as usize);
+                continue;
+            }
+            points.push(SplitPoint {
+                bit: sc.bit_pos,
+                is_psc: false,
+                ctx: None,
+            });
+            let gob_hdr = parse_gob_header(&mut br).unwrap();
+            let (gob_x, gob_y) = match fmt {
+                SourceFormat::Cif => cif_gob_origin_luma(gob_hdr.gn),
+                SourceFormat::Qcif => qcif_gob_origin_luma(gob_hdr.gn),
+            };
+            let mut quant = gob_hdr.gquant as u32;
+            let mut ctx = MbContext::reset();
+            let mut current_mba: i32 = 0;
+            loop {
+                let remaining = br.bits_remaining();
+                if remaining == 0 {
+                    break;
+                }
+                if remaining >= 16 && br.peek_u32(16).unwrap() == 0x0001 {
+                    break;
+                }
+                let Some(diff) = decode_mba_diff(&mut br).unwrap() else {
+                    break;
+                };
+                let new_mba = current_mba + diff as i32;
+                current_mba = new_mba;
+                decode_macroblock(
+                    &mut br,
+                    new_mba as u8,
+                    gob_x,
+                    gob_y,
+                    &mut quant,
+                    &mut ctx,
+                    &mut pic,
+                    None,
+                )
+                .unwrap();
+                if new_mba <= 32 {
+                    points.push(SplitPoint {
+                        bit: br.bit_position(),
+                        is_psc: false,
+                        ctx: Some(FragCtx {
+                            gobn: gob_hdr.gn,
+                            last_mba: new_mba as u8,
+                            quant: quant as u8,
+                            mv: if ctx.prev_was_mc { ctx.mv } else { (0, 0) },
+                        }),
+                    });
+                }
+            }
+        }
+        points
+    }
+
+    #[test]
+    fn mb_walker_matches_real_decoder_bit_for_bit() {
+        // The fragmenter's Huffman-layer walk must consume EXACTLY the
+        // bits the real decoder consumes, or every recorded split point
+        // (and thus every §4.1 context field) would be garbage. Check a
+        // real encoded picture against the decode-path oracle across a
+        // quantiser sweep (different quants exercise different TCOEFF
+        // code lengths and escape usage).
+        for quant in [2u32, 8, 31] {
+            let bits = encode_textured_qcif_intra(quant);
+            let walked = walk_mb_split_points(&bits).expect("walk");
+            let oracle = decoder_walk_oracle(&bits);
+            assert_eq!(
+                walked, oracle,
+                "walker desynced from decoder at quant {quant}"
+            );
+            // Structure: 1 PSC + 3 GBSCs (QCIF GOBs 1, 3, 5), and an
+            // INTRA picture codes all 33 MBs of every GOB — 32 mid-GOB
+            // split points each (MB 33's end is the next start code).
+            assert_eq!(walked.iter().filter(|p| p.is_psc).count(), 1);
+            assert_eq!(
+                walked
+                    .iter()
+                    .filter(|p| !p.is_psc && p.ctx.is_none())
+                    .count(),
+                3,
+                "QCIF transmits GOBs 1, 3, 5"
+            );
+            assert_eq!(walked.iter().filter(|p| p.ctx.is_some()).count(), 3 * 32);
+        }
+    }
+
+    #[test]
+    fn mb_walker_matches_real_decoder_on_p_picture_with_motion() {
+        // P-picture coverage: shifted+textured content makes the encoder
+        // emit INTER+MC (and FIL) macroblocks with non-zero MVDs, so the
+        // walker's §4.2.3.4 MV-predictor tracking is exercised against
+        // the decode-path oracle too.
+        let (y, cb, cr) = textured_qcif();
+        let mut enc = crate::encoder::H261Encoder::new(crate::picture::SourceFormat::Qcif, 6);
+        let _i = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).expect("I");
+        // Shift the luma 4 right / 2 down for clean integer-pel motion.
+        let mut y2 = vec![0u8; 176 * 144];
+        for j in 0..144usize {
+            for i in 0..176usize {
+                let sj = j.saturating_sub(2);
+                let si = i.saturating_sub(4);
+                y2[j * 176 + i] = y[sj * 176 + si];
+            }
+        }
+        let p_bits = enc.encode_frame(&y2, 176, &cb, 88, &cr, 88).expect("P");
+
+        let walked = walk_mb_split_points(&p_bits).expect("walk");
+        let oracle = decoder_walk_oracle(&p_bits);
+        assert_eq!(walked, oracle, "walker desynced from decoder on P-picture");
+        assert!(
+            walked.iter().any(|p| p.ctx.is_some_and(|c| c.mv != (0, 0))),
+            "shifted content should produce at least one MC-coded MB boundary"
+        );
+    }
+
+    #[test]
+    fn mb_fragment_round_trip_is_byte_exact_and_respects_budget() {
+        let bits = encode_textured_qcif_intra(8);
+        for &budget in &[128usize, 256, 512] {
+            let pkts = packetize_mb_fragmented(&bits, budget, true, false).expect("fragment");
+            assert!(
+                pkts.len() > 3,
+                "expected several packets at budget {budget}"
+            );
+            let mut saw_continuation = false;
+            for p in &pkts {
+                assert!(
+                    p.bytes.len() <= budget,
+                    "payload {} exceeds budget {budget}",
+                    p.bytes.len()
+                );
+                assert!(p.bytes.len() > HEADER_LEN);
+                if p.header.gobn != 0 {
+                    saw_continuation = true;
+                    // Continuation context invariants (RFC 4587 §4.1).
+                    assert!((1..=12).contains(&p.header.gobn));
+                    assert!((1..=31).contains(&p.header.quant));
+                    assert!(p.header.mbap <= 31);
+                    assert!((-15..=15).contains(&p.header.hmvd));
+                    assert!((-15..=15).contains(&p.header.vmvd));
+                }
+            }
+            assert!(
+                saw_continuation,
+                "budget {budget} should force at least one mid-GOB packet"
+            );
+            // Exactly one marker (single picture), on the last packet.
+            assert_eq!(pkts.iter().filter(|p| p.marker).count(), 1);
+            assert!(pkts.last().unwrap().marker);
+            let recovered = depacketize(&pkts).expect("depacketize");
+            assert_eq!(recovered, bits, "round trip at budget {budget}");
+        }
+    }
+
+    #[test]
+    fn mb_fragment_boundaries_are_bit_contiguous() {
+        // Fragments tile the stream with no gaps: every consecutive pair
+        // must agree on the split bit (next.sbit == (8 - prev.ebit) % 8)
+        // and share the split byte when it lands mid-byte.
+        let bits = encode_textured_qcif_intra(8);
+        let pkts = packetize_mb_fragmented(&bits, 128, true, false).expect("fragment");
+        let mut misaligned_splits = 0;
+        for pair in pkts.windows(2) {
+            let (prev, next) = (&pair[0], &pair[1]);
+            assert_eq!(
+                next.header.sbit,
+                (8 - prev.header.ebit) % 8,
+                "SBIT/EBIT must describe the same split bit"
+            );
+            if next.header.sbit != 0 {
+                misaligned_splits += 1;
+                assert_eq!(
+                    prev.bytes.last().unwrap(),
+                    &next.bytes[HEADER_LEN],
+                    "fragments must share the split byte"
+                );
+            }
+        }
+        assert!(
+            misaligned_splits > 0,
+            "expected at least one non-byte-aligned MB split"
+        );
+    }
+
+    #[test]
+    fn mb_fragment_continuation_context_matches_walker() {
+        // Every continuation packet's §4.1 context must equal a walker
+        // split point (which the oracle test above ties bit-for-bit to
+        // the real decoder).
+        let bits = encode_textured_qcif_intra(8);
+        let pkts = packetize_mb_fragmented(&bits, 128, true, false).expect("fragment");
+        let points = walk_mb_split_points(&bits).expect("walk");
+
+        let mut checked = 0;
+        for p in pkts.iter().filter(|p| p.header.gobn != 0) {
+            let matched = points.iter().any(|sp| {
+                sp.ctx.is_some_and(|c| {
+                    c.gobn == p.header.gobn
+                        && c.last_mba == p.header.mbap + 1
+                        && c.quant == p.header.quant
+                        && c.mv == (p.header.hmvd as i32, p.header.vmvd as i32)
+                        && (sp.bit % 8) as u8 == p.header.sbit
+                })
+            });
+            assert!(
+                matched,
+                "continuation header {:?} matches no walker split point",
+                p.header
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "expected continuation packets to verify");
+    }
+
+    #[test]
+    fn mb_fragment_errors_when_no_split_fits() {
+        // With max_data = 1 even the picture-header-to-GBSC unit (4
+        // bytes: PSC + TR + PTYPE + PEI = 32 bits) cannot be emitted;
+        // the fragmenter must surface FragmentTooLarge instead of
+        // emitting an undecodable packet.
+        let bits = encode_textured_qcif_intra(8);
+        match packetize_mb_fragmented(&bits, HEADER_LEN + 1, true, false) {
+            Err(RtpError::FragmentTooLarge { needed, max }) => {
+                assert_eq!(max, 1);
+                assert!(needed > 1);
+            }
+            other => panic!("expected FragmentTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mb_fragment_emits_single_packet_when_frame_fits() {
+        // §3.2 efficiency rule: multiple MBs (here, the whole picture —
+        // picture header plus all three GOBs) ride one packet when they
+        // fit, unlike the one-payload-per-start-code cheap packetizer.
+        let bits = encode_textured_qcif_intra(16);
+        let pkts =
+            packetize_mb_fragmented(&bits, bits.len() + HEADER_LEN, true, false).expect("fragment");
+        assert_eq!(pkts.len(), 1, "whole frame fits one packet");
+        let p = &pkts[0];
+        assert!(p.marker);
+        assert_eq!(p.header.sbit, 0);
+        assert_eq!(p.header.ebit, 0);
+        assert_eq!(p.header.gobn, 0);
+        assert_eq!(p.header.quant, 0);
+        assert_eq!(depacketize(&pkts).unwrap(), bits);
+    }
+
+    #[test]
+    fn mb_fragment_never_spans_a_psc() {
+        // Two coded pictures in one buffer: every frame's tail packet
+        // carries the marker, and the next packet starts at the PSC
+        // (zero context, byte-aligned SBIT=0) — packets of different
+        // video frames must not share an RTP packet (§4.1 timestamps).
+        let (y, cb, cr) = textured_qcif();
+        let mut enc = crate::encoder::H261Encoder::new(crate::picture::SourceFormat::Qcif, 8);
+        let f0 = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).expect("I");
+        let f1 = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).expect("P");
+        let mut stream = f0.clone();
+        stream.extend_from_slice(&f1);
+
+        let pkts = packetize_mb_fragmented(&stream, 128, true, false).expect("fragment");
+        assert_eq!(
+            pkts.iter().filter(|p| p.marker).count(),
+            2,
+            "one marker per picture"
+        );
+        // The packet after each marker starts the next frame at its PSC.
+        for pair in pkts.windows(2) {
+            if pair[0].marker {
+                assert_eq!(pair[1].header.gobn, 0);
+                assert_eq!(pair[1].header.sbit, 0);
+            }
+        }
+        assert_eq!(depacketize(&pkts).unwrap(), stream);
+    }
+
+    #[test]
+    fn rtp_packetizer_mb_fragmentation_emits_context_and_round_trips() {
+        let bits = encode_textured_qcif_intra(8);
+        let mut pk = RtpPacketizer::new(96, 0xABCD_EF01, 0, 200)
+            .with_intra_only(true)
+            .with_mb_fragmentation(true);
+        let packets = pk.pack_frame(&bits, 0);
+        assert!(!packets.is_empty());
+        let mut inner = Vec::new();
+        let mut saw_continuation = false;
+        for p in &packets {
+            assert!(p.bytes.len() <= 200);
+            let (_h, rest) = parse_rtp_fixed_header(&p.bytes).unwrap();
+            let (h261, _) = unpack_header(rest).unwrap();
+            if h261.gobn != 0 {
+                saw_continuation = true;
+            }
+            inner.push(H261RtpPayload {
+                header: h261,
+                bytes: rest.to_vec(),
+                marker: p.marker,
+            });
+        }
+        assert!(saw_continuation, "MTU 200 should force mid-GOB packets");
+        assert!(packets.last().unwrap().marker);
+        assert_eq!(packets.iter().filter(|p| p.marker).count(), 1);
+        assert_eq!(depacketize(&inner).unwrap(), bits);
+    }
+
+    #[test]
+    fn rtp_packetizer_mb_fragmentation_falls_back_when_unsplittable() {
+        // Inner budget of 5 bytes (max_data = 1) cannot hold the picture
+        // header; pack_frame must fall back to the byte-split path
+        // instead of dropping the frame.
+        let bits = encode_textured_qcif_intra(16);
+        let mtu = RTP_FIXED_HEADER_LEN + HEADER_LEN + 1;
+        let mut pk = RtpPacketizer::new(96, 1, 0, mtu).with_mb_fragmentation(true);
+        let packets = pk.pack_frame(&bits, 0);
+        assert!(!packets.is_empty(), "fallback must still emit packets");
+        let mut inner = Vec::new();
+        for p in &packets {
+            assert!(p.bytes.len() <= mtu);
+            let (_h, rest) = parse_rtp_fixed_header(&p.bytes).unwrap();
+            inner.push(H261RtpPayload {
+                header: unpack_header(rest).unwrap().0,
+                bytes: rest.to_vec(),
+                marker: p.marker,
+            });
+        }
+        assert_eq!(depacketize(&inner).unwrap(), bits);
     }
 }

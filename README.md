@@ -37,6 +37,7 @@ oxideav-h261 = "0.0"
 | BCH (511,493) FEC framing (§5.4) + t = 1 correction | yes | yes    |
 | HRD buffer model (§5.2 + Annex B)                | yes    | yes    |
 | RTP payload format (RFC 4587 §4.1)               | yes    | yes    |
+| RTP MB-level fragmentation (RFC 4587 §4.2)       | yes    | yes    |
 | RTCP SR / RR reports (RFC 3550 §6.4)             | yes    | yes    |
 | RTCP SDES + BYE + compound (RFC 3550 §6.5/§6.6)  | yes    | yes    |
 | RTCP APP application-defined (RFC 3550 §6.7)     | yes    | yes    |
@@ -259,12 +260,51 @@ let recovered = depacketize(&packets).expect("depacketize");
 assert_eq!(recovered, elementary_stream);
 ```
 
-The packetizer handles GOBs that exceed the MTU by splitting at byte
-boundaries (SBIT/EBIT stay zero in that case too). The 4-byte header
-covers SBIT/EBIT, the I/V hint bits, and the GOBN/MBAP/QUANT/HMVD/VMVD
-context fields; the GOB-aligned packetizer sets the context fields to
-zero per §4.1. MB-level fragmentation with non-zero context is left to
-the caller via [`pack_header`] / [`unpack_header`].
+The cheap packetizer handles GOBs that exceed the MTU by splitting at
+byte boundaries (SBIT/EBIT stay zero in that case too). The 4-byte
+header covers SBIT/EBIT, the I/V hint bits, and the
+GOBN/MBAP/QUANT/HMVD/VMVD context fields; the GOB-aligned packetizer
+sets the context fields to zero per §4.1.
+
+#### MB-level fragmentation (`packetize_mb_fragmented`, §4.2)
+
+`packetize_mb_fragmented` is the §4.2 RECOMMENDED packetization: the
+elementary stream is parsed once at the Huffman layer (§4.2: "only the
+Huffman encoding must be parsed and ... it is not necessary to
+decompress the stream fully") to collect every legal split point —
+each PSC/GBSC and the first bit after every macroblock — then packets
+are filled greedily (multiple GOBs/MBs per packet when they fit, per
+the §3.2 efficiency recommendation) under the §3.2 rules: an MB is
+never split across packets, the stream is never fragmented between a
+GOB header and MB 1, and no packet crosses a PSC (different frames
+need different RTP timestamps). A packet starting mid-GOB carries the
+full §4.1 context — non-zero SBIT/EBIT (the encoder bit-packs GOB
+headers, so split bits land mid-byte and consecutive packets share
+the split byte), GOBN, the MBAP predictor (last MBA of the previous
+packet, biased -1), the QUANT in effect, and the reference HMVD/VMVD
+(zero when the previous MB was not MC-coded) — so a receiver can
+resume decoding mid-GOB after losing the preceding packet. The
+internal Huffman-layer walk is verified bit-for-bit against the real
+decoder (a `decode_macroblock` oracle) across I- and P-pictures in
+`src/rtp.rs`; `depacketize` reassembles the output byte-exactly. A
+stream whose smallest legal fragment exceeds the budget surfaces
+`RtpError::FragmentTooLarge` instead of emitting an undecodable
+packet. `RtpPacketizer::with_mb_fragmentation(true)` switches the
+session glue onto this path (with an automatic fallback to the
+byte-split cheap path so a frame is never dropped).
+
+```rust
+use oxideav_h261::rtp::{packetize_mb_fragmented, depacketize};
+
+let elementary_stream: Vec<u8> = /* one coded picture */ vec![];
+let packets = packetize_mb_fragmented(&elementary_stream, 200, true, false)?;
+for p in &packets {
+    // Continuation packets carry GOBN/MBAP/QUANT/HMVD/VMVD per §4.1.
+    let _ = (p.header.gobn, p.header.mbap, p.header.quant);
+}
+let recovered = depacketize(&packets).expect("byte-exact");
+# Ok::<(), oxideav_h261::rtp::RtpError>(())
+```
 
 #### Encoder-side full RTP packetiser (`RtpPacketizer`)
 

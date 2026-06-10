@@ -124,7 +124,9 @@ pub fn luma_to_chroma_mv(v: i32) -> i32 {
 /// §4.2.3.4: exactly one of `predictor + a` and `predictor + b` is in the
 /// range `[-15, 15]`; we pick that one. If both are in-range (impossible
 /// when `|predictor| <= 15` and `|a-b| == 32` with `a != 0`), we pick `a`.
-fn reconstruct_mv(predictor: i32, sym: MvdSym) -> i32 {
+/// Also used by the RTP MB-level fragmenter's Huffman-layer walker
+/// (RFC 4587 §4.2) to track the reference MVD across packet boundaries.
+pub(crate) fn reconstruct_mv(predictor: i32, sym: MvdSym) -> i32 {
     let a = predictor + sym.a as i32;
     let b = predictor + sym.b as i32;
     let in_range = |v: i32| (-15..=15).contains(&v);
