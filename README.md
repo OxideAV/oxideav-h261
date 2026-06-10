@@ -469,7 +469,14 @@ else QCIF" mode (the order `format_value` emits), and
 "Parameters offered first are the most preferred picture mode to be received"
 order observed in a raw `a=fmtp` value — so a peer that emits `QCIF=1;CIF=2`
 is recognised as QCIF-preferring even though the typed `H261FmtpParams` view
-loses token order. `max_frame_rate`
+loses token order. The emit-side dual,
+`H261FmtpParams::format_value_preferred(preferred)` /
+`format_fmtp_preferred(pt, &params, preferred)`, lets an endpoint express its
+own §6.2.1 preference on the wire by leading with the preferred picture-size
+token (`QCIF=1;CIF=2;D=1` for a QCIF-preferring endpoint); a CIF preference is
+byte-identical to the canonical `format_value` / `format_fmtp` order, an
+unadvertised preference falls back to that canonical order, and `D` stays
+last since it is an Annex-D codec option, not a picture mode. `max_frame_rate`
 / `mpi` / `supports` read out the advertised capability per `SourceFormat`. The
 free function `negotiate_answer(offer, our_capability)` computes the §6.2.1
 **answer** by intersecting both peers' picture sizes, taking `max(offer.MPI,
@@ -569,7 +576,9 @@ five distinct attack surfaces an H.261 endpoint exposes:
   the input on `|` and feeds the `(offer, our)` halves to the
   negotiator; for any input that parses cleanly the formatter output
   is reparsed back through `parse_value` so a round-trip mismatch
-  trips the daily run.
+  trips the daily run — including both §6.2.1 preference orders via
+  `format_value_preferred`, whose leading token is read back through
+  `parse_preference_order`.
 
 The contract under test is the same for all five targets: every
 call must *return* — no panic, no abort, no integer overflow (in

@@ -145,6 +145,34 @@ fn drive(bytes: &[u8]) {
         assert_eq!(order_has_cif, params.cif.is_some());
         assert_eq!(order_has_qcif, params.qcif.is_some());
         assert!(order.len() <= 2);
+
+        // ---- Mode G: §6.2.1 preference-aware formatter oracle. ----
+        //
+        // Emit-side dual of Mode F: §6.2.1's "Parameters offered first
+        // are the most preferred picture mode to be received" means an
+        // endpoint expresses its preference purely through token
+        // order. (1) A CIF preference is byte-identical to the
+        // canonical `format_value`; (2) both preference emissions
+        // reparse to the same params; (3) whenever the params
+        // advertise the preferred size, `parse_preference_order`
+        // reads that preference back as the leading entry.
+        use oxideav_h261::picture::SourceFormat;
+        assert_eq!(
+            params.format_value_preferred(SourceFormat::Cif),
+            params.format_value(),
+        );
+        for fmt in [SourceFormat::Cif, SourceFormat::Qcif] {
+            let formatted = params.format_value_preferred(fmt);
+            let reparsed = H261FmtpParams::parse_value(&formatted)
+                .expect("preferred formatter output reparses");
+            assert_eq!(reparsed, params);
+            if params.supports(fmt) {
+                assert_eq!(
+                    H261FmtpParams::parse_preference_order(&formatted).first(),
+                    Some(&fmt),
+                );
+            }
+        }
     }
 }
 
@@ -408,6 +436,33 @@ fn parse_fmtp_strict_rejects_no_picture_size_advertisement() {
         strict_err,
         Some(Err(SdpError::MalformedToken { .. }))
     ));
+}
+
+#[test]
+fn preferred_formatter_expresses_qcif_preference_on_the_wire() {
+    // RFC 4587 §6.2.1: "Parameters offered first are the most preferred
+    // picture mode to be received." `format_value` is locked to the
+    // CIF-first worked-example order; the preference-aware formatter
+    // must let a QCIF-preferring endpoint lead with QCIF and the
+    // parse-side wire-order accessor must read it back.
+    use oxideav_h261::picture::SourceFormat;
+    use oxideav_h261::sdp::format_fmtp_preferred;
+    let params = H261FmtpParams {
+        cif: Some(2),
+        qcif: Some(1),
+        d: Some(true),
+    };
+    let line = format_fmtp_preferred(31, &params, SourceFormat::Qcif).unwrap();
+    assert_eq!(line, "a=fmtp:31 QCIF=1;CIF=2;D=1");
+    assert_eq!(
+        H261FmtpParams::parse_preference_order("QCIF=1;CIF=2;D=1"),
+        vec![SourceFormat::Qcif, SourceFormat::Cif],
+    );
+    // CIF preference is byte-identical to the fixed-order builder.
+    assert_eq!(
+        format_fmtp_preferred(31, &params, SourceFormat::Cif),
+        oxideav_h261::sdp::format_fmtp(31, &params),
+    );
 }
 
 #[test]

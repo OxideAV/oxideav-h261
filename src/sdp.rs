@@ -261,13 +261,58 @@ impl H261FmtpParams {
     /// who want the §6.1.1 "SHOULD NOT be used" behaviour for unsupported
     /// Annex D set `d: None` instead.
     pub fn format_value(&self) -> String {
+        // The canonical emission order is CIF-first — exactly the
+        // §6.2.1 worked-example order — so the fixed-order formatter is
+        // the CIF-preferring case of the preference-aware one.
+        self.format_value_preferred(SourceFormat::Cif)
+    }
+
+    /// Emit the bare semicolon-separated parameter string with the
+    /// caller's preferred picture size first (§6.2.1).
+    ///
+    /// §6.2.1: "Parameters offered first are the most preferred picture
+    /// mode to be received." [`format_value`](Self::format_value) always
+    /// emits CIF before QCIF (the §6.2.1 worked-example order), so an
+    /// endpoint that advertises both sizes but prefers to *receive* QCIF
+    /// cannot express that preference through it. This variant emits the
+    /// `preferred` picture-size token first when that size is advertised,
+    /// then the other advertised size, then `D` last (`D` is an Annex-D
+    /// codec option, not a picture mode, so the §6.2.1 "offered first"
+    /// rule does not order it).
+    ///
+    /// When `preferred` is **not** advertised on `self` (its field is
+    /// `None`), the preference is meaningless on the wire — the emission
+    /// falls back to the canonical CIF-before-QCIF order over whatever
+    /// is advertised. `format_value_preferred(SourceFormat::Cif)` is
+    /// therefore always identical to `format_value()`.
+    ///
+    /// The output round-trips through
+    /// [`parse_value`](Self::parse_value) to an equal `H261FmtpParams`
+    /// (token order never changes the parsed fields), and — whenever
+    /// `self` advertises `preferred` — through
+    /// [`parse_preference_order`](Self::parse_preference_order) with
+    /// `preferred` as the leading entry, closing the loop with the
+    /// parse-side §6.2.1 wire-order accessor.
+    ///
+    /// ```
+    /// use oxideav_h261::picture::SourceFormat;
+    /// use oxideav_h261::sdp::H261FmtpParams;
+    /// let params = H261FmtpParams { cif: Some(2), qcif: Some(1), d: Some(true) };
+    /// // Spec worked-example order (CIF preferred).
+    /// assert_eq!(params.format_value_preferred(SourceFormat::Cif), "CIF=2;QCIF=1;D=1");
+    /// // QCIF-preferring endpoint leads with QCIF per §6.2.1.
+    /// assert_eq!(params.format_value_preferred(SourceFormat::Qcif), "QCIF=1;CIF=2;D=1");
+    /// ```
+    pub fn format_value_preferred(&self, preferred: SourceFormat) -> String {
+        let cif = self.cif.map(|mpi| format!("CIF={mpi}"));
+        let qcif = self.qcif.map(|mpi| format!("QCIF={mpi}"));
+        let (first, second) = match preferred {
+            SourceFormat::Qcif => (qcif, cif),
+            SourceFormat::Cif => (cif, qcif),
+        };
         let mut parts: Vec<String> = Vec::new();
-        if let Some(cif) = self.cif {
-            parts.push(format!("CIF={cif}"));
-        }
-        if let Some(qcif) = self.qcif {
-            parts.push(format!("QCIF={qcif}"));
-        }
+        parts.extend(first);
+        parts.extend(second);
         if let Some(d) = self.d {
             parts.push(format!("D={}", u8::from(d)));
         }
@@ -533,6 +578,32 @@ pub fn format_rtpmap(payload_type: u8) -> String {
 /// Example: `format_fmtp(31, &params)` → `"a=fmtp:31 CIF=2;QCIF=1;D=1"`.
 pub fn format_fmtp(payload_type: u8, params: &H261FmtpParams) -> Option<String> {
     let value = params.format_value();
+    if value.is_empty() {
+        None
+    } else {
+        Some(format!("a=fmtp:{payload_type} {value}"))
+    }
+}
+
+/// Preference-aware counterpart of [`format_fmtp`]: same `a=fmtp` line
+/// builder, but the parameter value is emitted via
+/// [`H261FmtpParams::format_value_preferred`] so the caller's preferred
+/// picture size leads the list per the RFC 4587 §6.2.1 rule "Parameters
+/// offered first are the most preferred picture mode to be received."
+/// Returns `None` if no optional parameters are present (§6.2 includes
+/// the line only "if any"), exactly like [`format_fmtp`].
+/// `format_fmtp_preferred(pt, params, SourceFormat::Cif)` is always
+/// identical to `format_fmtp(pt, params)` (CIF-first is the canonical
+/// §6.2.1 worked-example order).
+///
+/// Example: `format_fmtp_preferred(31, &params, SourceFormat::Qcif)` →
+/// `"a=fmtp:31 QCIF=1;CIF=2;D=1"`.
+pub fn format_fmtp_preferred(
+    payload_type: u8,
+    params: &H261FmtpParams,
+    preferred: SourceFormat,
+) -> Option<String> {
+    let value = params.format_value_preferred(preferred);
     if value.is_empty() {
         None
     } else {
@@ -822,6 +893,141 @@ mod tests {
             d: Some(false),
         };
         assert_eq!(p.format_value(), "QCIF=1;D=0");
+    }
+
+    #[test]
+    fn format_value_preferred_cif_matches_canonical_formatter() {
+        // CIF-first is the §6.2.1 worked-example order, i.e. exactly
+        // what `format_value` emits — so a CIF preference must be the
+        // identity over every parameter shape, including the
+        // no-picture-size and empty cases.
+        let shapes = [
+            H261FmtpParams {
+                cif: Some(2),
+                qcif: Some(1),
+                d: Some(true),
+            },
+            H261FmtpParams {
+                cif: Some(4),
+                qcif: None,
+                d: None,
+            },
+            H261FmtpParams {
+                cif: None,
+                qcif: Some(3),
+                d: Some(false),
+            },
+            H261FmtpParams {
+                cif: None,
+                qcif: None,
+                d: Some(true),
+            },
+            H261FmtpParams::default(),
+        ];
+        for p in &shapes {
+            assert_eq!(
+                p.format_value_preferred(SourceFormat::Cif),
+                p.format_value(),
+                "CIF preference must equal the canonical order for {p:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn format_value_preferred_qcif_leads_with_qcif() {
+        // §6.2.1: "Parameters offered first are the most preferred
+        // picture mode to be received." A QCIF-preferring endpoint
+        // advertising both sizes must lead with the QCIF token; `D`
+        // stays last (it is a codec option, not a picture mode).
+        let p = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: Some(true),
+        };
+        let out = p.format_value_preferred(SourceFormat::Qcif);
+        assert_eq!(out, "QCIF=1;CIF=2;D=1");
+        // The parse-side §6.2.1 wire-order accessor must read the
+        // preference back out: QCIF first.
+        assert_eq!(
+            H261FmtpParams::parse_preference_order(&out),
+            vec![SourceFormat::Qcif, SourceFormat::Cif],
+        );
+    }
+
+    #[test]
+    fn format_value_preferred_unadvertised_preference_falls_back() {
+        // Preferring a size the params don't advertise is meaningless
+        // on the wire: the emission falls back to the canonical order
+        // over whatever IS advertised.
+        let cif_only = H261FmtpParams {
+            cif: Some(3),
+            qcif: None,
+            d: Some(true),
+        };
+        assert_eq!(
+            cif_only.format_value_preferred(SourceFormat::Qcif),
+            "CIF=3;D=1",
+        );
+        let qcif_only = H261FmtpParams {
+            cif: None,
+            qcif: Some(2),
+            d: None,
+        };
+        assert_eq!(
+            qcif_only.format_value_preferred(SourceFormat::Cif),
+            "QCIF=2",
+        );
+    }
+
+    #[test]
+    fn format_value_preferred_round_trips_parse_value() {
+        // Token order never changes the parsed fields, so both
+        // preference emissions must reparse to the same params.
+        let p = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(4),
+            d: Some(false),
+        };
+        for fmt in [SourceFormat::Cif, SourceFormat::Qcif] {
+            let out = p.format_value_preferred(fmt);
+            let reparsed = H261FmtpParams::parse_value(&out).expect("formatter output reparses");
+            assert_eq!(reparsed, p, "round trip with preference {fmt:?}");
+            // And the leading wire-order entry is the preference,
+            // since `p` advertises both sizes.
+            assert_eq!(
+                H261FmtpParams::parse_preference_order(&out).first(),
+                Some(&fmt),
+            );
+        }
+    }
+
+    #[test]
+    fn format_fmtp_preferred_builds_full_line() {
+        // Full-line builder mirrors `format_fmtp`, leading with the
+        // preferred size per §6.2.1.
+        let p = H261FmtpParams {
+            cif: Some(2),
+            qcif: Some(1),
+            d: Some(true),
+        };
+        assert_eq!(
+            format_fmtp_preferred(31, &p, SourceFormat::Qcif).unwrap(),
+            "a=fmtp:31 QCIF=1;CIF=2;D=1",
+        );
+        // CIF preference is byte-identical to the fixed-order builder.
+        assert_eq!(
+            format_fmtp_preferred(31, &p, SourceFormat::Cif),
+            format_fmtp(31, &p),
+        );
+        // §6.2 "if any": no parameters ⇒ no line, regardless of the
+        // requested preference.
+        let empty = H261FmtpParams::default();
+        assert_eq!(format_fmtp_preferred(31, &empty, SourceFormat::Qcif), None);
+        // The emitted line reparses through the lenient line parser to
+        // the same params (PT bound to 31).
+        let line = format_fmtp_preferred(96, &p, SourceFormat::Qcif).unwrap();
+        let reparsed = parse_fmtp(&line, 96).unwrap().unwrap();
+        assert_eq!(reparsed, p);
     }
 
     #[test]

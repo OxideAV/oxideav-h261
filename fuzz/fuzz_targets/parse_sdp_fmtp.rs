@@ -21,7 +21,7 @@
 //! UTF-8 text, so the lossy decode preserves the attacker's reach
 //! into every code path the production parsers can hit.)
 //!
-//! ## Four-mode driver
+//! ## Multi-mode driver
 //!
 //! Mode A — **`parse_rtpmap`** — drive the bare line parser, which
 //! accepts an `a=rtpmap:<pt> <enc>/<clock>[/<params>]` line and
@@ -205,5 +205,36 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(order_has_qcif, params.qcif.is_some());
         // No duplicates: at most one CIF and at most one QCIF entry.
         assert!(order.len() <= 2);
+
+        // ---- Mode G: §6.2.1 preference-aware formatter oracle. ----
+        //
+        // `format_value_preferred` is the emit-side dual of the Mode F
+        // parse-side wire-order accessor: §6.2.1's "Parameters offered
+        // first are the most preferred picture mode to be received"
+        // means an endpoint expresses its preference purely through
+        // token order. Three invariants on every parsed input: (1) a
+        // CIF preference is byte-identical to the canonical
+        // `format_value` (CIF-first IS the canonical order); (2) both
+        // preference emissions reparse to the same params (token order
+        // never changes the parsed fields); (3) whenever the params
+        // advertise the preferred size, `parse_preference_order` reads
+        // that preference back as the leading entry.
+        use oxideav_h261::picture::SourceFormat;
+        assert_eq!(
+            params.format_value_preferred(SourceFormat::Cif),
+            params.format_value(),
+        );
+        for fmt in [SourceFormat::Cif, SourceFormat::Qcif] {
+            let out = params.format_value_preferred(fmt);
+            let reparsed =
+                H261FmtpParams::parse_value(&out).expect("preferred formatter output reparses");
+            assert_eq!(reparsed, params);
+            if params.supports(fmt) {
+                assert_eq!(
+                    H261FmtpParams::parse_preference_order(&out).first(),
+                    Some(&fmt),
+                );
+            }
+        }
     }
 });

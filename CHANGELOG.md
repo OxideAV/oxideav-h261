@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC 4587 §6.2.1 preference-aware `a=fmtp` formatter.** §6.2.1
+  states "Parameters offered first are the most preferred picture
+  mode to be received" — an endpoint expresses its receive preference
+  purely through token order. The fixed-order `format_value` /
+  `format_fmtp` are locked to the §6.2.1 worked-example CIF-first
+  order, so an endpoint advertising both picture sizes but preferring
+  to receive QCIF could not express that on the wire. The new
+  `H261FmtpParams::format_value_preferred(preferred)` method and
+  `format_fmtp_preferred(pt, &params, preferred)` free function emit
+  the preferred picture-size token first when that size is advertised
+  (`QCIF=1;CIF=2;D=1` for a QCIF-preferring endpoint), the other
+  advertised size second, and `D` last (`D` is an Annex-D codec
+  option, not a picture mode, so the §6.2.1 "offered first" rule does
+  not order it). A CIF preference is byte-identical to the canonical
+  formatter (`format_value` is now a thin wrapper over
+  `format_value_preferred(SourceFormat::Cif)`); an unadvertised
+  preference falls back to the canonical order; the §6.2 "if any"
+  no-parameters ⇒ no-line rule is preserved. This is the emit-side
+  dual of the parse-side `parse_preference_order` accessor: whenever
+  the params advertise the preferred size, the leading entry of
+  `parse_preference_order(format_value_preferred(fmt))` is `fmt`,
+  closing the §6.2.1 wire-order loop in both directions. Five new
+  unit tests in `src/sdp.rs` cover CIF-preference identity across
+  five parameter shapes, the QCIF-first emission + wire-order
+  read-back, the unadvertised-preference fallback (both directions),
+  the parse round trip under both preferences, and the full
+  `a=fmtp` line builder (QCIF-first line, CIF-preference byte
+  equality with `format_fmtp`, empty-params `None`, reparse through
+  `parse_fmtp`). The existing fuzz target `parse_sdp_fmtp` and the
+  stable-CI `tests/fuzz_seed_corpus_sdp.rs` driver gain a Mode G
+  oracle: on every input that parses cleanly, (1)
+  `format_value_preferred(Cif) == format_value()`, (2) both
+  preference emissions reparse to equal params, and (3) when the
+  params advertise the preferred size, `parse_preference_order`
+  reads it back as the leading entry. New seed
+  `fuzz/corpus/parse_sdp_fmtp/14_fmtp_value_both_sizes_d0.txt`
+  carries a both-sizes + `D=0` bare parameter list. README's
+  SDP-media-type section is updated with the emit-side accessor.
+
 - **RFC 4587 §6.2.1 strict-conformance `a=fmtp` parser.** §6.2.1
   states "Implementations following this specification SHALL specify
   at least one supported picture size." The lenient `parse_fmtp`
