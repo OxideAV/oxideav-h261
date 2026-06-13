@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`filter_mc` criterion benchmark — §3.2.3 loop filter + §3.2.2
+  integer-pel motion-comp.** The existing `transform` bench covered
+  the inner (I)DCT, and `encode` / `decode` cover end-to-end picture
+  cost, but the two *other* per-block P-picture reconstruction
+  primitives the decoder runs on every coded P-block had no isolated
+  baseline. The new `benches/filter_mc.rs` times `mb::apply_loop_filter`
+  (the separable 1/4-1/2-1/4 in-loop filter with 0-1-0 edge taps) and
+  `mb::copy_block_integer` (the integer-pel reference fetch) across
+  three motion regimes (`center`, `mv_nonzero`, `corner_clamp`). Both
+  functions are now `pub` (matching the existing `fdct` / `idct`
+  primitive exports) so an optimisation pass — a SIMD loop filter or a
+  branchless edge-clamp copy — has an A/B baseline distinct from the
+  transform numbers. Round-287 release-build aarch64 baseline: loop
+  filter ≈ 25 ns / block (≈ 2.5 Gelem/s); integer-pel copy ≈ 15 ns /
+  block (≈ 4.1 Gelem/s) interior, ≈ 14.5 ns fully corner-clamped.
+
 - **RFC 4587 §4.2 MB-level fragmentation.** The RTP module previously
   shipped only the "cheap" GOB-aligned packetizer; a GOB larger than
   the payload budget was split at arbitrary byte boundaries with

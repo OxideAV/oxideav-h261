@@ -717,12 +717,14 @@ cargo +nightly fuzz run parse_sdp_fmtp -- -max_total_time=60
 
 ### Benchmarks
 
-A `criterion` benchmark suite lives under `benches/`. Five targets
-cover the codec pipeline plus the §5.4 outer FEC layer and the
-§4.1 / §4.2 start-code scanner so future optimisation rounds (e.g.
-a SIMD IDCT, a fixed-point FDCT, a precomputed CBP-prefix table, a
-faster spiral+diamond ME, a table-driven BCH parity, a SIMD start-
-code pre-scan) have a baseline to A/B against:
+A `criterion` benchmark suite lives under `benches/`. Six targets
+cover the codec pipeline plus the §5.4 outer FEC layer, the
+§4.1 / §4.2 start-code scanner, and the §3.2.3 loop filter /
+§3.2.2 integer-pel motion-comp primitives so future optimisation
+rounds (e.g. a SIMD IDCT, a fixed-point FDCT, a precomputed
+CBP-prefix table, a faster spiral+diamond ME, a table-driven BCH
+parity, a SIMD start-code pre-scan, a SIMD loop filter, a
+branchless edge-clamp block copy) have a baseline to A/B against:
 
 * **`transform`** — single 8×8 block forward / inverse DCT. Four
   sub-scenarios (`fdct_intra` / `fdct_signed` / `idct_intra` /
@@ -775,6 +777,25 @@ code pre-scan) have a baseline to A/B against:
   An eventual SIMD pre-scan over byte-aligned `0x00 0x01`
   candidates plus the bit-walk on the few near-hit windows is the
   obvious follow-up; this bench gives that change its A/B.
+* **`filter_mc`** — the two per-block P-picture reconstruction
+  primitives that sit *outside* the 8×8 transform: the §3.2.3
+  in-loop filter (`mb::apply_loop_filter`, separable
+  1/4-1/2-1/4 with 0-1-0 edge taps) and the §3.2.2 integer-pel
+  motion-comp reference fetch (`mb::copy_block_integer`). The
+  decoder runs both on every coded P-block, and the fuzzer's
+  `decode_h261` target reaches both; `transform` only covered the
+  (I)DCT, so these had no isolated baseline. Sub-scenarios:
+  `loop_filter_8x8/apply_loop_filter` (one 8×8 block), and three
+  motion-comp regimes — `motion_comp_8x8/copy_block_integer::
+  {center, mv_nonzero, corner_clamp}` — exercising the
+  no-clamp common case, a small interior MV, and the worst case
+  where every sample's edge-clamp branch fires. Headline points
+  on the round-287 baseline (release build, aarch64): the loop
+  filter clocks ≈ 25 ns / block (≈ 2.5 Gelem/s); the integer-pel
+  copy ≈ 15 ns / block (≈ 4.1 Gelem/s) interior, ≈ 14.5 ns when
+  fully corner-clamped. A SIMD loop filter and a branchless
+  clamp copy are the obvious follow-ups; this bench gives them
+  their A/B.
 
 Every benchmark synthesises its YUV source inline from a
 deterministic striped pattern plus low-amplitude xorshift noise

@@ -339,8 +339,13 @@ pub fn decode_macroblock(
 
 /// Copy an 8x8 integer-pel block from `ref_plane` at luma position `(bx,by)`
 /// plus `(mvx, mvy)`. Samples outside the plane are clamped to the nearest edge.
+///
+/// This is the §3.2.2 integer-pel motion-compensation primitive — the inner
+/// loop run once per coded block of every P-macroblock. It is `pub` (like the
+/// [`fdct`](crate::fdct) / [`idct`](crate::idct) primitives) so an
+/// optimisation pass has a benchable baseline; the decoder calls it internally.
 #[allow(clippy::too_many_arguments)]
-fn copy_block_integer(
+pub fn copy_block_integer(
     ref_plane: &[u8],
     ref_stride: usize,
     ref_w: i32,
@@ -364,7 +369,12 @@ fn copy_block_integer(
 
 /// Apply the H.261 loop filter (§3.2.3) to an 8x8 block. Separable 1/4-1/2-1/4
 /// filter with edge taps replaced by 0-1-0. Rounds to nearest, half-up.
-fn apply_loop_filter(src: &[u8; 64]) -> [u8; 64] {
+///
+/// This is the §3.2.3 loop-filter primitive applied to the motion-compensated
+/// prediction of every filtered P-block. It is `pub` (like the
+/// [`fdct`](crate::fdct) / [`idct`](crate::idct) primitives) so an optimisation
+/// pass has a benchable baseline; the decoder calls it internally.
+pub fn apply_loop_filter(src: &[u8; 64]) -> [u8; 64] {
     // Horizontal pass.
     let mut h = [0i32; 64];
     for j in 0..8 {

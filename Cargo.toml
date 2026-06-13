@@ -66,3 +66,15 @@ harness = false
 [[bench]]
 name = "start_code"
 harness = false
+
+# Round 287 — §3.2.3 loop filter + §3.2.2 integer-pel motion-comp
+# bench. The `transform` bench covers the inner (I)DCT; this one
+# isolates the two other per-block P-picture reconstruction
+# primitives (`mb::apply_loop_filter`, `mb::copy_block_integer`) that
+# the decoder runs on every coded P-block and that the fuzzer's
+# `decode_h261` target drives. Gives a SIMD filter / branchless
+# edge-clamp copy an A/B baseline alongside the transform / bch /
+# start_code / encode / decode benches.
+[[bench]]
+name = "filter_mc"
+harness = false
