@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-h261/compare/v0.0.6...v0.0.7) - 2026-06-14
+
+### Other
+
+- §4.2.1.3 PTYPE display-control flags (split-screen / doc-cam / freeze-release)
+- §3.4 forced updating — per-MB cyclic INTRA refresh
+- §4.2.3.4 MVD predictor reset at MB-row starts (MBA 12 / 23)
+- criterion suite for §3.2.3 loop filter + §3.2.2 integer-pel MC
+- RFC 4587 §4.2 MB-level fragmentation with §4.1 context
+- §6.2.1 preference-aware a=fmtp formatter
+- §6.2.1 strict-conformance `a=fmtp` parser
+- §6.2.1 wire-order preference accessor for fmtp
+- §6.2 strict-conformance accessor for RtpMap clock-rate MUST
+- drop release-plz.toml — use release-plz defaults across the workspace
+- criterion suite for §4.1 / §4.2 start-code scanner
+- criterion suite for §5.4 BCH (511, 493) FEC layer
+- §5.4.1 single-bit BCH (511,493) error correction (t = 1)
+- still-image sub-image transform per H.261 §D.2 + §D.3
+- fifth cargo-fuzz target for SDP signalling parser
+- Annex A conformance test — §A.1..§A.9 against f64 reference
+- fourth cargo-fuzz target for RTP data-path parser
+- third cargo-fuzz target for BCH (511,493) FEC multiframe parser
+
 ### Added
 
 - **§4.2.1.3 PTYPE display-control flags (encoder).** The encoder can now
