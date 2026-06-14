@@ -32,6 +32,7 @@ oxideav-h261 = "0.0"
 | INTER prediction (P-pictures, no MC)             | yes    | yes    |
 | Integer-pel MC (spiral+diamond ME, ±15)          | yes    | yes    |
 | Loop filter (FIL, §3.2.3) with per-MB RDO        | yes    | yes    |
+| Forced updating (§3.4 per-MB cyclic INTRA refresh) | n/a  | yes    |
 | Per-GOB MQUANT rate control (§4.2.3.3)           | n/a    | yes    |
 | Encoder registry (`first_encoder` / `bit_rate`)  | n/a    | yes    |
 | BCH (511,493) FEC framing (§5.4) + t = 1 correction | yes | yes    |
@@ -66,6 +67,47 @@ At the canonical H.261 target rate (64 kbit/s QCIF / 30 fps), the encoder
 achieves ≥ 45 dB PSNR_Y on smooth content and ≥ 39 dB on the standard
 `testsrc` test pattern (see `bench_testsrc_psnr`). ffmpeg cross-validates
 all P-picture, MC, and FIL streams cleanly.
+
+### Forced updating (§3.4)
+
+H.261 §3.4 mandates that, "for control of accumulation of inverse
+transform mismatch error, a macroblock should be forcibly updated at
+least once per every 132 times it is transmitted." The encoder honours
+this with a per-macroblock cyclic INTRA refresh that runs independently
+of the whole-frame `intra_period` I-refresh. `H261Encoder` keeps a
+transmission counter for every macroblock (global raster order across
+all GOBs — GOB 0 holds MBs 0..33, GOB 1 holds 33..66, …) and forces the
+due macroblocks into INTRA mode inside the next P-picture before any
+counter can reach the period. To avoid a bandwidth spike when every
+counter would otherwise hit the cap on the same frame, the scheduler
+also forces a rotating slice of `ceil(total_mbs / period)` MBs per
+P-frame, so a complete refresh sweep is spread evenly across the
+refresh window. An INTRA macroblock in a P-picture is never
+motion-compensated, so emitting one resets the §4.2.3.4 MVD predictor.
+
+`H261Encoder::with_forced_update_period(p)` overrides the period — the
+default is `132` (the spec maximum); `0` disables per-MB forced updating
+(not recommended for long P-only sequences). Callers that drive the
+stateless P-picture path directly can pass their own forced-update set
+to `encode_inter_picture_forced_update` — for example, the RFC 4587
+§C.3 loss-driven refresh that re-INTRA-codes only the macroblocks a
+receiver reports as damaged.
+
+```rust
+use oxideav_h261::encoder::H261Encoder;
+use oxideav_h261::picture::SourceFormat;
+
+// P-only sequence (no whole-frame I-refresh) that still bounds
+// inverse-transform mismatch via §3.4 per-MB forced updating.
+let mut enc = H261Encoder::new(SourceFormat::Qcif, 12)
+    .with_intra_period(0)        // no whole-frame I after the first
+    .with_forced_update_period(132); // §3.4 upper bound
+let y = vec![0u8; 176 * 144];
+let cb = vec![128u8; 88 * 72];
+let cr = vec![128u8; 88 * 72];
+let _first = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap(); // I
+let _p = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap();     // P + forced INTRA MBs
+```
 
 ### IDCT accuracy (Annex A)
 

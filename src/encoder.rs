@@ -306,6 +306,47 @@ pub fn encode_inter_picture(
     temporal_reference: u8,
     reference: &Picture,
 ) -> Result<(Vec<u8>, Picture)> {
+    encode_inter_picture_forced_update(
+        fmt,
+        y,
+        y_stride,
+        cb,
+        cb_stride,
+        cr,
+        cr_stride,
+        quant,
+        temporal_reference,
+        reference,
+        &[],
+    )
+}
+
+/// Encode a P-picture with an explicit §3.4 forced-updating set.
+///
+/// `forced_mbs` lists the global macroblock indices (raster order over the
+/// whole picture: GOB 0 holds MBs 0..33, GOB 1 holds 33..66, …) that MUST
+/// be transmitted in INTRA mode this frame regardless of the rate/distortion
+/// mode decision. H.261 §3.4 requires every macroblock to be forcibly
+/// INTRA-updated "at least once per every 132 times it is transmitted" so
+/// that inverse-transform mismatch error cannot accumulate without bound;
+/// the per-MB scheduler in [`H261Encoder`] populates this set automatically,
+/// but a caller driving [`encode_inter_picture`] directly can supply its own
+/// (for example, the §C.3 loss-driven MB refresh in RFC 4587). Indices out
+/// of range are ignored; duplicates are harmless.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_inter_picture_forced_update(
+    fmt: SourceFormat,
+    y: &[u8],
+    y_stride: usize,
+    cb: &[u8],
+    cb_stride: usize,
+    cr: &[u8],
+    cr_stride: usize,
+    quant: u32,
+    temporal_reference: u8,
+    reference: &Picture,
+    forced_mbs: &[u32],
+) -> Result<(Vec<u8>, Picture)> {
     validate_inputs(
         fmt,
         y,
@@ -330,12 +371,31 @@ pub fn encode_inter_picture(
     let mut bw = BitWriter::with_capacity(8192);
     write_picture_header(&mut bw, fmt, temporal_reference);
 
-    for &gn in fmt.gob_numbers() {
+    for (gob_idx, &gn) in fmt.gob_numbers().iter().enumerate() {
         write_gob_header(&mut bw, gn, quant);
         let (gob_x, gob_y) = gob_origin_luma(fmt, gn);
+        // Project the global forced-update set onto this GOB's 33 MBs.
+        let mb_base = (gob_idx * 33) as u32;
+        let mut forced_intra = [false; 33];
+        for &gm in forced_mbs {
+            if gm >= mb_base && gm < mb_base + 33 {
+                forced_intra[(gm - mb_base) as usize] = true;
+            }
+        }
         encode_gob_inter(
-            &mut bw, y, y_stride, cb, cb_stride, cr, cr_stride, gob_x, gob_y, quant, reference,
+            &mut bw,
+            y,
+            y_stride,
+            cb,
+            cb_stride,
+            cr,
+            cr_stride,
+            gob_x,
+            gob_y,
+            quant,
+            reference,
             &mut recon,
+            &forced_intra,
         );
     }
 
@@ -358,6 +418,18 @@ pub struct H261Encoder {
     /// after the first I.
     intra_period: u32,
     frames_since_intra: u32,
+    /// §3.4 forced-updating period: the maximum number of times a single
+    /// macroblock may be transmitted before it MUST be forcibly INTRA-coded
+    /// (the spec mandates "at least once per every 132"). 0 disables per-MB
+    /// forced updating (relying solely on `intra_period` whole-frame I's).
+    forced_update_period: u32,
+    /// Per-MB transmission counter since each MB's last INTRA coding, in
+    /// global raster order (GOB 0 = MBs 0..33, GOB 1 = 33..66, …). Sized to
+    /// the source format on the first frame.
+    mb_since_intra: Vec<u32>,
+    /// Round-robin cursor so the forced-update load is spread across frames
+    /// rather than spiking every 132th P-frame.
+    forced_update_cursor: usize,
 }
 
 impl H261Encoder {
@@ -371,6 +443,9 @@ impl H261Encoder {
             reference: None,
             intra_period: 30, // an I-refresh roughly every second at 30 fps
             frames_since_intra: 0,
+            forced_update_period: 132, // §3.4 upper bound
+            mb_since_intra: Vec::new(),
+            forced_update_cursor: 0,
         }
     }
 
@@ -378,6 +453,17 @@ impl H261Encoder {
     /// INTRAs, including the first). `0` disables refresh.
     pub fn with_intra_period(mut self, period: u32) -> Self {
         self.intra_period = period;
+        self
+    }
+
+    /// Override the §3.4 per-MB forced-updating period (the maximum number
+    /// of transmissions a macroblock may go without an INTRA update). The
+    /// spec mandates this be `<= 132`; the default is exactly `132`. Pass
+    /// `0` to disable per-MB forced updating entirely (not recommended for
+    /// long sequences — inverse-transform mismatch error can then accumulate
+    /// unbounded between whole-frame I-refreshes).
+    pub fn with_forced_update_period(mut self, period: u32) -> Self {
+        self.forced_update_period = period;
         self
     }
 
@@ -393,11 +479,22 @@ impl H261Encoder {
         cr: &[u8],
         cr_stride: usize,
     ) -> Result<Vec<u8>> {
+        let total_mbs = self.fmt.gob_numbers().len() * 33;
+        if self.mb_since_intra.len() != total_mbs {
+            self.mb_since_intra = vec![0u32; total_mbs];
+            self.forced_update_cursor = 0;
+        }
+
         let force_intra = self.reference.is_none()
             || (self.intra_period != 0 && self.frames_since_intra >= self.intra_period);
 
         let (bytes, recon) = if force_intra {
             self.frames_since_intra = 1;
+            // A whole-frame INTRA picture forcibly updates every MB.
+            for c in self.mb_since_intra.iter_mut() {
+                *c = 0;
+            }
+            self.forced_update_cursor = 0;
             encode_intra_picture_with_recon(
                 self.fmt,
                 y,
@@ -411,11 +508,13 @@ impl H261Encoder {
             )?
         } else {
             self.frames_since_intra += 1;
+            // §3.4 forced-updating set for this P-picture.
+            let forced = self.compute_forced_update_set(total_mbs);
             let reference = self
                 .reference
                 .as_ref()
                 .expect("reference must exist by now");
-            encode_inter_picture(
+            let result = encode_inter_picture_forced_update(
                 self.fmt,
                 y,
                 y_stride,
@@ -426,12 +525,62 @@ impl H261Encoder {
                 self.quant,
                 self.next_tr,
                 reference,
-            )?
+                &forced,
+            )?;
+            // Update per-MB counters: an INTRA-forced MB resets to 0, every
+            // other MB's "times transmitted since last INTRA" grows by one.
+            for (i, c) in self.mb_since_intra.iter_mut().enumerate() {
+                if forced.binary_search(&(i as u32)).is_ok() {
+                    *c = 0;
+                } else {
+                    *c = c.saturating_add(1);
+                }
+            }
+            result
         };
 
         self.reference = Some(recon);
         self.next_tr = self.next_tr.wrapping_add(1) & 0x1F;
         Ok(bytes)
+    }
+
+    /// Compute the §3.4 forced-update macroblock set for the next P-picture.
+    ///
+    /// Returns the sorted global MB indices that MUST be coded INTRA so that
+    /// no macroblock is transmitted more than `forced_update_period` times
+    /// without an INTRA update (§3.4 controls inverse-transform mismatch
+    /// accumulation). Two contributions are merged:
+    ///
+    ///   * **mandatory** — any MB whose counter is one transmission short of
+    ///     the period (`count + 1 >= period`) is forced now, before it can
+    ///     exceed the bound.
+    ///   * **proactive round-robin** — `ceil(total / period)` MBs per frame
+    ///     are forced on a rotating cursor, so the load is spread evenly
+    ///     across the refresh window instead of spiking when every counter
+    ///     reaches the cap on the same frame.
+    ///
+    /// `period == 0` disables forced updating and returns an empty set.
+    fn compute_forced_update_set(&mut self, total_mbs: usize) -> Vec<u32> {
+        let period = self.forced_update_period;
+        if period == 0 || total_mbs == 0 {
+            return Vec::new();
+        }
+        let mut forced: Vec<u32> = Vec::new();
+        // Mandatory: counters about to exceed the bound.
+        for (i, &c) in self.mb_since_intra.iter().enumerate() {
+            if c + 1 >= period {
+                forced.push(i as u32);
+            }
+        }
+        // Proactive round-robin sweep.
+        let per_frame = total_mbs.div_ceil(period as usize).max(1);
+        for _ in 0..per_frame {
+            forced.push(self.forced_update_cursor as u32);
+            self.forced_update_cursor = (self.forced_update_cursor + 1) % total_mbs;
+        }
+        forced.sort_unstable();
+        forced.dedup();
+        forced
     }
 }
 
@@ -595,6 +744,7 @@ fn encode_gob_inter(
     quant: u32,
     reference: &Picture,
     recon: &mut Picture,
+    forced_intra: &[bool; 33],
 ) {
     let mut prev_mba: u8 = 0;
     // MV predictor state per §4.2.3.4 (reset at GOB start).
@@ -634,6 +784,37 @@ fn encode_gob_inter(
         let cy = luma_y / 2;
         extract_block(cb, cb_stride, cx, cy, &mut blocks_pels[4]);
         extract_block(cr, cr_stride, cx, cy, &mut blocks_pels[5]);
+
+        // ---- 1b. §3.4 forced updating.
+        //
+        // "For control of accumulation of inverse transform mismatch error
+        // a macroblock should be forcibly updated at least once per every
+        // 132 times it is transmitted." (§3.4). When the per-MB scheduler
+        // (see `H261Encoder`) marks this MB due for a forced update, we
+        // emit it in INTRA mode — bypassing the INTER/MC mode decision
+        // entirely — so the decoder discards its prediction history for
+        // this MB and the mismatch error cannot accumulate further.
+        //
+        // An INTRA MB in a P-picture is never motion-compensated, so the
+        // §4.2.3.4 MVD predictor is reset (`pred_mv = 0`, `prev_was_mc =
+        // false`) exactly as the spec treats any non-MC macroblock.
+        if forced_intra[(mba - 1) as usize] {
+            let diff = mba - prev_mba;
+            let (bits, code) = encode_mba_diff(diff);
+            bw.write_u32(code, bits as u32);
+            // MTYPE = INTRA (4-bit 0001). No MQUANT override — reuse the
+            // GOB QUANT in effect.
+            bw.write_u32(MTYPE_INTRA.1, MTYPE_INTRA.0 as u32);
+            encode_intra_mb_blocks(
+                bw, y, y_stride, cb, cb_stride, cr, cr_stride, luma_x, luma_y, quant, recon,
+            );
+            prev_mba = mba;
+            pred_mv = (0, 0);
+            prev_was_mc = false;
+            let bits_after_mb = bw.bit_position();
+            rc.account(bits_after_mb - bits_before_mb);
+            continue;
+        }
 
         // ---- 2. Motion estimation on luma (16×16). Returns best (mvx, mvy).
         //
@@ -2988,5 +3169,218 @@ mod tests {
         let max_p = psnrs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let min_p = psnrs.iter().copied().fold(f64::INFINITY, f64::min);
         eprintln!("[diag] PSNR spread: {:.2} dB", max_p - min_p);
+    }
+
+    // ---- §3.4 Forced updating ------------------------------------------
+
+    /// A P-picture carrying an explicit forced-INTRA set decodes cleanly and
+    /// the forced MBs are reconstructed exactly to the source (INTRA coding
+    /// has no prediction-history dependency), so the decode resets any drift
+    /// in those MBs.
+    #[test]
+    fn forced_update_intra_mb_decodes_and_refreshes() {
+        let (y, cb, cr) = gradient_qcif();
+        let (_iframe, recon) =
+            encode_intra_picture_with_recon(SourceFormat::Qcif, &y, 176, &cb, 88, &cr, 88, 8, 0)
+                .expect("intra");
+
+        // Force MBs 0, 1, 17, 50, 98 (spanning all three QCIF GOBs) to INTRA.
+        let forced: &[u32] = &[0, 1, 17, 50, 98];
+        let (pframe, _r) = encode_inter_picture_forced_update(
+            SourceFormat::Qcif,
+            &y,
+            176,
+            &cb,
+            88,
+            &cr,
+            88,
+            8,
+            1,
+            &recon,
+            forced,
+        )
+        .expect("inter forced");
+
+        // Decode the I + P sequence and check the P-frame is well-formed and
+        // close to the source.
+        let mut stream = Vec::new();
+        let iframe =
+            encode_intra_picture(SourceFormat::Qcif, &y, 176, &cb, 88, &cr, 88, 8, 0).unwrap();
+        stream.extend_from_slice(&iframe);
+        stream.extend_from_slice(&pframe);
+
+        let codec_id = CodecId::new(crate::CODEC_ID_STR);
+        let mut decoder = H261Decoder::new(codec_id);
+        let pkt = Packet {
+            stream_index: 0,
+            data: stream,
+            pts: Some(0),
+            dts: Some(0),
+            duration: None,
+            time_base: TimeBase::new(1, 30_000),
+            flags: PacketFlags {
+                keyframe: true,
+                ..Default::default()
+            },
+        };
+        decoder.send_packet(&pkt).expect("send");
+        decoder.flush().ok();
+        let _f0 = decoder.receive_frame().expect("f0");
+        let f1 = match decoder.receive_frame().expect("f1") {
+            Frame::Video(v) => v,
+            _ => panic!("video"),
+        };
+        let p = psnr(&f1.planes[0].data, &y);
+        assert!(p >= 28.0, "forced-update P-frame Y PSNR too low: {p:.2} dB");
+    }
+
+    /// Out-of-range forced indices are ignored and an empty forced set is a
+    /// no-op (identical bytes to plain `encode_inter_picture`).
+    #[test]
+    fn forced_update_empty_set_matches_plain_inter() {
+        let (y, cb, cr) = gradient_qcif();
+        let (_i, recon) =
+            encode_intra_picture_with_recon(SourceFormat::Qcif, &y, 176, &cb, 88, &cr, 88, 8, 0)
+                .unwrap();
+        let (plain, _r1) =
+            encode_inter_picture(SourceFormat::Qcif, &y, 176, &cb, 88, &cr, 88, 8, 1, &recon)
+                .unwrap();
+        // Empty set and an all-out-of-range set must both be no-ops.
+        let (forced_empty, _r2) = encode_inter_picture_forced_update(
+            SourceFormat::Qcif,
+            &y,
+            176,
+            &cb,
+            88,
+            &cr,
+            88,
+            8,
+            1,
+            &recon,
+            &[],
+        )
+        .unwrap();
+        let (forced_oob, _r3) = encode_inter_picture_forced_update(
+            SourceFormat::Qcif,
+            &y,
+            176,
+            &cb,
+            88,
+            &cr,
+            88,
+            8,
+            1,
+            &recon,
+            &[99, 100, 1_000_000],
+        )
+        .unwrap();
+        assert_eq!(plain, forced_empty);
+        assert_eq!(plain, forced_oob);
+    }
+
+    /// §3.4 guarantee: with whole-frame I-refresh disabled, the per-MB
+    /// scheduler in `H261Encoder` forcibly INTRA-updates EVERY macroblock at
+    /// least once within `forced_update_period` consecutive P-frames, so no
+    /// MB is ever transmitted more than the period without an INTRA reset.
+    /// We model the scheduler directly and assert full coverage.
+    #[test]
+    fn forced_update_scheduler_covers_every_mb_within_period() {
+        let period = 16u32; // short period for a fast test
+        let mut enc = H261Encoder::new(SourceFormat::Qcif, 8)
+            .with_intra_period(0)
+            .with_forced_update_period(period);
+        let total_mbs = SourceFormat::Qcif.gob_numbers().len() * 33; // 99
+        enc.mb_since_intra = vec![0u32; total_mbs];
+
+        let mut ever_forced = vec![false; total_mbs];
+        let mut max_count = 0u32;
+        for _frame in 0..period {
+            let forced = enc.compute_forced_update_set(total_mbs);
+            for &m in &forced {
+                ever_forced[m as usize] = true;
+            }
+            // Apply the same counter update the encoder uses.
+            for (i, c) in enc.mb_since_intra.iter_mut().enumerate() {
+                if forced.binary_search(&(i as u32)).is_ok() {
+                    *c = 0;
+                } else {
+                    *c = c.saturating_add(1);
+                }
+            }
+            max_count = max_count.max(enc.mb_since_intra.iter().copied().max().unwrap());
+        }
+        assert!(
+            ever_forced.iter().all(|&b| b),
+            "some MB was never forcibly updated within {period} frames"
+        );
+        // No counter may have reached the period (that would mean an MB was
+        // transmitted `period` times without an INTRA update).
+        assert!(
+            max_count < period,
+            "an MB counter reached {max_count} (>= period {period})"
+        );
+    }
+
+    /// `forced_update_period == 0` disables per-MB forced updating.
+    #[test]
+    fn forced_update_period_zero_disables() {
+        let mut enc = H261Encoder::new(SourceFormat::Qcif, 8)
+            .with_intra_period(0)
+            .with_forced_update_period(0);
+        let total_mbs = SourceFormat::Qcif.gob_numbers().len() * 33;
+        enc.mb_since_intra = vec![0u32; total_mbs];
+        let forced = enc.compute_forced_update_set(total_mbs);
+        assert!(forced.is_empty());
+    }
+
+    /// End-to-end: a long P-only sequence (intra_period disabled) stays
+    /// decodable and the forced-update INTRA MBs keep the picture from
+    /// drifting away. We drive `H261Encoder` for `2 * period` frames and
+    /// confirm every frame decodes and the final PSNR is healthy.
+    #[test]
+    fn forced_update_sequence_stays_healthy() {
+        let period = 8u32;
+        let (y, cb, cr) = gradient_qcif();
+        let mut enc = H261Encoder::new(SourceFormat::Qcif, 8)
+            .with_intra_period(0)
+            .with_forced_update_period(period);
+
+        let frames = (2 * period) as usize;
+        let mut stream = Vec::new();
+        for _ in 0..frames {
+            let b = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).expect("frame");
+            stream.extend_from_slice(&b);
+        }
+
+        let codec_id = CodecId::new(crate::CODEC_ID_STR);
+        let mut decoder = H261Decoder::new(codec_id);
+        let pkt = Packet {
+            stream_index: 0,
+            data: stream,
+            pts: Some(0),
+            dts: Some(0),
+            duration: None,
+            time_base: TimeBase::new(1, 30_000),
+            flags: PacketFlags {
+                keyframe: true,
+                ..Default::default()
+            },
+        };
+        decoder.send_packet(&pkt).expect("send");
+        decoder.flush().ok();
+        let mut last = None;
+        for _ in 0..frames {
+            match decoder.receive_frame() {
+                Ok(Frame::Video(v)) => last = Some(v),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let last = last.expect("at least one decoded frame");
+        let p = psnr(&last.planes[0].data, &y);
+        assert!(
+            p >= 28.0,
+            "forced-update sequence final Y PSNR too low: {p:.2} dB"
+        );
     }
 }

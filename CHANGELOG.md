@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **§3.4 forced updating (per-MB cyclic INTRA refresh).** H.261 §3.4
+  requires every macroblock to be forcibly INTRA-coded "at least once
+  per every 132 times it is transmitted" so that inverse-transform
+  mismatch error cannot accumulate without bound between whole-frame
+  I-refreshes. The encoder previously relied solely on the frame-level
+  `intra_period` (a whole-picture I-refresh). It now also runs a per-MB
+  forced-update scheduler: `H261Encoder` tracks how many times each
+  macroblock has been transmitted since its last INTRA coding (global
+  raster order across all GOBs) and forces the due macroblocks to INTRA
+  mode inside a P-picture before any counter reaches the period. The
+  load is spread across frames with a round-robin sweep
+  (`ceil(total_mbs / period)` MBs per P-frame) instead of spiking when
+  every counter hits the cap together. `H261Encoder::with_forced_update_period`
+  overrides the period (default `132`, the spec maximum; `0` disables).
+  A new public `encode_inter_picture_forced_update` lets callers driving
+  the stateless P-picture path supply their own forced-update set (for
+  example the RFC 4587 §C.3 loss-driven MB refresh). INTRA MBs in a
+  P-picture reset the §4.2.3.4 MVD predictor since they are never
+  motion-compensated.
+
 ### Fixed
 
 - **§4.2.3.4 MVD predictor reset at MB-row boundaries (MBA 12 and 23).**
