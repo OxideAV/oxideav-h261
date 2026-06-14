@@ -608,11 +608,10 @@ fn skip_macroblock(
 
     let mut mv = (0i32, 0i32);
     if mtype.mvd {
-        let pred = if ctx.prev_was_mc && ctx.prev_mba != 0 && mba == ctx.prev_mba + 1 {
-            ctx.mv
-        } else {
-            (0, 0)
-        };
+        // Same §4.2.3.4 predictor rule the real decoder applies (including
+        // the MBA 1 / 12 / 23 row-boundary reset), so this Huffman-layer
+        // walker stays bit-for-bit in lockstep with `mb::decode_macroblock`.
+        let pred = crate::mb::mvd_predictor(mba, ctx.prev_mba, ctx.prev_was_mc, ctx.mv);
         let sym_x: MvdSym = decode_vlc(br, MVD_TABLE)?;
         let sym_y: MvdSym = decode_vlc(br, MVD_TABLE)?;
         mv = (reconstruct_mv(pred.0, sym_x), reconstruct_mv(pred.1, sym_y));

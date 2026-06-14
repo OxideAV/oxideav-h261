@@ -49,6 +49,17 @@ half-pel refinements, no B-pictures, and no start-code emulation prevention.
 The spec tables (MBA / MTYPE / MVD / CBP / TCOEFF) are all implemented
 directly from the PDF.
 
+The §4.2.3.4 MVD predictor honours all three "vector regarded as zero"
+conditions: the start of each MB row in a GOB (MBA 1, 12, 23 — a GOB is
+11 MBs wide × 3 rows), an MBA difference other than 1 (intervening skipped
+MBs), and a previous macroblock whose MTYPE was not motion-compensated.
+The row-boundary reset (MBA 12 / 23) is applied on the absolute MBA, not
+just the MBA difference, so a conformant stream that carries a non-zero MV
+at MB 11 (or 22) and a motion-compensated MB 12 (or 23) decodes the right
+predictor. The decoder, the encoder's MVD derivation, and the RFC 4587
+§4.2 MB-level fragmentation walker all share one `mb::mvd_predictor`
+implementation of these rules, so they stay bit-for-bit in agreement.
+
 ### Encoder quality
 
 At the canonical H.261 target rate (64 kbit/s QCIF / 30 fps), the encoder

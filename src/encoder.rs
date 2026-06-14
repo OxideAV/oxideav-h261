@@ -80,11 +80,11 @@
 //!
 //! §4.2.3.4 mandates the MV predictor be reset to `(0, 0)` for MBs 1, 12,
 //! and 23 (start of each MB row in a GOB), at MBA discontinuity, and when
-//! the previous MB was not MC-coded. The encoder follows §4.2.3.4 exactly
-//! so any spec-conformant decoder derives the same predictor. To keep the
-//! in-crate decoder byte-tight (which does not row-reset on its own) we
-//! force the MV at MBs 11 and 22 to `(0, 0)` so `prev_was_mc` is false
-//! going into MBs 12 / 23 — both decoders then derive the same predictor.
+//! the previous MB was not MC-coded. The encoder follows §4.2.3.4 exactly,
+//! and the in-crate decoder applies the same three reset conditions (the
+//! MBA 1 / 12 / 23 row-boundary reset included), so any spec-conformant
+//! decoder — ours or a third party's — derives the same predictor at the
+//! row-boundary MBs without the encoder constraining MC there.
 
 use std::collections::VecDeque;
 
@@ -637,18 +637,11 @@ fn encode_gob_inter(
 
         // ---- 2. Motion estimation on luma (16×16). Returns best (mvx, mvy).
         //
-        // At MBs 11 and 22 we deliberately disable MC to force
-        // `prev_was_mc = false` going into MBs 12 and 23. This lets us
-        // emit spec-compliant zero-predictor MVDs at the row-boundary MBs
-        // while keeping the local decoder's MV reconstruction byte-tight
-        // — the local decoder doesn't reset on MB 12/23 the way the spec
-        // demands, so we rely on the fact that "prev MB was not MC"
-        // already triggers a reset both ways. (See §4.2.3.4.)
-        let (mvx, mvy) = if matches!(mba, 11 | 22) {
-            (0, 0)
-        } else {
-            motion_estimate_luma(y, y_stride, reference, luma_x, luma_y)
-        };
+        // No row-boundary constraint is needed: the §4.2.3.4 predictor
+        // reset on MBA 12 and 23 is honoured symmetrically by the encoder's
+        // MVD derivation (see step 5) and by the decoder, so a non-zero MV
+        // at MBs 11 / 22 reconstructs identically on both sides.
+        let (mvx, mvy) = motion_estimate_luma(y, y_stride, reference, luma_x, luma_y);
 
         // ---- 3. Build full predictor at (mvx, mvy).
         let mut blocks_pred: [[u8; 64]; 6] = [[0u8; 64]; 6];
@@ -724,17 +717,9 @@ fn encode_gob_inter(
         //     skip cost downward by a few bits to prefer it on truly idle
         //     content (skips also save the MBA diff length on the next MB).
         //   * Per Table 2 Note 2 the FIL+MC-only mode is legal even with
-        //     mv = (0,0) (filter applied to a non-MC MB). However we
-        //     suppress all MC modes (FIL or not) at MBs 11 and 22 to
-        //     keep `prev_was_mc=false` going into MBs 12 and 23 — this
-        //     matches the workaround in motion_estimate above and avoids
-        //     a divergence with the local decoder which doesn't force
-        //     row-boundary MV-predictor resets per §4.2.3.4 the way the
-        //     spec does.
+        //     mv = (0,0) (filter applied to a non-MC MB).
 
         let mv_is_zero = mvx == 0 && mvy == 0;
-        // Whether MC modes are allowed at this MB. See note above.
-        let allow_mc = !matches!(mba, 11 | 22);
         let mv_l1 = (mvx.abs() + mvy.abs()) as u32;
         // CBP VLC length is between 3 and 9 bits; treat as an average 6 for
         // the estimator. The real VLC is emitted unconditionally below.
@@ -777,7 +762,7 @@ fn encode_gob_inter(
         }
         // MC-only (no FIL). Requires non-zero MV (else this is a skip) and
         // cbp_nf == 0. The 9-bit MTYPE is the largest in Table 2.
-        if allow_mc && !mv_is_zero && cbp_nf == 0 {
+        if !mv_is_zero && cbp_nf == 0 {
             let c = MTYPE_INTER_MC_ONLY.0 as u32 + mvd_total;
             if c < best_cost {
                 best_cost = c;
@@ -785,7 +770,7 @@ fn encode_gob_inter(
             }
         }
         // MC + CBP (no FIL). Requires non-zero MV.
-        if allow_mc && !mv_is_zero && cbp_nf != 0 {
+        if !mv_is_zero && cbp_nf != 0 {
             let c = MTYPE_INTER_MC_CBP.0 as u32 + mvd_total + cbp_vlc_bits(cbp_nf) + resid_bits_nf;
             if c < best_cost {
                 best_cost = c;
@@ -796,16 +781,15 @@ fn encode_gob_inter(
         // The `OXIDEAV_H261_NO_FIL` env var disables FIL globally; useful
         // for A/B benchmarks against the r12 baseline.
         let allow_fil = std::env::var("OXIDEAV_H261_NO_FIL").is_err();
-        if allow_fil && allow_mc && cbp_fil == 0 {
+        if allow_fil && cbp_fil == 0 {
             let c = MTYPE_INTER_MC_FIL_ONLY.0 as u32 + mvd_total;
             if c < best_cost {
                 best_cost = c;
                 best_mode = 4;
             }
         }
-        // MC + FIL + CBP. Always legal — but still gated on `allow_mc` to
-        // preserve the row-boundary MV-predictor reset workaround.
-        if allow_fil && allow_mc && cbp_fil != 0 {
+        // MC + FIL + CBP. Always legal.
+        if allow_fil && cbp_fil != 0 {
             let c = MTYPE_INTER_MC_FIL_CBP.0 as u32
                 + mvd_total
                 + cbp_vlc_bits(cbp_fil)

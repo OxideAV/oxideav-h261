@@ -137,6 +137,40 @@ pub(crate) fn reconstruct_mv(predictor: i32, sym: MvdSym) -> i32 {
     }
 }
 
+/// §4.2.3.4 motion-vector predictor for the current MB's MVD.
+///
+/// The predictor is the previous MB's reconstructed vector `prev_mv`, except
+/// that it "is regarded as zero in the following three situations":
+///
+/// 1. **Row start** — the MB is the first of an MB row in the GOB, i.e. its
+///    MBA is 1, 12 or 23. A GOB is 11 MBs wide × 3 rows, so the rows begin at
+///    MBA 1, 12 and 23; the spec lists exactly these three. MBA 1 is also
+///    covered by the per-GOB context reset (`prev_mba == 0`), but MBA 12 and
+///    23 must reset even when the immediately preceding MB was a *consecutive*
+///    MC macroblock — which is why the absolute MBA, not just the MBA
+///    difference, has to be inspected.
+/// 2. **MBA discontinuity** — the MBA does not represent a difference of 1
+///    (one or more skipped MBs lie between this MB and the previous one).
+/// 3. **Previous MB not MC** — the previous macroblock's MTYPE was not
+///    motion-compensated (tracked by `prev_was_mc`).
+///
+/// `prev_mba == 0` marks "no previous MB yet in this GOB"; in that state the
+/// MBA-difference condition (2) already forces the zero predictor.
+pub(crate) fn mvd_predictor(
+    mba: u8,
+    prev_mba: u8,
+    prev_was_mc: bool,
+    prev_mv: (i32, i32),
+) -> (i32, i32) {
+    let row_start = matches!(mba, 1 | 12 | 23);
+    let consecutive = prev_mba != 0 && mba == prev_mba + 1;
+    if !row_start && consecutive && prev_was_mc {
+        prev_mv
+    } else {
+        (0, 0)
+    }
+}
+
 /// Decode a single macroblock at MB position `(mb_col, mb_row)` within the
 /// current GOB's top-left origin `(gob_x, gob_y)` (in luma pels). Updates
 /// `ctx` for the next MB, and writes into `pic`.
@@ -174,17 +208,10 @@ pub fn decode_macroblock(
         *quant = q;
     }
 
-    // MVD (if present). Predictor is the previous MB's MV if the previous MB
-    // was MC-coded AND this MBA is consecutive with the previous one;
-    // otherwise zero.
+    // MVD (if present).
     let mut mv = (0i32, 0i32);
     if mtype.mvd {
-        // Decide predictor.
-        let pred = if ctx.prev_was_mc && ctx.prev_mba != 0 && mba == ctx.prev_mba + 1 {
-            ctx.mv
-        } else {
-            (0, 0)
-        };
+        let pred = mvd_predictor(mba, ctx.prev_mba, ctx.prev_was_mc, ctx.mv);
         let sym_x: MvdSym = decode_vlc(br, MVD_TABLE)?;
         let sym_y: MvdSym = decode_vlc(br, MVD_TABLE)?;
         let mx = reconstruct_mv(pred.0, sym_x);
@@ -490,6 +517,39 @@ mod tests {
         // Predictor 10, MVD "a=10, b=-22" → 10+10=20 out, 10-22=-12 in → -12.
         let s = MvdSym { a: 10, b: -22 };
         assert_eq!(reconstruct_mv(10, s), -12);
+    }
+
+    #[test]
+    fn mvd_predictor_uses_prev_mv_mid_row() {
+        // Consecutive MC MBs inside a row (e.g. MB 6 after MB 5) carry the
+        // previous vector forward as the predictor (§4.2.3.4, none of the
+        // three reset conditions fire).
+        assert_eq!(mvd_predictor(6, 5, true, (3, -4)), (3, -4));
+    }
+
+    #[test]
+    fn mvd_predictor_resets_at_row_starts() {
+        // §4.2.3.4 condition (1): MBA 1, 12, 23 reset to zero even when the
+        // previous MB was a *consecutive* MC macroblock. MBA 12 (after the
+        // MC MB 11) and MBA 23 (after the MC MB 22) are the cases the
+        // per-GOB reset alone would miss.
+        assert_eq!(mvd_predictor(1, 0, false, (9, 9)), (0, 0));
+        assert_eq!(mvd_predictor(12, 11, true, (9, 9)), (0, 0));
+        assert_eq!(mvd_predictor(23, 22, true, (-7, 5)), (0, 0));
+        // A non-row-start consecutive MC MB at the same boundary distance
+        // does carry the predictor — proving it is the absolute MBA, not the
+        // difference, that drives the reset.
+        assert_eq!(mvd_predictor(13, 12, true, (9, 9)), (9, 9));
+    }
+
+    #[test]
+    fn mvd_predictor_resets_on_discontinuity_and_non_mc() {
+        // Condition (2): MBA gap > 1 (skipped MBs) → zero predictor.
+        assert_eq!(mvd_predictor(7, 5, true, (2, 2)), (0, 0));
+        // Condition (3): previous MB was not MC → zero predictor.
+        assert_eq!(mvd_predictor(6, 5, false, (2, 2)), (0, 0));
+        // No previous MB yet in the GOB (prev_mba == 0) → zero predictor.
+        assert_eq!(mvd_predictor(5, 0, true, (2, 2)), (0, 0));
     }
 
     #[test]

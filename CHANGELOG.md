@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **§4.2.3.4 MVD predictor reset at MB-row boundaries (MBA 12 and 23).**
+  The decoder's motion-vector-data predictor only reset to zero at GOB
+  start, on MBA discontinuities, and when the previous MB was not
+  motion-compensated. It was missing §4.2.3.4 condition (1): the
+  predictor "is regarded as zero" for macroblocks 1, 12 and 23 (the
+  first MB of each of the three rows in an 11×3-MB GOB). MBA 1 was
+  already covered by the per-GOB context reset, but MBA 12 and 23 were
+  not — so a conformant stream carrying a non-zero MV at MB 11 (or 22)
+  immediately followed by a motion-compensated MB 12 (or 23) decoded
+  the wrong vector. The in-crate encoder had previously worked around
+  this by forcing the MV to zero at MBs 11 and 22 to keep the two
+  sides in agreement; with the decoder now spec-conformant, that
+  constraint is removed and the encoder may use motion compensation at
+  every MB. The RFC 4587 §4.2 MB-level fragmentation walker, which
+  carries its own §4.2.3.4 predictor tracking, was given the same
+  reset so it stays bit-for-bit in lockstep with the decoder. A new
+  shared `mb::mvd_predictor` helper is the single source of truth for
+  the three reset conditions, unit-tested across all of them.
+
 ### Added
 
 - **`filter_mc` criterion benchmark — §3.2.3 loop filter + §3.2.2
