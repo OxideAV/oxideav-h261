@@ -615,6 +615,35 @@ fn validate_inputs(
     Ok(())
 }
 
+/// The three picture-layer display-control flags carried in PTYPE
+/// (§4.2.1.3 bits 1–3). These are independent of the source-format and
+/// HI_RES bits, which the encoder derives from the picture geometry and
+/// the Annex-D mode rather than from caller intent.
+///
+/// All three default to "off" (`false`), which reproduces the canonical
+/// motion-video header the encoder has always emitted. A caller drives a
+/// non-default value to signal:
+///
+/// * [`Ptype::split_screen`] (bit 1) — "Split screen indicator, '0' off,
+///   '1' on" (§4.2.1.3). Indicates the picture is to be displayed as two
+///   side-by-side half-pictures.
+/// * [`Ptype::document_camera`] (bit 2) — "Document camera indicator,
+///   '0' off, '1' on" (§4.2.1.3).
+/// * [`Ptype::freeze_picture_release`] (bit 3) — "Freeze picture
+///   release, '0' off, '1' on" (§4.2.1.3). Per §4.3.3 this is set in the
+///   picture header of "the first picture coded in response to [a] fast
+///   update request", allowing a decoder that had frozen its display
+///   (§4.3.1) to resume normal display.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ptype {
+    /// PTYPE bit 1 — split-screen indicator.
+    pub split_screen: bool,
+    /// PTYPE bit 2 — document-camera indicator.
+    pub document_camera: bool,
+    /// PTYPE bit 3 — freeze-picture release (§4.3.3).
+    pub freeze_picture_release: bool,
+}
+
 /// Emit the 32-bit picture header (§4.2.1).
 pub fn write_picture_header(bw: &mut BitWriter, fmt: SourceFormat, tr: u8) {
     write_picture_header_full(bw, fmt, tr, true);
@@ -628,15 +657,30 @@ pub fn write_picture_header(bw: &mut BitWriter, fmt: SourceFormat, tr: u8) {
 /// [`crate::annex_d::still_image_tr`] to derive it from a sub-image
 /// index).
 pub fn write_picture_header_full(bw: &mut BitWriter, fmt: SourceFormat, tr: u8, hi_res_off: bool) {
+    write_picture_header_ptype(bw, fmt, tr, hi_res_off, Ptype::default());
+}
+
+/// Emit the 32-bit picture header (§4.2.1) with explicit `HI_RES` and the
+/// three §4.2.1.3 display-control flags ([`Ptype`]). This is the most
+/// general picture-header writer; [`write_picture_header`] and
+/// [`write_picture_header_full`] are thin wrappers that pass
+/// [`Ptype::default()`] (all flags off).
+pub fn write_picture_header_ptype(
+    bw: &mut BitWriter,
+    fmt: SourceFormat,
+    tr: u8,
+    hi_res_off: bool,
+    ptype: Ptype,
+) {
     bw.write_u32(0x00010, 20); // PSC
     bw.write_u32(tr as u32, 5); // TR
                                 // PTYPE — six single-bit flags, MSB first.
-                                // bit1 split-screen indicator off
-    bw.write_u32(0, 1);
-    // bit2 document-camera indicator off
-    bw.write_u32(0, 1);
-    // bit3 freeze-picture release off
-    bw.write_u32(0, 1);
+                                // bit1 split-screen indicator (§4.2.1.3)
+    bw.write_u32(ptype.split_screen as u32, 1);
+    // bit2 document-camera indicator (§4.2.1.3)
+    bw.write_u32(ptype.document_camera as u32, 1);
+    // bit3 freeze-picture release (§4.2.1.3 / §4.3.3)
+    bw.write_u32(ptype.freeze_picture_release as u32, 1);
     // bit4 source format
     let fmt_bit = match fmt {
         SourceFormat::Qcif => 0,
@@ -1927,6 +1971,79 @@ mod tests {
         assert_eq!(hdr.source_format, SourceFormat::Qcif);
         assert_eq!(hdr.width, 176);
         assert_eq!(hdr.height, 144);
+    }
+
+    #[test]
+    fn picture_header_default_ptype_flags_all_off() {
+        // The canonical writers must emit all three §4.2.1.3 display-control
+        // bits as "0" (off), preserving the historical motion-video header.
+        let mut bw = BitWriter::new();
+        write_picture_header(&mut bw, SourceFormat::Cif, 3);
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let hdr = parse_picture_header(&mut br).expect("parse");
+        assert!(!hdr.split_screen);
+        assert!(!hdr.document_camera);
+        assert!(!hdr.freeze_release);
+        assert!(hdr.hi_res_off);
+        assert_eq!(hdr.source_format, SourceFormat::Cif);
+    }
+
+    #[test]
+    fn picture_header_ptype_each_flag_roundtrips() {
+        // §4.2.1.3 bits 1–3, exercised one at a time, must reach the decoder
+        // exactly. The other PTYPE bits (source format, HI_RES) stay at their
+        // motion-video values.
+        let cases = [
+            Ptype {
+                split_screen: true,
+                ..Ptype::default()
+            },
+            Ptype {
+                document_camera: true,
+                ..Ptype::default()
+            },
+            Ptype {
+                freeze_picture_release: true,
+                ..Ptype::default()
+            },
+        ];
+        for ptype in cases {
+            let mut bw = BitWriter::new();
+            write_picture_header_ptype(&mut bw, SourceFormat::Qcif, 5, true, ptype);
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let hdr = parse_picture_header(&mut br).expect("parse");
+            assert_eq!(hdr.split_screen, ptype.split_screen);
+            assert_eq!(hdr.document_camera, ptype.document_camera);
+            assert_eq!(hdr.freeze_release, ptype.freeze_picture_release);
+            assert_eq!(hdr.temporal_reference, 5);
+            assert_eq!(hdr.source_format, SourceFormat::Qcif);
+            assert!(hdr.hi_res_off);
+        }
+    }
+
+    #[test]
+    fn picture_header_ptype_all_flags_set_roundtrips() {
+        // All three §4.2.1.3 flags asserted simultaneously, on a CIF still-
+        // image (HI_RES on) header, to confirm the flags are independent of
+        // the source-format and HI_RES bits.
+        let ptype = Ptype {
+            split_screen: true,
+            document_camera: true,
+            freeze_picture_release: true,
+        };
+        let mut bw = BitWriter::new();
+        // TR top 3 bits zero so the Annex-D still-image parse stays valid.
+        write_picture_header_ptype(&mut bw, SourceFormat::Cif, 2, false, ptype);
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let hdr = parse_picture_header(&mut br).expect("parse");
+        assert!(hdr.split_screen);
+        assert!(hdr.document_camera);
+        assert!(hdr.freeze_release);
+        assert!(!hdr.hi_res_off);
+        assert_eq!(hdr.source_format, SourceFormat::Cif);
     }
 
     #[test]

@@ -61,6 +61,27 @@ predictor. The decoder, the encoder's MVD derivation, and the RFC 4587
 §4.2 MB-level fragmentation walker all share one `mb::mvd_predictor`
 implementation of these rules, so they stay bit-for-bit in agreement.
 
+### PTYPE display-control flags (§4.2.1.3)
+
+The picture header's PTYPE field carries three display-control bits the
+decoder has always parsed (`split_screen`, `document_camera`,
+`freeze_release`) but that the encoder previously hardcoded to "0". The
+encoder now exposes them through `encoder::Ptype` and
+`encoder::write_picture_header_ptype`:
+
+* **bit 1 — split-screen indicator** (§4.2.1.3): the picture is to be
+  shown as two side-by-side half-pictures.
+* **bit 2 — document-camera indicator** (§4.2.1.3).
+* **bit 3 — freeze-picture release** (§4.2.1.3 / §4.3.3): set in the
+  first picture coded in response to a fast-update request, releasing a
+  decoder from the §4.3.1 freeze-display state.
+
+`write_picture_header` and `write_picture_header_full` are thin wrappers
+that pass `Ptype::default()` (all flags off), so the canonical
+motion-video header is byte-for-byte unchanged. The three flags are
+independent of the source-format and HI_RES bits, which the encoder still
+derives from the picture geometry and Annex-D mode.
+
 ### Encoder quality
 
 At the canonical H.261 target rate (64 kbit/s QCIF / 30 fps), the encoder

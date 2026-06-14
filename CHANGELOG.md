@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§4.2.1.3 PTYPE display-control flags (encoder).** The encoder can now
+  emit the three picture-layer display-control bits the decoder already
+  parsed — split-screen indicator (bit 1), document-camera indicator
+  (bit 2), and freeze-picture release (bit 3, §4.3.3). A new
+  `encoder::Ptype` struct carries the three flags and a new
+  `encoder::write_picture_header_ptype` writer threads them into the
+  picture header; `write_picture_header` / `write_picture_header_full`
+  now delegate to it with `Ptype::default()` (all flags off), so the
+  canonical motion-video header is byte-for-byte unchanged. Previously
+  these three bits were hardcoded to "0" with no caller-facing way to set
+  them. Four new round-trip tests assert each flag, and all three
+  together (on a CIF Annex-D still-image header to prove independence
+  from the source-format and HI_RES bits), reach the decoder's
+  `parse_picture_header` exactly.
+
 - **§3.4 forced updating (per-MB cyclic INTRA refresh).** H.261 §3.4
   requires every macroblock to be forcibly INTRA-coded "at least once
   per every 132 times it is transmitted" so that inverse-transform
