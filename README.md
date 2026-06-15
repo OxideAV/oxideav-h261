@@ -86,8 +86,9 @@ derives from the picture geometry and Annex-D mode.
 
 At the canonical H.261 target rate (64 kbit/s QCIF / 30 fps), the encoder
 achieves ≥ 45 dB PSNR_Y on smooth content and ≥ 39 dB on the standard
-`testsrc` test pattern (see `bench_testsrc_psnr`). ffmpeg cross-validates
-all P-picture, MC, and FIL streams cleanly.
+`testsrc` test pattern (see `bench_testsrc_psnr`). An independent
+black-box reference decoder validates all P-picture, MC, and FIL
+streams cleanly.
 
 ### Forced updating (§3.4)
 
@@ -822,8 +823,8 @@ branchless edge-clamp block copy) have a baseline to A/B against:
   (the §5.4.1 `t = 1` correction walk, fixed-cost 511-step), and
   `encode_multiframe` / `decode_multiframe` clean +
   one-bit-corrupted + `decode_multiframe_with_correction` on one
-  full 8-frame multiframe. Headline points on the round-233
-  baseline (release build, aarch64): `parity18` ≈ 350 ns / frame
+  full 8-frame multiframe. Headline points
+  (release build, aarch64): `parity18` ≈ 350 ns / frame
   (≈ 0.7 ns / data bit), `locate_single_error` ≈ 460 ns,
   `encode_multiframe` ≈ 12 µs / multiframe, `decode_multiframe`
   ≈ 24 µs, and the §5.4.1 correcting decode adds essentially no
@@ -843,8 +844,8 @@ branchless edge-clamp block copy) have a baseline to A/B against:
   qcif_intra_misaligned_start` (the §4.2 packetizer's slow path
   when a GOB does not land on a byte boundary), and
   `find_next_start_code::no_start_code_in_buffer` (worst case —
-  4 KiB scanned end-to-end, no hit). Headline points on the
-  round-238 baseline (release build, aarch64): the bit-by-bit
+  4 KiB scanned end-to-end, no hit). Headline points
+  (release build, aarch64): the bit-by-bit
   scanner clocks ≈ 295–300 MiB/s across all three full-stream
   walks; a byte-aligned hit costs ≈ 6 ns; a 3-bit misaligned hit
   costs ≈ 18 ns; the worst-case 4 KiB no-hit walk takes ≈ 13 µs.
@@ -864,7 +865,7 @@ branchless edge-clamp block copy) have a baseline to A/B against:
   {center, mv_nonzero, corner_clamp}` — exercising the
   no-clamp common case, a small interior MV, and the worst case
   where every sample's edge-clamp branch fires. Headline points
-  on the round-287 baseline (release build, aarch64): the loop
+  (release build, aarch64): the loop
   filter clocks ≈ 25 ns / block (≈ 2.5 Gelem/s); the integer-pel
   copy ≈ 15 ns / block (≈ 4.1 Gelem/s) interior, ≈ 14.5 ns when
   fully corner-clamped. A SIMD loop filter and a branchless
