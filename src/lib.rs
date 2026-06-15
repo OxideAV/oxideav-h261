@@ -55,6 +55,16 @@
 //!   (`CIF`, `QCIF`, `D`) to the SDP `a=rtpmap` / `a=fmtp` attribute lines,
 //!   with the §6.2.1 offer/answer helpers (per-format MPI frame-rate bound,
 //!   the "at least one picture size" invariant, the RFC-2032 QCIF fallback).
+//! * Codec delay measurement (§5.3 + Annex C): the [`annex_c`] module
+//!   implements the §C measurement procedure — the toggling
+//!   identification mark on its 97-input-frame schedule
+//!   ([`annex_c::MarkGenerator`]), the mid-level transition detector at
+//!   measuring points B / C ([`annex_c::MarkDetector`]), the averaged
+//!   encoder / decoder / overall delay meter ([`annex_c::DelayMeter`]),
+//!   and the §C.1 test-sequence precondition gate
+//!   ([`annex_c::SequenceRequirements`]: > 100 s duration, ≥ 7.5 Hz coded
+//!   rate, < 10 % stuffing). Like the [`hrd`] model it is a measurement
+//!   helper — nothing it does changes the on-wire bitstream.
 //! * Annex D still-image transmission (§D.2 + §D.3): the [`annex_d`] module
 //!   exposes the [`annex_d::SubImageIndex`] mapping to / from the 5-bit `TR`
 //!   field, the still-image dimensions (4× the currently transmitted video
@@ -78,6 +88,7 @@
 #![allow(clippy::unusual_byte_groupings)]
 #![allow(clippy::unnecessary_cast)]
 
+pub mod annex_c;
 pub mod annex_d;
 pub mod bch;
 pub mod block;

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- §5.3 + Annex C codec delay measurement method — toggling identification
+  mark on the 97-input-frame schedule, mid-level transition detector at
+  measuring points B / C, averaged encoder / decoder / overall delay meter,
+  and the §C.1 test-sequence precondition gate (> 100 s, ≥ 7.5 Hz coded
+  rate, < 10 % stuffing), with an end-to-end measurement through the real
+  encoder + decoder
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-h261/compare/v0.0.6...v0.0.7) - 2026-06-14
 
 ### Other

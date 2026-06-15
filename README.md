@@ -44,6 +44,7 @@ oxideav-h261 = "0.0"
 | RTCP APP application-defined (RFC 3550 §6.7)     | yes    | yes    |
 | SDP rtpmap/fmtp media type (RFC 4587 §6.1.1/6.2) | yes    | yes    |
 | Annex D still-image sub-image transform (§D.2/§D.3) | yes | yes    |
+| §5.3 + Annex C codec delay measurement method       | n/a | n/a    |
 
 H.261 only permits integer-pel motion vectors (range ±15); there are no
 half-pel refinements, no B-pictures, and no start-code emulation prevention.
@@ -259,6 +260,59 @@ The HRD is purely a coder-side compliance check — nothing in the
 on-wire bitstream changes. The encoder doesn't run it by default
 (see the module docstring for why); callers that need the assertion
 drive it explicitly with their picture-size sequence.
+
+### Codec delay measurement (§5.3 + Annex C)
+
+Annex C "forms an integral part of this Recommendation" (like the
+Annex A IDCT-accuracy procedure): it specifies a measurable procedure
+for establishing a particular codec design's encoder and decoder
+delays, so audio-delay compensation can be fixed for lip-sync when
+H.261 is part of a conversational service (§5.3). The `annex_c` module
+implements that procedure as a measurement helper — like the `hrd`
+model, nothing it does changes the on-wire bitstream.
+
+The §C measuring points are **A** (video input to the coder), **B**
+(channel output, *including* any FEC / framing — see `bch`), and **C**
+(decoder output). The encoder delay is A → B; the decoder delay is
+B → C; the overall video delay is their sum. The module surface:
+
+- `MarkGenerator` — stamps the §C visible identification mark into the
+  first 8×8 luma block of the first GOB, toggling black ↔ white every
+  **97 video input frames** (`MARK_INTERVAL_FRAMES`).
+- `MarkDetector` — re-detects the mark in a tapped / decoded frame at a
+  **mid-level threshold** (the §C note: pre/post-temporal processing
+  smears a hard edge, so a mid-level is taken to establish the
+  transition at points B and C).
+- `DelayMeter` — pairs the mark-change instants observed at A, B, C and
+  reports the averaged encoder / decoder / overall delays (§C: "several
+  measurements should be made … and the average period obtained"), in
+  frame-interval units or seconds at a supplied frame rate.
+- `SequenceRequirements` — validates the §C.1 test-sequence
+  preconditions: a sequence lasting **> 100 s**, a coded picture rate
+  **≥ 7.5 Hz**, and **< 10 %** stuffing (MBA stuffing + FEC fill).
+
+```rust
+use oxideav_h261::annex_c::{MarkGenerator, MarkDetector, MarkLevels, MarkState};
+use oxideav_h261::picture::SourceFormat;
+
+let levels = MarkLevels::default();         // 0 / 255, mid-level 128
+let gen = MarkGenerator::new(SourceFormat::Qcif, levels);
+let det = MarkDetector::new(levels);
+
+let (w, h) = SourceFormat::Qcif.dimensions();
+let mut y = vec![64u8; (w * h) as usize];
+gen.stamp(/* input frame */ 100, &mut y, w as usize); // frame 100 ⇒ High
+assert_eq!(det.sample(&y, w as usize), MarkState::High);
+```
+
+`tests/annex_c_e2e.rs` drives the whole procedure through the real
+encoder + decoder: it builds a §C sequence (mark stamped per input
+frame), encodes and decodes it, and re-detects the mark transitions at
+point C — confirming the mark survives the coding round-trip and the
+meter pairs the A/B/C instants correctly (this synchronous codec has
+zero frame-interval pipeline delay, which the test asserts). The
+§C.1 precondition gate is exercised independently so an out-of-spec
+run is rejected before its delay figures are trusted.
 
 ### BCH (511,493) FEC framing (§5.4)
 
