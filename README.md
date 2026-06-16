@@ -34,6 +34,7 @@ oxideav-h261 = "0.0"
 | Loop filter (FIL, §3.2.3) with per-MB RDO        | yes    | yes    |
 | Forced updating (§3.4 per-MB cyclic INTRA refresh) | n/a  | yes    |
 | Per-GOB MQUANT rate control (§4.2.3.3)           | n/a    | yes    |
+| MBA stuffing (§4.2.3.1) — discard / emit + pad   | yes    | yes    |
 | Encoder registry (`first_encoder` / `bit_rate`)  | n/a    | yes    |
 | BCH (511,493) FEC framing (§5.4) + t = 1 correction | yes | yes    |
 | HRD buffer model (§5.2 + Annex B)                | yes    | yes    |
@@ -131,6 +132,37 @@ let cr = vec![128u8; 88 * 72];
 let _first = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap(); // I
 let _p = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap();     // P + forced INTRA MBs
 ```
+
+### MBA stuffing for buffer regulation (§4.2.3.1)
+
+Table 1/H.261 reserves an extra macroblock-address codeword
+(`0000 0001 111`, 11 bits) "for bit stuffing immediately after a GOB
+header or a coded macroblock"; the spec adds that "this codeword should
+be discarded by decoders." The decoder has always honoured the discard
+rule — `mb::decode_mba_diff` loops over stuffing codewords transparently
+before returning the next data-bearing MBA difference. The encoder now
+exposes the emit side so a rate controller can pad a coded picture to a
+minimum size without disturbing the reconstructed image:
+
+- `encoder::write_mba_stuffing(bw, count)` emits `count` stuffing
+  codewords at the current (legal) insertion point.
+- `encoder::pad_to_min_bits(bw, target_bits)` pads the picture trailer
+  — after the last GOB's final macroblock, before the trailing
+  byte-alignment — with whole stuffing codewords until at least
+  `target_bits` bits have been written, returning the count emitted (it
+  is a no-op when the writer is already at or beyond the budget).
+- `encoder::MBA_STUFFING_BITS` is the 11-bit codeword granularity, so a
+  caller can reason about the sub-codeword overshoot (always
+  `< MBA_STUFFING_BITS`).
+
+This is the §5.2 / Annex B buffer-regulation primitive: an encoder that
+must keep a constant-bit-rate channel filled, or satisfy an HRD lower
+bound, calls `pad_to_min_bits` at the picture trailer. Because the
+inserted bits carry no picture data, a conformant decode reproduces a
+padded INTRA picture bit-identically to its unpadded form — an
+end-to-end test drives a stuffed QCIF picture through the real decoder
+and asserts all three planes match the plain encode while the padded
+elementary stream is strictly larger.
 
 ### IDCT accuracy (Annex A)
 

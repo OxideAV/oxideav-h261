@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- §4.2.3.1 MBA-stuffing emission on the encode side — `write_mba_stuffing`
+  emits the Table 1 `0000 0001 111` stuffing codeword(s), and
+  `pad_to_min_bits` pads a coded picture's trailer up to a minimum bit
+  budget with whole stuffing codewords for §5.2 / Annex B buffer
+  regulation (constant-bit-rate channel fill / HRD lower bound). The
+  inserted bits carry no picture data and a conformant decode discards
+  them, so a padded INTRA picture reconstructs bit-identically to its
+  unpadded form; verified end-to-end through the real decoder. Removes the
+  dead `MBA_STUFFING` reference the encoder previously only named to
+  suppress an unused-constant warning.
 - criterion suite for the Annex D §D.2 / Figure D.1 still-image transform —
   whole-plane 2:1×2:1 sub-sample (`subsample_plane`) / re-assembly
   (`reassemble_plane`) and their YUV-4:2:0 wrappers

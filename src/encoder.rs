@@ -706,6 +706,66 @@ pub fn write_gob_header(bw: &mut BitWriter, gn: u8, gquant: u32) {
     bw.write_u32(0, 1);
 }
 
+/// Number of bits in one MBA-stuffing codeword (§4.2.3.1, Table 1 — the
+/// 11-bit `0000 0001 111` pattern). Exposed so callers driving buffer
+/// regulation can reason about padding granularity.
+pub const MBA_STUFFING_BITS: u32 = MBA_STUFFING.0 as u32;
+
+/// Emit `count` MBA-stuffing codewords (§4.2.3.1) into `bw`.
+///
+/// The H.261 macroblock-address VLC table reserves an extra codeword
+/// (`0000 0001 111`, 11 bits) "for bit stuffing immediately after a GOB
+/// header or a coded macroblock" (§4.2.3.1). It carries no picture data —
+/// "This codeword should be discarded by decoders." An encoder uses it to
+/// pad the coded bitstream when the rate controller / HRD buffer model
+/// (§5.2, Annex B) requires a coded picture to occupy a minimum number of
+/// bits, or to keep a constant-bit-rate channel filled, without disturbing
+/// the reconstructed picture.
+///
+/// The caller is responsible for emitting these only at a legal insertion
+/// point — immediately after a GOB header or after a coded macroblock, and
+/// before the next start code (PSC / GBSC). [`pad_to_min_bits`] is the
+/// higher-level helper that places stuffing at the end of a coded picture
+/// (after the final GOB's last macroblock) up to a target bit budget.
+pub fn write_mba_stuffing(bw: &mut BitWriter, count: usize) {
+    let (bits, code) = MBA_STUFFING;
+    for _ in 0..count {
+        bw.write_u32(code, bits as u32);
+    }
+}
+
+/// Pad the writer with whole MBA-stuffing codewords until at least
+/// `target_bits` bits have been written, returning the number of stuffing
+/// codewords emitted.
+///
+/// This is the §4.2.3.1 / §5.2 buffer-regulation primitive: an encoder that
+/// must not let a coded picture fall below a minimum size (e.g. to keep a
+/// constant-bit-rate channel filled, or to satisfy an Annex B HRD lower
+/// bound) calls this at the picture trailer — after the last coded
+/// macroblock of the last GOB and before [`BitWriter::align_to_byte`] /
+/// the next PSC — so the inserted bits are discarded by a conformant
+/// decoder (see [`crate::mb::decode_mba_diff`], which loops over stuffing
+/// codewords transparently).
+///
+/// Stuffing is quantised to the 11-bit codeword, so the final bit length is
+/// the smallest value `>= target_bits` reachable by adding whole codewords
+/// to the current length. If the writer is already at or beyond
+/// `target_bits`, no codewords are emitted and `0` is returned. The
+/// subsequent byte-alignment padding (which a decoder also discards as
+/// trailing zeros) is the caller's responsibility and is *not* counted
+/// here.
+pub fn pad_to_min_bits(bw: &mut BitWriter, target_bits: u64) -> usize {
+    let current = bw.bit_position();
+    if current >= target_bits {
+        return 0;
+    }
+    let deficit = target_bits - current;
+    // ceil(deficit / MBA_STUFFING_BITS) whole codewords.
+    let count = deficit.div_ceil(MBA_STUFFING_BITS as u64) as usize;
+    write_mba_stuffing(bw, count);
+    count
+}
+
 fn gob_origin_luma(fmt: SourceFormat, gn: u8) -> (usize, usize) {
     match fmt {
         SourceFormat::Cif => crate::gob::cif_gob_origin_luma(gn),
@@ -1885,7 +1945,6 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 
 #[allow(dead_code)]
 fn _unused_refs() {
-    let _ = MBA_STUFFING;
     let _ = MTYPE_INTRA_MQUANT;
 }
 
@@ -1971,6 +2030,109 @@ mod tests {
         assert_eq!(hdr.source_format, SourceFormat::Qcif);
         assert_eq!(hdr.width, 176);
         assert_eq!(hdr.height, 144);
+    }
+
+    #[test]
+    fn mba_stuffing_codeword_decodes_as_stuffing() {
+        // The exact §4.2.3.1 stuffing codeword the encoder emits must decode
+        // back through the production MBA decoder as `Stuffing`, never as a
+        // data-bearing MBA difference.
+        use crate::mb::decode_mba_diff;
+        use crate::tables::{decode_vlc, MbaSym, MBA_TABLE};
+
+        let mut bw = BitWriter::new();
+        write_mba_stuffing(&mut bw, 1);
+        // A single stuffing codeword is 11 bits; pad the trailer with a real
+        // MBA(1) so the decoder has a data symbol to return after skipping it.
+        let (b, c) = crate::tables::encode_mba_diff(1);
+        bw.write_u32(c, b as u32);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+
+        // Raw VLC layer: the first symbol is Stuffing.
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_vlc(&mut br, MBA_TABLE).unwrap(), MbaSym::Stuffing);
+
+        // Production path: decode_mba_diff transparently skips the stuffing
+        // and returns the MBA(1) that follows.
+        let mut br2 = BitReader::new(&bytes);
+        assert_eq!(decode_mba_diff(&mut br2).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn pad_to_min_bits_meets_budget_with_whole_codewords() {
+        let mut bw = BitWriter::new();
+        write_picture_header(&mut bw, SourceFormat::Qcif, 0);
+        let before = bw.bit_position();
+        // Ask for a budget 100 bits above the header.
+        let target = before + 100;
+        let emitted = pad_to_min_bits(&mut bw, target);
+        let after = bw.bit_position();
+        // ceil(100 / 11) = 10 codewords → 110 bits added.
+        assert_eq!(emitted, 10);
+        assert_eq!(after, before + 10 * MBA_STUFFING_BITS as u64);
+        // Budget is met (>= target) and overshoot is < one codeword.
+        assert!(after >= target);
+        assert!(after - target < MBA_STUFFING_BITS as u64);
+    }
+
+    #[test]
+    fn pad_to_min_bits_noop_when_already_over_budget() {
+        let mut bw = BitWriter::new();
+        write_picture_header(&mut bw, SourceFormat::Qcif, 0);
+        let pos = bw.bit_position();
+        // Target below the current length ⇒ nothing emitted.
+        let emitted = pad_to_min_bits(&mut bw, pos.saturating_sub(8));
+        assert_eq!(emitted, 0);
+        assert_eq!(bw.bit_position(), pos);
+        // Exactly at the current length ⇒ also a no-op.
+        assert_eq!(pad_to_min_bits(&mut bw, pos), 0);
+        assert_eq!(bw.bit_position(), pos);
+    }
+
+    #[test]
+    fn padded_intra_picture_decodes_identically() {
+        // End-to-end: pad a real INTRA picture with MBA stuffing up to a
+        // minimum bit budget and confirm a conformant decode discards the
+        // stuffing — the reconstructed picture is bit-identical to the
+        // unpadded stream's, and the padded stream is strictly larger.
+        let (y, cb, cr) = gradient_qcif();
+        let plain = encode_intra_picture(SourceFormat::Qcif, &y, 176, &cb, 88, &cr, 88, 12, 0)
+            .expect("encode plain");
+
+        // Re-encode by hand so we can splice stuffing into the picture
+        // trailer (after the last GOB's last MB, before the trailing
+        // byte-alignment), mirroring what a rate controller would do.
+        let mut bw = BitWriter::with_capacity(4096);
+        let mut recon = Picture::new(176, 144);
+        write_picture_header(&mut bw, SourceFormat::Qcif, 0);
+        for &gn in SourceFormat::Qcif.gob_numbers() {
+            write_gob_header(&mut bw, gn, 12);
+            let (gx, gy) = gob_origin_luma(SourceFormat::Qcif, gn);
+            encode_gob_intra(&mut bw, &y, 176, &cb, 88, &cr, 88, gx, gy, 12, &mut recon);
+        }
+        // Pad to at least 256 bits beyond the natural coded size.
+        let target = bw.bit_position() + 256;
+        let emitted = pad_to_min_bits(&mut bw, target);
+        assert!(emitted > 0, "expected stuffing to be inserted");
+        bw.align_to_byte();
+        let padded = bw.finish();
+
+        assert!(
+            padded.len() > plain.len(),
+            "padded stream ({}) must exceed plain ({})",
+            padded.len(),
+            plain.len()
+        );
+
+        let a = decode_one(plain);
+        let b = decode_one(padded);
+        assert_eq!(
+            a.planes[0].data, b.planes[0].data,
+            "Y plane differs after stuffing"
+        );
+        assert_eq!(a.planes[1].data, b.planes[1].data, "Cb plane differs");
+        assert_eq!(a.planes[2].data, b.planes[2].data, "Cr plane differs");
     }
 
     #[test]
