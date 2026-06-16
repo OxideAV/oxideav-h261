@@ -78,3 +78,18 @@ harness = false
 [[bench]]
 name = "filter_mc"
 harness = false
+
+# Round 320 — Annex D §D.2 / Figure D.1 still-image transform bench.
+# Every other bench measures per-8×8-block work or the end-to-end
+# picture cost; none measured the whole-plane 2:1×2:1 sub-sample /
+# re-assembly that runs when an endpoint sends a still image
+# (HI_RES = 0). `subsample_plane` gathers every other sample of a
+# 352×288 (QCIF endpoint) or 704×576 (CIF endpoint) still-image plane
+# into four sub-images; `reassemble_plane` scatters them back. This
+# bench gives those bandwidth-bound interleave / deinterleave paths —
+# and their YUV-4:2:0 wrappers `subsample_still_image` /
+# `reassemble_still_image` — an A/B baseline alongside the transform /
+# filter_mc / bch / start_code / encode / decode benches.
+[[bench]]
+name = "annex_d"
+harness = false

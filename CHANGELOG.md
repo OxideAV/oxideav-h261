@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- criterion suite for the Annex D §D.2 / Figure D.1 still-image transform —
+  whole-plane 2:1×2:1 sub-sample (`subsample_plane`) / re-assembly
+  (`reassemble_plane`) and their YUV-4:2:0 wrappers
+  (`subsample_still_image` / `reassemble_still_image`), QCIF-endpoint
+  (352×288 still) and CIF-endpoint (704×576 still) regimes
 - §5.3 + Annex C codec delay measurement method — toggling identification
   mark on the 97-input-frame schedule, mid-level transition detector at
   measuring points B / C, averaged encoder / decoder / overall delay meter,

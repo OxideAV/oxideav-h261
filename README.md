@@ -925,6 +925,25 @@ branchless edge-clamp block copy) have a baseline to A/B against:
   fully corner-clamped. A SIMD loop filter and a branchless
   clamp copy are the obvious follow-ups; this bench gives them
   their A/B.
+* **`annex_d`** — the Annex D §D.2 / Figure D.1 still-image
+  transform. When an endpoint sends a still image (HI_RES = 0) it
+  2:1×2:1 sub-samples a full-resolution still image (4× the video
+  format) into four sub-images at the current video format, and the
+  receiver re-assembles them. Unlike every other bench this is a
+  *whole-plane* gather / scatter, not per-8×8-block work, so it had
+  no baseline. Sub-scenarios: `annex_d_subsample_plane` /
+  `annex_d_reassemble_plane` (the per-plane `subsample_plane` /
+  `reassemble_plane` primitives over a 352×288 QCIF-endpoint and a
+  704×576 CIF-endpoint still-image luma plane) and
+  `annex_d_still_image_yuv` (the YUV-4:2:0 wrappers
+  `subsample_still_image` / `reassemble_still_image` over all three
+  planes). Headline points (release build, aarch64): the strided
+  sub-sample gather of a 352×288 plane ≈ 8.3 µs, the 704×576 plane
+  ≈ 38 µs; the scatter re-assembly ≈ 18 µs / 64 µs respectively; the
+  full YUV-4:2:0 round trip is ≈ 13 µs + 28 µs (QCIF still) and
+  ≈ 54 µs + 109 µs (CIF still). A cache-blocked or SIMD-gather
+  rewrite of the interleave is the obvious follow-up; this bench
+  gives it an A/B baseline.
 
 Every benchmark synthesises its YUV source inline from a
 deterministic striped pattern plus low-amplitude xorshift noise
@@ -946,11 +965,14 @@ cargo bench -p oxideav-h261 --bench encode
 cargo bench -p oxideav-h261 --bench decode
 cargo bench -p oxideav-h261 --bench bch
 cargo bench -p oxideav-h261 --bench start_code
+cargo bench -p oxideav-h261 --bench filter_mc
+cargo bench -p oxideav-h261 --bench annex_d
 
 # Filter to one sub-scenario.
 cargo bench -p oxideav-h261 --bench encode -- qcif_intra
 cargo bench -p oxideav-h261 --bench bch -- parity18
 cargo bench -p oxideav-h261 --bench start_code -- iter_start_codes
+cargo bench -p oxideav-h261 --bench annex_d -- subsample_plane
 ```
 
 The bench suite is `harness = false` (criterion replaces the
