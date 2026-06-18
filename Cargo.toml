@@ -93,3 +93,19 @@ harness = false
 [[bench]]
 name = "annex_d"
 harness = false
+
+# Round 336 — §3.2.5 / §4.2.4 (de)quantisation leaf-primitive bench.
+# `transform` covers the inner (I)DCT and `filter_mc` covers the P-block
+# reconstruction primitives, but neither isolated the per-coefficient
+# (de)quantiser the encoder and decoder run on every transmitted DCT
+# coefficient: `block::dequant_ac` (decode, QUANT-parity branch — the
+# fuzzer's `decode_h261` target reaches it), `quant::quant_ac` (encode
+# forward AC quantiser with the central dead-zone), and
+# `quant::quant_intra_dc` (the §3.2.5 Table 6 INTRA-DC quantiser with the
+# forbidden-code / special-1024 search). Gives a branchless-parity dequant
+# / reciprocal-multiply forward quantiser an A/B baseline alongside the
+# transform / filter_mc / annex_d / bch / start_code / encode / decode
+# benches.
+[[bench]]
+name = "quant"
+harness = false

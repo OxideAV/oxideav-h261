@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- criterion suite for the §3.2.5 / §4.2.4 (de)quantisation leaf
+  primitives — the decode-side `block::dequant_ac` (QUANT-parity
+  reconstruction, swept sparse/dense over a 64-coefficient block at odd
+  and even QUANT), the encode-side forward AC quantiser `quant::quant_ac`
+  (central dead-zone), and the Table 6 INTRA-DC quantiser
+  `quant::quant_intra_dc` (full `0..=2040` level sweep through the
+  forbidden-`0x80` / special-`0xFF` search). These per-coefficient leaf
+  functions had no isolated baseline — `transform` covered the (I)DCT and
+  `filter_mc` the P-block reconstruction primitives — so a branchless
+  QUANT-parity dequant or a reciprocal-multiply forward quantiser now has
+  an A/B to measure against.
 - §4.2.3.1 MBA-stuffing emission on the encode side — `write_mba_stuffing`
   emits the Table 1 `0000 0001 111` stuffing codeword(s), and
   `pad_to_min_bits` pads a coded picture's trailer up to a minimum bit

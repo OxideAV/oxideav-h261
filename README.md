@@ -878,14 +878,16 @@ cargo +nightly fuzz run parse_sdp_fmtp -- -max_total_time=60
 
 ### Benchmarks
 
-A `criterion` benchmark suite lives under `benches/`. Six targets
+A `criterion` benchmark suite lives under `benches/`. Eight targets
 cover the codec pipeline plus the §5.4 outer FEC layer, the
-§4.1 / §4.2 start-code scanner, and the §3.2.3 loop filter /
-§3.2.2 integer-pel motion-comp primitives so future optimisation
-rounds (e.g. a SIMD IDCT, a fixed-point FDCT, a precomputed
-CBP-prefix table, a faster spiral+diamond ME, a table-driven BCH
-parity, a SIMD start-code pre-scan, a SIMD loop filter, a
-branchless edge-clamp block copy) have a baseline to A/B against:
+§4.1 / §4.2 start-code scanner, the §3.2.3 loop filter /
+§3.2.2 integer-pel motion-comp primitives, the Annex D §D.2
+still-image transform, and the §3.2.5 / §4.2.4 (de)quantiser so
+future optimisation rounds (e.g. a SIMD IDCT, a fixed-point FDCT,
+a precomputed CBP-prefix table, a faster spiral+diamond ME, a
+table-driven BCH parity, a SIMD start-code pre-scan, a SIMD loop
+filter, a branchless edge-clamp block copy, a branchless
+QUANT-parity dequant) have a baseline to A/B against:
 
 * **`transform`** — single 8×8 block forward / inverse DCT. Four
   sub-scenarios (`fdct_intra` / `fdct_signed` / `idct_intra` /
@@ -976,6 +978,30 @@ branchless edge-clamp block copy) have a baseline to A/B against:
   ≈ 54 µs + 109 µs (CIF still). A cache-blocked or SIMD-gather
   rewrite of the interleave is the obvious follow-up; this bench
   gives it an A/B baseline.
+* **`quant`** — the §3.2.5 / §4.2.4 (de)quantisation leaf
+  primitives, the per-coefficient arithmetic the encoder and
+  decoder run on every transmitted DCT coefficient. The `transform`
+  bench covers the inner (I)DCT and `filter_mc` the P-block
+  reconstruction primitives, but neither isolated the (de)quantiser.
+  Sub-scenarios: `dequant_block_8x8/dequant_ac` (the decode-side
+  §4.2.4 reconstruction `REC = QUANT*(2|level|+1)` with the
+  QUANT-parity `-1` correction, swept over a full 64-coefficient
+  block in a `sparse` post-quantisation regime and a `dense` regime
+  where every coefficient survives, at both an odd `q7` and an even
+  `q8` QUANT — the parity is what changes the arithmetic),
+  `quant_ac_block_8x8/quant_ac` (the matching encode-side forward AC
+  quantiser `|level| = floor(|coeff| / (2*QUANT))` with the central
+  dead-zone, over a 64-coefficient block at both parities), and
+  `quant_intra_dc/quant_intra_dc` (the Table 6 INTRA-DC quantiser
+  swept across the whole `0..=2040` level range so both the common
+  fast path and the narrow-neighbourhood search near the forbidden
+  `0x80` code / special `0xFF` = 1024 are exercised). Headline
+  points (release build, aarch64): a dense 64-coefficient dequant
+  block ≈ 52 ns (≈ 0.8 ns/coeff), the sparse block ≈ 30 ns; the
+  forward `quant_ac` block ≈ 46 ns; the full INTRA-DC level sweep
+  ≈ 1.6 µs. A branchless QUANT-parity dequant or a reciprocal-
+  multiply forward quantiser is the obvious follow-up; this bench
+  gives it an A/B baseline.
 
 Every benchmark synthesises its YUV source inline from a
 deterministic striped pattern plus low-amplitude xorshift noise
@@ -999,12 +1025,14 @@ cargo bench -p oxideav-h261 --bench bch
 cargo bench -p oxideav-h261 --bench start_code
 cargo bench -p oxideav-h261 --bench filter_mc
 cargo bench -p oxideav-h261 --bench annex_d
+cargo bench -p oxideav-h261 --bench quant
 
 # Filter to one sub-scenario.
 cargo bench -p oxideav-h261 --bench encode -- qcif_intra
 cargo bench -p oxideav-h261 --bench bch -- parity18
 cargo bench -p oxideav-h261 --bench start_code -- iter_start_codes
 cargo bench -p oxideav-h261 --bench annex_d -- subsample_plane
+cargo bench -p oxideav-h261 --bench quant -- dequant_ac
 ```
 
 The bench suite is `harness = false` (criterion replaces the
