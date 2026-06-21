@@ -114,3 +114,25 @@ name = "parse_sdp_fmtp"
 path = "fuzz_targets/parse_sdp_fmtp.rs"
 test = false
 doc = false
+
+# Sixth fuzz target — the RTP *packetiser* (send / forward) path, the
+# complement of the parse_rtp_payload receive path. Drives
+# `packetize_gob_aligned` (RFC 4587 §4.2 byte-aligned start-code split,
+# total over arbitrary bytes), `packetize_mb_fragmented` (RFC 4587 §4.2
+# RECOMMENDED MB-level fragmentation — the Huffman / VLC macroblock-layer
+# walk that finds macroblock-boundary split points; the richest
+# attacker-reachable parse on the send side, since an MCU / forwarder
+# re-fragments an untrusted sender's bitstream through it), and
+# `RtpPacketizer::pack_frame` in both fragmentation modes (session-
+# stateful glue with running packet / octet / sequence counters). A
+# round-trip seam re-runs the receive-path `depacketize` over the
+# GOB-aligned packetiser's output. The documented `assert!`
+# preconditions on the payload budgets are caller-contract violations,
+# so the harness only feeds budgets above the documented floor. Distinct
+# from the five other surfaces (elementary-stream, RTCP control channel,
+# BCH FEC framing, RTP receive wire format, SDP signalling).
+[[bin]]
+name = "packetize_h261"
+path = "fuzz_targets/packetize_h261.rs"
+test = false
+doc = false

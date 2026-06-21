@@ -901,7 +901,15 @@ pub fn packetize_mb_fragmented(
         };
         let end_byte = frag_end_bit.div_ceil(8) as usize;
         let mut bytes = Vec::with_capacity(HEADER_LEN + (end_byte - start_byte));
-        bytes.extend_from_slice(&pack_header(&hdr).expect("hdr packs"));
+        // The §4.1 continuation header carries the last MB's reconstructed
+        // MV as HMVD/VMVD. On a *malformed* stream the §4.2.3.4 predictor
+        // can desync (`reconstruct_mv` falls through its "shouldn't happen"
+        // arm and yields an MV outside the 5-bit `-15..=15` field), so
+        // `pack_header` may legitimately reject it with
+        // `ForbiddenMvd`/`FieldOverflow`. Propagate that as an `Err` rather
+        // than panicking — re-fragmenting an untrusted sender's bitstream
+        // must never abort the forwarder.
+        bytes.extend_from_slice(&pack_header(&hdr)?);
         bytes.extend_from_slice(&data[start_byte..end_byte]);
         payloads.push(H261RtpPayload {
             header: hdr,
@@ -2345,6 +2353,34 @@ mod tests {
                 assert!(needed > 1);
             }
             other => panic!("expected FragmentTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mb_fragment_returns_err_not_panic_on_desynced_mv() {
+        // Regression for a packetiser panic surfaced by the
+        // `packetize_h261` fuzz target. On a *malformed* INTER stream the
+        // §4.2.3.4 MV predictor can desync — `reconstruct_mv` falls through
+        // its "shouldn't happen on well-formed streams" arm and yields a
+        // reconstructed MV outside the RFC 4587 §4.1 5-bit `-15..=15`
+        // HMVD/VMVD field. The MB-level fragmenter copies that MV into a
+        // mid-GOB continuation header; `pack_header` then legitimately
+        // rejects it (`ForbiddenMvd` / `FieldOverflow`). The fragmenter
+        // used to `.expect("hdr packs")` that pack, turning a recoverable
+        // malformed-input error into a process abort — fatal for an MCU /
+        // forwarder re-fragmenting an untrusted sender's bitstream. It must
+        // return `Err` instead.
+        //
+        // This 34-byte stream + budget=11 is a fuzz-derived minimal
+        // reproducer (cargo-fuzz `packetize_h261`).
+        let stream: &[u8] = &[
+            0, 101, 0, 33, 0, 0, 0, 0, 0, 12, 39, 0, 0, 0, 0, 155, 0, 0, 0, 0, 0, 52, 51, 51, 51,
+            51, 51, 51, 3, 39, 37, 83, 83, 11,
+        ];
+        let res = packetize_mb_fragmented(stream, HEADER_LEN + 7, false, false);
+        match res {
+            Err(RtpError::ForbiddenMvd { .. }) | Err(RtpError::FieldOverflow { .. }) => {}
+            other => panic!("expected ForbiddenMvd/FieldOverflow Err, got {other:?}"),
         }
     }
 

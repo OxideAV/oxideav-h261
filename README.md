@@ -709,16 +709,24 @@ assert_eq!(answer.d, None);
 
 ### Daily fuzzing
 
-A `cargo-fuzz` harness lives under `fuzz/`. Five targets cover the
-five distinct attack surfaces an H.261 endpoint exposes:
+A `cargo-fuzz` harness lives under `fuzz/`. Six targets cover the
+six distinct attack surfaces an H.261 endpoint exposes:
 
 * **`decode_h261`** drives arbitrary fuzz-supplied bytes through the
-  decoder's full public surface (`send_packet` → drain `receive_frame`
-  → `flush` → drain again), so the PSC / GBSC start-code scanners,
+  decoder's full public surface, so the PSC / GBSC start-code scanners,
   every VLC table (MBA / MTYPE / MVD / CBP / TCOEFF + 20-bit escape),
   the §4.2.3.4 MV predictor, the integer-pel MC indexing, the §3.2.3
   loop filter, and the 8×8 IDCT are all exercised against bytes whose
-  shape the fuzzer dictates.
+  shape the fuzzer dictates. The harness is `arbitrary`-driven: the
+  fuzzer picks tight `DecoderLimits` (so the DoS caps are exercised at
+  the small end, where off-by-one rejection bugs live), splits the
+  elementary stream into an arbitrary number of `send_packet` fragments
+  at arbitrary offsets (driving the cross-packet PSC-scanner /
+  picture-buffer accumulation path so a start code straddling a packet
+  boundary stays covered), and drains via both the heap `receive_frame`
+  path and the zero-copy `receive_arena_frame` path (fuzzing the
+  arena-pool lease/return cycle). The default-limits whole-stream path
+  remains covered as the single-packet reduction.
 * **`parse_rtcp_compound`** drives arbitrary fuzz-supplied bytes
   through the RTCP control-channel parser surface
   (`parse_compound` / `parse_report` / `parse_sdes` / `parse_bye` /
@@ -780,8 +788,28 @@ five distinct attack surfaces an H.261 endpoint exposes:
   trips the daily run — including both §6.2.1 preference orders via
   `format_value_preferred`, whose leading token is read back through
   `parse_preference_order`.
+* **`packetize_h261`** drives arbitrary fuzz-supplied bytes through the
+  RTP *packetiser* (send / forward) surface — the complement of
+  `parse_rtp_payload`'s receive path. Three entry points are exercised:
+  `packetize_gob_aligned` (RFC 4587 §4.2 byte-aligned start-code split,
+  total over arbitrary bytes), `packetize_mb_fragmented` (RFC 4587 §4.2
+  RECOMMENDED MB-level fragmentation — the Huffman / VLC macroblock-layer
+  walk that finds macroblock-boundary split points; the richest
+  attacker-reachable parse on the send side, since an MCU / forwarder
+  re-fragments an *untrusted* sender's bitstream through it), and
+  `RtpPacketizer::pack_frame` in both fragmentation modes (the
+  session-stateful glue with running packet / octet / sequence
+  counters). The harness is `arbitrary`-driven (fuzzer-chosen payload
+  budgets, kept above the documented `assert!` floor) and re-runs the
+  receive-path `depacketize` over the GOB-aligned packetiser's output to
+  exercise the pack → unpack seam. This target surfaced a packetiser
+  panic: on a malformed INTER stream the §4.2.3.4 MV predictor can
+  desync and yield a reconstructed MV outside the §4.1 5-bit `-15..=15`
+  HMVD/VMVD field, which `pack_header` legitimately rejects — the
+  fragmenter used to `.expect()` that pack and abort; it now returns
+  `Err` (regression-tested with a 34-byte fuzz-minimized reproducer).
 
-The contract under test is the same for all five targets: every
+The contract under test is the same for all six targets: every
 call must *return* — no panic, no abort, no integer overflow (in
 debug / ASAN builds), no out-of-bounds index, no allocator OOM.
 
@@ -828,7 +856,8 @@ parser must reject.
 
 `tests/fuzz_seed_corpus.rs`, `tests/fuzz_seed_corpus_rtcp.rs`,
 `tests/fuzz_seed_corpus_bch.rs`, `tests/fuzz_seed_corpus_rtp.rs`,
-and `tests/fuzz_seed_corpus_sdp.rs` drive the same logic on stable
+`tests/fuzz_seed_corpus_sdp.rs`, and
+`tests/fuzz_seed_corpus_packetize.rs` drive the same logic on stable
 Rust against each corpus so the regular CI matrix catches a regression
 in any public surface without waiting for the daily fuzz run. The
 RTCP stable-CI test also drives a handful of hand-crafted adversarial

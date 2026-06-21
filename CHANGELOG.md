@@ -7,8 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `packetize_mb_fragmented` (RFC 4587 §4.2 RECOMMENDED MB-level
+  fragmentation) no longer panics on a malformed INTER stream. On a
+  hostile bitstream the §4.2.3.4 MV predictor can desync —
+  `reconstruct_mv` falls through its "shouldn't happen on well-formed
+  streams" arm and yields a reconstructed motion vector outside the
+  RFC 4587 §4.1 5-bit `-15..=15` HMVD/VMVD field. The fragmenter copies
+  that MV into the mid-GOB continuation header; `pack_header` then
+  legitimately rejects it (`ForbiddenMvd` / `FieldOverflow`). The code
+  used to `.expect("hdr packs")` that pack, turning a recoverable
+  malformed-input error into a process abort — fatal for an MCU /
+  forwarder re-fragmenting an untrusted sender's bitstream. It now
+  propagates the error as `Err`. Surfaced by the new `packetize_h261`
+  fuzz target; covered by
+  `mb_fragment_returns_err_not_panic_on_desynced_mv` with a 34-byte
+  fuzz-minimized reproducer.
+
 ### Other
 
+- new `packetize_h261` fuzz target — the RTP *packetiser* (send /
+  forward) surface, complement of the existing `parse_rtp_payload`
+  receive path. Drives `packetize_gob_aligned`,
+  `packetize_mb_fragmented` (the Huffman/VLC macroblock-layer walk over
+  attacker bytes), and `RtpPacketizer::pack_frame` in both
+  fragmentation modes over structured `arbitrary` input (fuzzer-chosen
+  payload budgets above the documented `assert!` floor), with a
+  round-trip seam re-running the receive-path `depacketize` over the
+  GOB-aligned packetiser's output. ~1.66M execs/run clean after the
+  fix above.
 - `decode_h261` fuzz target restructured from a single whole-stream
   packet into a structured `arbitrary`-driven harness: the fuzzer now
   picks tight [`DecoderLimits`] (so the DoS caps —
