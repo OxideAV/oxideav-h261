@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- `decode_h261` fuzz target restructured from a single whole-stream
+  packet into a structured `arbitrary`-driven harness: the fuzzer now
+  picks tight [`DecoderLimits`] (so the DoS caps —
+  `max_pixels_per_frame`, `max_alloc_bytes_per_frame`,
+  `max_arenas_in_flight`, `max_alloc_count_per_frame` — are exercised at
+  the small end where off-by-one rejection bugs live, not just at the
+  generous default), splits the elementary stream into an arbitrary
+  number of `send_packet` fragments at arbitrary offsets (driving the
+  §4.2.1 cross-packet PSC-scanner / picture-buffer accumulation path so
+  a start code straddling a packet boundary is covered), and drains via
+  both the heap `receive_frame` and the zero-copy `receive_arena_frame`
+  surfaces (fuzzing the arena-pool lease/return cycle). The
+  default-limits whole-stream path remains covered as the
+  single-packet/empty-splits reduction. ~185k execs/run clean, no
+  panic / OOB / overflow / OOM surfaced.
+- `fuzz/Cargo.lock` is no longer tracked in git (added to
+  `fuzz/.gitignore`); a committed fuzz lockfile blocks release-plz.
 - criterion suite for the §3.2.5 / §4.2.4 (de)quantisation leaf
   primitives — the decode-side `block::dequant_ac` (QUANT-parity
   reconstruction, swept sparse/dense over a 64-coefficient block at odd
