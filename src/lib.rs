@@ -65,6 +65,14 @@
 //!   ([`annex_c::SequenceRequirements`]: > 100 s duration, ≥ 7.5 Hz coded
 //!   rate, < 10 % stuffing). Like the [`hrd`] model it is a measurement
 //!   helper — nothing it does changes the on-wire bitstream.
+//! * Multipoint control signals (§2.8 + §4.3): the [`multipoint`] module
+//!   models the three switched-multipoint control-signal state machines — the
+//!   decoder-side §4.3.1 freeze-picture hold (released by the §4.3.3 PTYPE
+//!   bit-3 signal or the §4.3.1 "at least six seconds" timeout) and the
+//!   encoder-side §4.3.2 fast-update request (next picture coded INTRA with
+//!   the §4.3.3 release bit set). Two of the three signals travel by external
+//!   means (§4.3), so the module is control-plane logic the decoder / encoder
+//!   wire into their picture loops rather than a bitstream change.
 //! * Annex D still-image transmission (§D.2 + §D.3): the [`annex_d`] module
 //!   exposes the [`annex_d::SubImageIndex`] mapping to / from the 5-bit `TR`
 //!   field, the still-image dimensions (4× the currently transmitted video
@@ -99,6 +107,7 @@ pub mod gob;
 pub mod hrd;
 pub mod idct;
 pub mod mb;
+pub mod multipoint;
 pub mod picture;
 pub mod quant;
 pub mod rtcp;
