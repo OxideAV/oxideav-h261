@@ -80,6 +80,14 @@ pub struct H261Decoder {
     /// Previous decoded picture, kept as the motion-compensation reference
     /// for the next picture.
     reference: Option<Picture>,
+    /// §4.3.1 / §4.3.3 freeze-picture state machine. While frozen the decoder
+    /// keeps decoding (so the MC reference stays current) but the *displayed*
+    /// picture — the one queued for `receive_frame` — is held at the
+    /// last-shown picture rather than advancing to the newly decoded one.
+    freeze: crate::multipoint::FreezeState,
+    /// The most recently *displayed* picture. Used as the held frame while the
+    /// §4.3.1 freeze is active. `None` before the first picture is decoded.
+    frozen_display: Option<Picture>,
     /// DoS-protection caps applied at header-parse and arena-lease time.
     limits: DecoderLimits,
     /// Arena pool sized from `limits`. An arena is leased only when
@@ -124,9 +132,30 @@ impl H261Decoder {
             pending_tb: TimeBase::new(1, 30_000),
             eof: false,
             reference: None,
+            freeze: crate::multipoint::FreezeState::new(),
+            frozen_display: None,
             limits,
             pool,
         }
+    }
+
+    /// Apply a §4.3.1 external freeze-picture request. While frozen, the
+    /// decoder continues to decode incoming pictures (keeping the
+    /// motion-compensation reference current) but repeats the last displayed
+    /// picture on `receive_frame` / `receive_arena_frame` instead of advancing
+    /// to newly decoded ones. The freeze is released by either a decoded
+    /// picture whose PTYPE freeze-picture-release bit is set (§4.3.3) or the
+    /// §4.3.1 "at least six seconds" timeout, whichever comes first.
+    ///
+    /// §4.3 specifies this signal travels by external means (e.g. H.221), so
+    /// it enters the decoder through this API rather than the H.261 bitstream.
+    pub fn request_freeze(&mut self) {
+        self.freeze.request_freeze();
+    }
+
+    /// `true` while the decoder is holding a frozen display picture (§4.3.1).
+    pub fn is_frozen(&self) -> bool {
+        self.freeze.is_frozen()
     }
 
     /// Borrow the configured caps. Useful for tests and diagnostics.
@@ -194,12 +223,38 @@ impl H261Decoder {
             )));
         }
         let pic = decode_picture_body(&mut br, &hdr, bytes, self.reference.as_ref())?;
-        // Queue the raw decoded `Picture` for later draining. Arena
+        // §4.3.1 / §4.3.3 freeze-picture arbitration. The state machine
+        // consumes this picture's freeze-picture-release PTYPE bit and tells
+        // us whether the display should advance to it (`Show`) or keep holding
+        // the last-shown picture (`Freeze`). Decoding itself is unaffected —
+        // the newly decoded picture always becomes the MC reference so that,
+        // once the freeze releases, prediction resumes from the correct frame.
+        let display = self.freeze.on_decoded_picture(hdr.freeze_release);
+        let to_display = match display {
+            crate::multipoint::DisplayAction::Show => {
+                self.frozen_display = Some(pic.clone());
+                pic.clone()
+            }
+            crate::multipoint::DisplayAction::Freeze => {
+                // Repeat the last displayed picture. `frozen_display` is set
+                // as soon as any picture has been shown; if the freeze was
+                // requested before the very first picture, fall back to
+                // showing this one (there is nothing yet to hold).
+                match &self.frozen_display {
+                    Some(held) => held.clone(),
+                    None => {
+                        self.frozen_display = Some(pic.clone());
+                        pic.clone()
+                    }
+                }
+            }
+        };
+        // Queue the picture chosen for display for later draining. Arena
         // leasing happens at `receive_arena_frame` time so the pool
         // doesn't sit checked out across multiple decoded pictures
         // when the caller drives the decoder in a send-many-then-drain
         // pattern (typical for elementary-stream tests).
-        self.ready_frames.push_back((pic.clone(), self.pending_pts));
+        self.ready_frames.push_back((to_display, self.pending_pts));
         self.reference = Some(pic);
         Ok(())
     }
@@ -507,6 +562,8 @@ impl Decoder for H261Decoder {
         self.pending_pts = None;
         self.eof = false;
         self.reference = None;
+        self.freeze = crate::multipoint::FreezeState::new();
+        self.frozen_display = None;
         Ok(())
     }
 
