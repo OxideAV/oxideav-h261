@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-h261/compare/v0.0.7...v0.0.8) - 2026-07-01
+
+### Other
+
+- §2.7 / §2.8 GOB-resync error concealment
+- §4.3.2 fast-update request drives INTRA reply with §4.3.3 release bit
+- wire §4.3.1 / §4.3.3 freeze-picture hold into H261Decoder
+- §4.3 multipoint control-signal state machines (freeze / fast-update)
+- add packetize_h261 target; fix MV-desync packetiser panic
+- structured multi-packet decode_h261 harness + untrack fuzz/Cargo.lock
+- §3.2.5 / §4.2.4 (de)quantiser leaf-primitive criterion suite
+- encoder-side MBA stuffing (§4.2.3.1) for §5.2/Annex B buffer regulation
+- Annex D §D.2 still-image sub-sample / re-assembly transform
+- §5.3 + Annex C codec delay measurement method
+- refresh to current status, drop per-round changelog cruft
+
 ### Fixed
 
 - `packetize_mb_fragmented` (RFC 4587 §4.2 RECOMMENDED MB-level
