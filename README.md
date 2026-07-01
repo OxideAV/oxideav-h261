@@ -725,8 +725,12 @@ six distinct attack surfaces an H.261 endpoint exposes:
   picture-buffer accumulation path so a start code straddling a packet
   boundary stays covered), and drains via both the heap `receive_frame`
   path and the zero-copy `receive_arena_frame` path (fuzzing the
-  arena-pool lease/return cycle). The default-limits whole-stream path
-  remains covered as the single-packet reduction.
+  arena-pool lease/return cycle). The fuzzer also flips the §2.7 / §2.8
+  error-concealment toggle, so the GOB-resync walk, the per-GOB
+  reference-copy concealment, and the whole-picture fallback are driven
+  against the same hostile bytes as the strict abort path. The
+  default-limits whole-stream path remains covered as the single-packet
+  reduction.
 * **`parse_rtcp_compound`** drives arbitrary fuzz-supplied bytes
   through the RTCP control-channel parser surface
   (`parse_compound` / `parse_report` / `parse_sdes` / `parse_bye` /
@@ -860,6 +864,10 @@ parser must reject.
 `tests/fuzz_seed_corpus_packetize.rs` drive the same logic on stable
 Rust against each corpus so the regular CI matrix catches a regression
 in any public surface without waiting for the daily fuzz run. The
+`decode_h261` stable-CI test drives every seed through **both** the strict
+and the §2.7 / §2.8 error-concealment decoder, mirroring the harness's
+concealment toggle so the resync / reference-copy paths stay covered on
+the regular matrix. The
 RTCP stable-CI test also drives a handful of hand-crafted adversarial
 buffers — lying header length, zero-length advance, truncated
 compound, SDES PRIV length overflow, BYE reason overflow, APP at the

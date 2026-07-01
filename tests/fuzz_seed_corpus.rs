@@ -28,8 +28,8 @@ fn corpus_dir() -> PathBuf {
         .join("decode_h261")
 }
 
-fn drive(bytes: &[u8]) {
-    let mut dec = H261Decoder::new(CodecId::new("h261"));
+fn drive_one(bytes: &[u8], conceal: bool) {
+    let mut dec = H261Decoder::new(CodecId::new("h261")).with_error_concealment(conceal);
     let pkt = Packet::new(0, TimeBase::new(1, 30), bytes.to_vec());
     let _ = dec.send_packet(&pkt);
     for _ in 0..32 {
@@ -43,6 +43,17 @@ fn drive(bytes: &[u8]) {
             break;
         }
     }
+    // Reading the concealment count must never panic regardless of input.
+    let _ = dec.last_concealed_gobs();
+}
+
+/// Drive `bytes` through both the strict decoder and the §2.7 / §2.8
+/// error-concealment decoder — mirroring the `conceal` toggle the
+/// `decode_h261` fuzz harness now flips — so the concealment resync / copy
+/// paths get the same stable-CI coverage as the strict path.
+fn drive(bytes: &[u8]) {
+    drive_one(bytes, false);
+    drive_one(bytes, true);
 }
 
 #[test]

@@ -81,6 +81,12 @@ struct Plan {
     splits: Vec<u16>,
     /// Drain kinds cycled through between/after packets.
     drains: Vec<DrainKind>,
+    /// Whether to enable §2.7 / §2.8 error concealment. With it on, a GOB
+    /// that fails to decode is concealed from the reference and decoding
+    /// resyncs at the next GBSC instead of aborting the picture — a distinct
+    /// code path (the resync walk, the per-GOB reference copy, and the
+    /// whole-picture fallback) that must also never panic on hostile bytes.
+    conceal: bool,
     /// The elementary-stream payload.
     stream: Vec<u8>,
 }
@@ -114,6 +120,8 @@ impl<'a> Arbitrary<'a> for Plan {
             });
         }
 
+        let conceal = bool::arbitrary(u)?;
+
         // Whatever is left is the bitstream the decoder actually parses.
         let remaining = u.len();
         let stream = u.bytes(remaining)?.to_vec();
@@ -122,6 +130,7 @@ impl<'a> Arbitrary<'a> for Plan {
             limits,
             splits,
             drains,
+            conceal,
             stream,
         })
     }
@@ -151,10 +160,12 @@ fuzz_target!(|plan: Plan| {
         limits,
         splits,
         drains,
+        conceal,
         stream,
     } = plan;
 
-    let mut dec = H261Decoder::with_limits(CodecId::new("h261"), limits);
+    let mut dec = H261Decoder::with_limits(CodecId::new("h261"), limits)
+        .with_error_concealment(conceal);
     let tb = TimeBase::new(1, 30);
 
     // Feed the stream in fragments at the planned offsets. A start code
