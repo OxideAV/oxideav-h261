@@ -253,6 +253,42 @@ pub fn encode_intra_picture_with_recon(
     quant: u32,
     temporal_reference: u8,
 ) -> Result<(Vec<u8>, Picture)> {
+    encode_intra_picture_with_recon_ptype(
+        fmt,
+        y,
+        y_stride,
+        cb,
+        cb_stride,
+        cr,
+        cr_stride,
+        quant,
+        temporal_reference,
+        Ptype::default(),
+    )
+}
+
+/// Encode an INTRA picture (as [`encode_intra_picture_with_recon`]) with
+/// explicit §4.2.1.3 PTYPE display-control flags in the picture header.
+///
+/// The primary use is the §4.3.2 / §4.3.3 fast-update response: an encoder that
+/// codes an INTRA picture in reply to a fast-update request sets
+/// [`Ptype::freeze_picture_release`] so a far-end decoder frozen by a §4.3.1
+/// freeze request may exit freeze mode (§4.3.3). The `HI_RES` bit stays set
+/// (canonical motion-video header); use [`write_picture_header_ptype`] directly
+/// for the Annex-D still-image combination.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_intra_picture_with_recon_ptype(
+    fmt: SourceFormat,
+    y: &[u8],
+    y_stride: usize,
+    cb: &[u8],
+    cb_stride: usize,
+    cr: &[u8],
+    cr_stride: usize,
+    quant: u32,
+    temporal_reference: u8,
+    ptype: Ptype,
+) -> Result<(Vec<u8>, Picture)> {
     validate_inputs(
         fmt,
         y,
@@ -269,7 +305,7 @@ pub fn encode_intra_picture_with_recon(
     let mut recon = Picture::new(w as usize, h as usize);
 
     let mut bw = BitWriter::with_capacity(4096);
-    write_picture_header(&mut bw, fmt, temporal_reference);
+    write_picture_header_ptype(&mut bw, fmt, temporal_reference, true, ptype);
 
     for &gn in fmt.gob_numbers() {
         write_gob_header(&mut bw, gn, quant);
@@ -430,6 +466,10 @@ pub struct H261Encoder {
     /// Round-robin cursor so the forced-update load is spread across frames
     /// rather than spiking every 132th P-frame.
     forced_update_cursor: usize,
+    /// §4.3.2 fast-update request latch. When a request is pending, the next
+    /// `encode_frame` codes an INTRA picture carrying the §4.3.3
+    /// freeze-picture-release PTYPE bit.
+    fast_update: crate::multipoint::FastUpdateState,
 }
 
 impl H261Encoder {
@@ -446,7 +486,27 @@ impl H261Encoder {
             forced_update_period: 132, // §3.4 upper bound
             mb_since_intra: Vec::new(),
             forced_update_cursor: 0,
+            fast_update: crate::multipoint::FastUpdateState::new(),
         }
+    }
+
+    /// Latch a §4.3.2 fast-update request. The next [`encode_frame`] call codes
+    /// an INTRA picture "with coding parameters such as to avoid buffer
+    /// overflow" (§4.3.2) and stamps the §4.3.3 freeze-picture-release bit into
+    /// its PTYPE header, so a far-end decoder frozen by a §4.3.1 request can
+    /// resume live display. The request travels by external means per §4.3
+    /// (e.g. an RTCP FIR or an H.245 videoFastUpdatePicture command), so it
+    /// enters the encoder through this API rather than the bitstream. The
+    /// request is consumed by exactly one picture; a second request before the
+    /// next `encode_frame` collapses into the same single INTRA response.
+    pub fn request_fast_update(&mut self) {
+        self.fast_update.request();
+    }
+
+    /// `true` while a §4.3.2 fast-update request is latched and not yet applied
+    /// to a coded picture.
+    pub fn fast_update_pending(&self) -> bool {
+        self.fast_update.is_pending()
     }
 
     /// Override the I-refresh period (number of frames between forced
@@ -485,7 +545,13 @@ impl H261Encoder {
             self.forced_update_cursor = 0;
         }
 
-        let force_intra = self.reference.is_none()
+        // §4.3.2 fast-update: a pending request forces this picture INTRA and
+        // stamps the §4.3.3 freeze-release bit. Poll (and clear) the latch once
+        // per picture.
+        let fast = self.fast_update.take_for_next_picture();
+
+        let force_intra = fast.force_intra
+            || self.reference.is_none()
             || (self.intra_period != 0 && self.frames_since_intra >= self.intra_period);
 
         let (bytes, recon) = if force_intra {
@@ -495,7 +561,11 @@ impl H261Encoder {
                 *c = 0;
             }
             self.forced_update_cursor = 0;
-            encode_intra_picture_with_recon(
+            let ptype = Ptype {
+                freeze_picture_release: fast.set_freeze_release,
+                ..Ptype::default()
+            };
+            encode_intra_picture_with_recon_ptype(
                 self.fmt,
                 y,
                 y_stride,
@@ -505,6 +575,7 @@ impl H261Encoder {
                 cr_stride,
                 self.quant,
                 self.next_tr,
+                ptype,
             )?
         } else {
             self.frames_since_intra += 1;
@@ -1977,6 +2048,61 @@ mod tests {
         let cb = vec![128u8; (w / 2) * (h / 2)];
         let cr = vec![128u8; (w / 2) * (h / 2)];
         (y, cb, cr)
+    }
+
+    /// Parse just the picture header of an encoded elementary stream.
+    fn header_of(bytes: &[u8]) -> crate::picture::PictureHeader {
+        let mut br = BitReader::new(bytes);
+        parse_picture_header(&mut br).expect("parse header")
+    }
+
+    #[test]
+    fn fast_update_forces_intra_with_release_bit() {
+        let (y, cb, cr) = gradient_qcif();
+        // P-only sequence so ordinary frames are P-pictures with the release
+        // bit clear.
+        let mut enc = H261Encoder::new(SourceFormat::Qcif, 8).with_intra_period(0);
+
+        // Frame 0 is the initial I-picture — release bit clear (no fast update).
+        let s0 = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap();
+        assert!(
+            !header_of(&s0).freeze_release,
+            "plain I has release bit clear"
+        );
+
+        // Frame 1 is an ordinary P-picture — release bit clear.
+        let s1 = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap();
+        assert!(!header_of(&s1).freeze_release);
+        assert!(!enc.fast_update_pending());
+
+        // §4.3.2 fast-update request ⇒ next picture INTRA with §4.3.3 bit set.
+        enc.request_fast_update();
+        assert!(enc.fast_update_pending());
+        let s_fu = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap();
+        assert!(!enc.fast_update_pending(), "consumed by one picture");
+        let h = header_of(&s_fu);
+        assert!(
+            h.freeze_release,
+            "§4.3.3 release bit set on fast-update reply"
+        );
+
+        // The fast-update picture must be INTRA: it decodes with NO reference
+        // (an INTER MB with no reference would fall back to grey; an all-INTRA
+        // picture reconstructs the source regardless of reference). Decode it
+        // standalone and confirm it round-trips the source closely.
+        let mut br = BitReader::new(&s_fu);
+        let hdr = parse_picture_header(&mut br).expect("parse header");
+        let pic = decode_picture_body(&mut br, &hdr, &s_fu, None)
+            .expect("decode fast-update picture with no reference");
+        let vf = pic_to_video_frame(&pic, None, TimeBase::new(1, 30));
+        assert!(
+            psnr(&vf.planes[0].data, &y) > 30.0,
+            "INTRA picture reconstructs source without a reference"
+        );
+
+        // The picture after the fast-update reply is an ordinary P again.
+        let s_after = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap();
+        assert!(!header_of(&s_after).freeze_release);
     }
 
     fn psnr(a: &[u8], b: &[u8]) -> f64 {

@@ -136,3 +136,67 @@ fn freeze_before_first_picture_shows_first() {
 fn freeze_timeout_constant_is_six_seconds() {
     assert_eq!(FREEZE_TIMEOUT_NANOS, 6_000_000_000);
 }
+
+#[test]
+fn fast_update_release_bit_unfreezes_decoder_in_band() {
+    // §4.3.2 + §4.3.3 round trip: the encoder responds to a fast-update
+    // request with an INTRA picture carrying the freeze-release bit, and a
+    // decoder frozen by a §4.3.1 request releases on that in-band signal —
+    // well before the six-second timeout.
+    let mut dec = H261Decoder::new(CodecId::new(oxideav_h261::CODEC_ID_STR));
+    // P-only after the first I, so ordinary frames do NOT set the release bit.
+    let mut enc = H261Encoder::new(SourceFormat::Qcif, 8).with_intra_period(0);
+
+    // Frame 0: I-picture (no fast update ⇒ no release bit), luma 30.
+    let (y, cb, cr) = flat_frame(30);
+    let s0 = enc.encode_frame(&y, W, &cb, W / 2, &cr, W / 2).unwrap();
+    assert!(!enc.fast_update_pending());
+    // Frame 1: ordinary P-picture, luma 30 (identical ⇒ mostly skipped).
+    let s1 = enc.encode_frame(&y, W, &cb, W / 2, &cr, W / 2).unwrap();
+
+    // Feed frames 0,1: frame 0 decodes on the second feed (un-frozen ⇒ shown).
+    assert!(feed(&mut dec, &s0).is_none());
+    let f0 = feed(&mut dec, &s1).expect("frame 0 out");
+    assert_eq!(luma00(&f0), 30);
+
+    // §4.3.1 external freeze request now.
+    dec.request_freeze();
+
+    // A couple of ordinary P-frames while frozen — held, no release.
+    let s2 = enc.encode_frame(&y, W, &cb, W / 2, &cr, W / 2).unwrap();
+    let f1 = feed(&mut dec, &s2).expect("frame 1 out"); // decodes frame 1 (frozen)
+    assert_eq!(luma00(&f1), 30, "held while frozen");
+    assert!(dec.is_frozen());
+
+    // A far-end §4.3.2 fast-update request reaches the encoder. Its next
+    // picture must be INTRA with the §4.3.3 release bit set. Change the image
+    // so the released picture is distinguishable (luma 200).
+    enc.request_fast_update();
+    assert!(enc.fast_update_pending());
+    let (y2, cb2, cr2) = flat_frame(200);
+    let s_fu = enc.encode_frame(&y2, W, &cb2, W / 2, &cr2, W / 2).unwrap();
+    assert!(
+        !enc.fast_update_pending(),
+        "request consumed by one picture"
+    );
+
+    // Feed the fast-update picture: it decodes frame 2 (s2, still frozen, held
+    // at 30). Then feed one more frame to decode the fast-update picture.
+    let f2 = feed(&mut dec, &s_fu).expect("frame 2 out");
+    assert_eq!(luma00(&f2), 30, "still frozen decoding s2");
+    assert!(dec.is_frozen());
+
+    // Frame after the fast-update picture, to trigger its decode.
+    let s_after = enc.encode_frame(&y2, W, &cb2, W / 2, &cr2, W / 2).unwrap();
+    let f_release = feed(&mut dec, &s_after).expect("fast-update frame out");
+    // §4.3.3: the release picture is itself displayed and the freeze ends.
+    assert_eq!(
+        luma00(&f_release),
+        200,
+        "release bit shows the INTRA picture"
+    );
+    assert!(
+        !dec.is_frozen(),
+        "in-band release exited freeze before timeout"
+    );
+}
