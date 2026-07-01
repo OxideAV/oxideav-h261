@@ -65,6 +65,13 @@
 //!   ([`annex_c::SequenceRequirements`]: > 100 s duration, ≥ 7.5 Hz coded
 //!   rate, < 10 % stuffing). Like the [`hrd`] model it is a measurement
 //!   helper — nothing it does changes the on-wire bitstream.
+//! * Error concealment (§2.7 + §2.8): the [`decoder::H261Decoder`] opt-in
+//!   [`decoder::H261Decoder::with_error_concealment`] mode resynchronises at
+//!   the next GBSC when a GOB fails to decode, concealing the damaged GOB from
+//!   the reference picture instead of discarding the whole frame — the recovery
+//!   mechanism §2.7 relies on when the outer BCH FEC is not used.
+//!   [`decoder::H261Decoder::last_concealed_gobs`] reports the per-picture
+//!   concealment count for loss-driven feedback.
 //! * Multipoint control signals (§2.8 + §4.3): the [`multipoint`] module
 //!   models the three switched-multipoint control-signal state machines — the
 //!   decoder-side §4.3.1 freeze-picture hold (released by the §4.3.3 PTYPE

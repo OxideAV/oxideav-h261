@@ -88,6 +88,15 @@ pub struct H261Decoder {
     /// The most recently *displayed* picture. Used as the held frame while the
     /// §4.3.1 freeze is active. `None` before the first picture is decoded.
     frozen_display: Option<Picture>,
+    /// §2.7 / §2.8 error concealment. When `true`, a GOB that fails to decode
+    /// is concealed from the reference and decoding resyncs at the next GBSC
+    /// rather than discarding the whole picture. Off by default (strict decode
+    /// surfaces malformed streams as `Err`).
+    conceal_errors: bool,
+    /// Count of GOBs concealed in the most recently decoded picture (§2.7).
+    /// Zero on a clean decode; useful for a caller driving loss-feedback
+    /// (e.g. an RTCP-triggered fast-update request).
+    last_concealed_gobs: usize,
     /// DoS-protection caps applied at header-parse and arena-lease time.
     limits: DecoderLimits,
     /// Arena pool sized from `limits`. An arena is leased only when
@@ -134,9 +143,33 @@ impl H261Decoder {
             reference: None,
             freeze: crate::multipoint::FreezeState::new(),
             frozen_display: None,
+            conceal_errors: false,
+            last_concealed_gobs: 0,
             limits,
             pool,
         }
+    }
+
+    /// Enable §2.7 / §2.8 error concealment. When enabled, a GOB that fails to
+    /// decode (malformed GOB header, bad MBA, or a macroblock decode error) is
+    /// concealed from the reference picture and decoding resyncs at the next
+    /// GBSC, so a single damaged GOB no longer discards the whole picture. This
+    /// is the resilient mode for lossy p × 64 kbit/s channels where the outer
+    /// BCH FEC (§2.7) is optional and the GOB start-code structure is the
+    /// recovery mechanism. Off by default (strict decode surfaces malformed
+    /// input as `Err`).
+    pub fn with_error_concealment(mut self, enable: bool) -> Self {
+        self.conceal_errors = enable;
+        self
+    }
+
+    /// Number of GOBs concealed while decoding the most recently produced
+    /// picture (§2.7 / §2.8). Zero on a clean decode and whenever error
+    /// concealment is disabled. A caller can drive loss feedback (e.g. an
+    /// RTCP-triggered §4.3.2 fast-update request back to the far-end encoder)
+    /// off a non-zero count.
+    pub fn last_concealed_gobs(&self) -> usize {
+        self.last_concealed_gobs
     }
 
     /// Apply a §4.3.1 external freeze-picture request. While frozen, the
@@ -222,7 +255,15 @@ impl H261Decoder {
                 hdr.width, hdr.height, pixels, self.limits.max_pixels_per_frame
             )));
         }
-        let pic = decode_picture_body(&mut br, &hdr, bytes, self.reference.as_ref())?;
+        let pic = if self.conceal_errors {
+            let (pic, concealed) =
+                decode_picture_body_concealing(&mut br, &hdr, bytes, self.reference.as_ref());
+            self.last_concealed_gobs = concealed;
+            pic
+        } else {
+            self.last_concealed_gobs = 0;
+            decode_picture_body(&mut br, &hdr, bytes, self.reference.as_ref())?
+        };
         // §4.3.1 / §4.3.3 freeze-picture arbitration. The state machine
         // consumes this picture's freeze-picture-release PTYPE bit and tells
         // us whether the display should advance to it (`Show`) or keep holding
@@ -315,50 +356,140 @@ fn build_arena_frame(
 /// expect to find, parse its header (which tells us GN and GQUANT), then
 /// iterate MBs by MBA differences until we run out of MBs or hit the next
 /// start code.
+///
+/// This is the **strict** entry point: any malformed GOB header or macroblock
+/// aborts the whole picture with `Err`. For lossy-channel resilience — where a
+/// single damaged GOB should be concealed from the reference and decoding
+/// should resync at the next GBSC (§2.7 / §2.8) — use
+/// [`decode_picture_body_concealing`].
 pub fn decode_picture_body(
     br: &mut BitReader<'_>,
     hdr: &PictureHeader,
     bytes: &[u8],
     reference: Option<&Picture>,
 ) -> Result<Picture> {
+    decode_picture_body_impl(br, hdr, bytes, reference, false).map(|(pic, _)| pic)
+}
+
+/// Decode the body of a picture with **error concealment** (§2.7 / §2.8).
+///
+/// H.261 §2.7 makes the outer BCH FEC layer optional and relies on the video
+/// multiplex's start-code structure for recovery: each GOB begins with a
+/// unique 16-bit GBSC, so a decoder can resynchronise at a GOB boundary after
+/// a bit error. This entry point implements that recovery. When a GOB header
+/// or any macroblock inside a GOB fails to decode, the remaining macroblocks of
+/// that GOB are concealed — copied from the co-located region of the
+/// `reference` picture (a P-picture's best available estimate), or left at the
+/// picture's initial state when no reference exists (an opening I-picture) —
+/// and decoding continues from the next expected GBSC rather than discarding
+/// the whole picture. A GOB whose GBSC is entirely missing from the bitstream
+/// is likewise concealed.
+///
+/// Returns the reconstructed picture and the number of GOBs that were
+/// concealed (`0` on a clean decode). Concealment never fails: a picture is
+/// always produced, at worst a full copy of the reference.
+pub fn decode_picture_body_concealing(
+    br: &mut BitReader<'_>,
+    hdr: &PictureHeader,
+    bytes: &[u8],
+    reference: Option<&Picture>,
+) -> (Picture, usize) {
+    // `conceal = true` never returns Err (see impl), so the unwrap is
+    // infallible — but express it as a fallback for total safety.
+    decode_picture_body_impl(br, hdr, bytes, reference, true).unwrap_or_else(|_| {
+        let mut pic = Picture::new(hdr.width as usize, hdr.height as usize);
+        if let Some(r) = reference {
+            conceal_whole_picture(&mut pic, r);
+        }
+        (pic, hdr.source_format.gob_numbers().len())
+    })
+}
+
+/// Shared decode driver for the strict and concealing entry points. `conceal`
+/// selects error-concealment resync (§2.7 / §2.8) vs strict abort. Returns the
+/// picture plus the count of concealed GOBs.
+fn decode_picture_body_impl(
+    br: &mut BitReader<'_>,
+    hdr: &PictureHeader,
+    bytes: &[u8],
+    reference: Option<&Picture>,
+    conceal: bool,
+) -> Result<(Picture, usize)> {
     let mut pic = Picture::new(hdr.width as usize, hdr.height as usize);
     let gobs: Vec<StartCode> = collect_start_codes(bytes);
+    let mut concealed_gobs = 0usize;
 
     let expected_gns = hdr.source_format.gob_numbers();
     for &expected_gn in expected_gns {
+        let (gob_x, gob_y) = match hdr.source_format {
+            SourceFormat::Cif => cif_gob_origin_luma(expected_gn),
+            SourceFormat::Qcif => qcif_gob_origin_luma(expected_gn),
+        };
         // Seek to the GBSC for this GOB (starting from current bit position).
         let cur_bit = br.bit_position();
         let target = gobs.iter().find(|g| g.bit_pos >= cur_bit);
-        let Some(target) = target else {
-            return Err(Error::invalid(format!(
-                "h261: missing GBSC for GN={expected_gn} (no further start codes)"
-            )));
+        let target = match target {
+            Some(t) if t.gn != GN_PICTURE && t.gn == expected_gn => t,
+            other => {
+                // Missing / out-of-order / PSC-first GBSC for this GN.
+                if conceal {
+                    conceal_gob(&mut pic, reference, gob_x, gob_y);
+                    concealed_gobs += 1;
+                    // Do not advance `br`; the next expected GN will re-scan
+                    // from the same position and either find its GBSC or be
+                    // concealed too. A PSC-first / end-of-data condition ends
+                    // the remaining GOBs via this same concealment path.
+                    let _ = other;
+                    continue;
+                }
+                match other {
+                    None => {
+                        return Err(Error::invalid(format!(
+                            "h261: missing GBSC for GN={expected_gn} (no further start codes)"
+                        )))
+                    }
+                    Some(t) if t.gn == GN_PICTURE => {
+                        return Err(Error::invalid(format!(
+                            "h261: expected GBSC for GN={expected_gn} but found a PSC first"
+                        )))
+                    }
+                    Some(t) => {
+                        return Err(Error::invalid(format!(
+                            "h261: GOB order mismatch — expected GN={expected_gn}, found GN={}",
+                            t.gn
+                        )))
+                    }
+                }
+            }
         };
-        if target.gn == GN_PICTURE {
-            return Err(Error::invalid(format!(
-                "h261: expected GBSC for GN={expected_gn} but found a PSC first"
-            )));
-        }
-        if target.gn != expected_gn {
-            return Err(Error::invalid(format!(
-                "h261: GOB order mismatch — expected GN={expected_gn}, found GN={}",
-                target.gn
-            )));
-        }
         // Align to the first zero bit of the GBSC.
         let pad = target.bit_pos - cur_bit;
         if pad > 0 {
             br.skip(pad as u32)?;
         }
-        let gob_hdr = parse_gob_header(br)?;
-        let mut quant = gob_hdr.gquant as u32;
-        let (gob_x, gob_y) = match hdr.source_format {
-            SourceFormat::Cif => cif_gob_origin_luma(gob_hdr.gn),
-            SourceFormat::Qcif => qcif_gob_origin_luma(gob_hdr.gn),
+        let gob_hdr = match parse_gob_header(br) {
+            Ok(h) => h,
+            Err(e) => {
+                if conceal {
+                    conceal_gob(&mut pic, reference, gob_x, gob_y);
+                    concealed_gobs += 1;
+                    // Resync: skip past this GBSC so the next GN scan looks
+                    // beyond it for the following GOB's start code.
+                    resync_after(br, &gobs);
+                    continue;
+                }
+                return Err(e);
+            }
         };
+        let mut quant = gob_hdr.gquant as u32;
 
         let mut ctx = MbContext::reset();
         let mut current_mba: i32 = 0;
+
+        // A snapshot of the bit position at the GOB start, so a concealment
+        // can drop everything decoded in this GOB and start clean from the
+        // reference (avoids a half-decoded GOB when an MB fails mid-way).
+        let mut gob_failed = false;
 
         loop {
             // Stop when we hit the next start code. The 16-bit prefix is
@@ -380,17 +511,35 @@ pub fn decode_picture_body(
                 break;
             }
             if remaining_bits >= 16 {
-                let peek16 = br.peek_u32(16)?;
+                let peek16 = match br.peek_u32(16) {
+                    Ok(v) => v,
+                    Err(e) if conceal => {
+                        gob_failed = true;
+                        let _ = e;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
                 if peek16 == 0x0001 {
                     break;
                 }
             }
-            let diff = match decode_mba_diff(br)? {
-                Some(d) => d as i32,
-                None => break,
+            let diff = match decode_mba_diff(br) {
+                Ok(Some(d)) => d as i32,
+                Ok(None) => break,
+                Err(e) if conceal => {
+                    gob_failed = true;
+                    let _ = e;
+                    break;
+                }
+                Err(e) => return Err(e),
             };
             let new_mba = current_mba + diff;
             if !(1..=33).contains(&new_mba) {
+                if conceal {
+                    gob_failed = true;
+                    break;
+                }
                 return Err(Error::invalid(format!(
                     "h261 MB: MBA out of range {new_mba} (GN={}, prev_mba={})",
                     gob_hdr.gn, current_mba
@@ -409,7 +558,7 @@ pub fn decode_picture_body(
                 }
             }
             current_mba = new_mba;
-            decode_macroblock(
+            match decode_macroblock(
                 br,
                 new_mba as u8,
                 gob_x,
@@ -418,8 +567,28 @@ pub fn decode_picture_body(
                 &mut ctx,
                 &mut pic,
                 reference,
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(e) if conceal => {
+                    gob_failed = true;
+                    let _ = e;
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
         }
+
+        if gob_failed {
+            // §2.7 / §2.8 concealment: a mid-GOB failure conceals the whole
+            // GOB from the reference (any MBs decoded before the failure are
+            // overwritten so a half-decoded GOB is never displayed) and
+            // resyncs at the next start code.
+            conceal_gob(&mut pic, reference, gob_x, gob_y);
+            concealed_gobs += 1;
+            resync_after(br, &gobs);
+            continue;
+        }
+
         // Pad any remaining skipped MBs through MBA=33.
         if let Some(ref_pic) = reference {
             for skipped_mba in (current_mba + 1)..=33 {
@@ -428,7 +597,52 @@ pub fn decode_picture_body(
         }
     }
 
-    Ok(pic)
+    Ok((pic, concealed_gobs))
+}
+
+/// Advance `br` to just after the next start code at or beyond the current bit
+/// position (used to resynchronise after a concealed GOB). If there is no
+/// further start code, position at end-of-data so the outer loop's remaining
+/// GOBs all take the "missing GBSC" concealment path.
+fn resync_after(br: &mut BitReader<'_>, gobs: &[StartCode]) {
+    let cur = br.bit_position();
+    // Find the first start code strictly after the current position (skip the
+    // one we may be sitting on).
+    if let Some(next) = gobs.iter().find(|g| g.bit_pos > cur) {
+        let pad = next.bit_pos - cur;
+        let _ = br.skip(pad as u32);
+    } else {
+        // No further start code: consume the rest so the next expected GN is
+        // concealed and the loop terminates.
+        let rem = br.bits_remaining();
+        if rem > 0 {
+            let _ = br.skip(rem as u32);
+        }
+    }
+}
+
+/// Conceal one GOB by copying its 3×11 macroblock region from the co-located
+/// area of `reference`. With no reference (an opening I-picture) the region is
+/// left at the picture's initial (zero) state — the best available estimate.
+fn conceal_gob(pic: &mut Picture, reference: Option<&Picture>, gob_x: usize, gob_y: usize) {
+    let Some(reference) = reference else {
+        return;
+    };
+    // A GOB is 11 MBs wide × 3 rows = MBAs 1..=33.
+    for mba in 1u8..=33 {
+        copy_skipped_mb(pic, reference, mba, gob_x, gob_y);
+    }
+}
+
+/// Conceal the entire picture by copying every plane from `reference`. Used as
+/// the last-resort fallback when even the GOB walk cannot start.
+fn conceal_whole_picture(pic: &mut Picture, reference: &Picture) {
+    let n = pic.y.len().min(reference.y.len());
+    pic.y[..n].copy_from_slice(&reference.y[..n]);
+    let nc = pic.cb.len().min(reference.cb.len());
+    pic.cb[..nc].copy_from_slice(&reference.cb[..nc]);
+    let nr = pic.cr.len().min(reference.cr.len());
+    pic.cr[..nr].copy_from_slice(&reference.cr[..nr]);
 }
 
 /// Copy an MB verbatim from `reference` into `pic` at the same position.
@@ -564,6 +778,7 @@ impl Decoder for H261Decoder {
         self.reference = None;
         self.freeze = crate::multipoint::FreezeState::new();
         self.frozen_display = None;
+        self.last_concealed_gobs = 0;
         Ok(())
     }
 
