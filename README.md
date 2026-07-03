@@ -1,5 +1,7 @@
 # oxideav-h261
 
+[![CI](https://github.com/OxideAV/oxideav-h261/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-h261/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-h261.svg)](https://crates.io/crates/oxideav-h261) [![docs.rs](https://docs.rs/oxideav-h261/badge.svg)](https://docs.rs/oxideav-h261) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **ITU-T H.261** video codec — the original 1990/1993 videoconferencing
 codec. Decodes and encodes both I-pictures (INTRA macroblocks) and P-pictures
 (INTER with integer-pel motion compensation + loop filter). QCIF (176×144) and
