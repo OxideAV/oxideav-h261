@@ -80,6 +80,14 @@
 //!   the §4.3.3 release bit set). Two of the three signals travel by external
 //!   means (§4.3), so the module is control-plane logic the decoder / encoder
 //!   wire into their picture loops rather than a bitstream change.
+//! * Temporal reference and picture rate (§3.1 + §4.2.1.2): the [`temporal`]
+//!   module unwraps the 5-bit `TR` field's mod-32 arithmetic into a monotonic
+//!   presentation timeline ([`temporal::TrTracker`]), and models the §3.1
+//!   picture-rate restriction ([`temporal::PictureRate`]: "at least 0, 1, 2 or
+//!   3 non-transmitted pictures between transmitted ones") that the encoder
+//!   stamps into successive `TR` fields. The decoder feeds the per-picture
+//!   `TR` delta into the §4.3.1 freeze-picture timeout so it counts the true
+//!   number of elapsed source-picture periods, not one tick per decoded picture.
 //! * Annex D still-image transmission (§D.2 + §D.3): the [`annex_d`] module
 //!   exposes the [`annex_d::SubImageIndex`] mapping to / from the 5-bit `TR`
 //!   field, the still-image dimensions (4× the currently transmitted video
@@ -122,6 +130,7 @@ pub mod rtp;
 pub mod sdp;
 pub mod start_code;
 pub mod tables;
+pub mod temporal;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 use oxideav_core::{CodecInfo, CodecRegistry, RuntimeContext};
