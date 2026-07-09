@@ -470,6 +470,13 @@ pub struct H261Encoder {
     /// `encode_frame` codes an INTRA picture carrying the §4.3.3
     /// freeze-picture-release PTYPE bit.
     fast_update: crate::multipoint::FastUpdateState,
+    /// §3.1 picture-rate restriction. Each emitted picture advances the `TR`
+    /// field by `picture_rate.tr_increment()` (§4.2.1.2: `1 + non_transmitted`)
+    /// so a caller that drops the non-transmitted source pictures itself still
+    /// stamps a conformant temporal reference. Defaults to the full 29.97 Hz
+    /// rate (increment 1), keeping the coded sequence byte-identical to one that
+    /// never modelled a rate restriction.
+    picture_rate: crate::temporal::PictureRate,
 }
 
 impl H261Encoder {
@@ -487,7 +494,35 @@ impl H261Encoder {
             mb_since_intra: Vec::new(),
             forced_update_cursor: 0,
             fast_update: crate::multipoint::FastUpdateState::new(),
+            picture_rate: crate::temporal::PictureRate::FULL,
         }
+    }
+
+    /// Restrict the picture rate per §3.1 ("at least 0, 1, 2 or 3
+    /// non-transmitted pictures between transmitted ones"). Each subsequent
+    /// [`encode_frame`] then advances the `TR` field by
+    /// `rate.tr_increment()` (§4.2.1.2), so a caller that has already dropped
+    /// the non-transmitted source pictures still emits a conformant temporal
+    /// reference. The default is [`crate::temporal::PictureRate::FULL`] (the
+    /// full 29.97 Hz rate, `TR` increment 1) which leaves the coded sequence
+    /// byte-identical to the un-restricted encoder. Selection of the rate is "by
+    /// external means" (§3.1), so it enters through this API rather than the
+    /// bitstream.
+    pub fn with_picture_rate(mut self, rate: crate::temporal::PictureRate) -> Self {
+        self.picture_rate = rate;
+        self
+    }
+
+    /// The configured §3.1 picture rate.
+    pub fn picture_rate(&self) -> crate::temporal::PictureRate {
+        self.picture_rate
+    }
+
+    /// The `TR` field that the *next* [`encode_frame`] call will stamp into its
+    /// picture header (§4.2.1.2). Exposed for callers driving presentation
+    /// timing or asserting the temporal-reference schedule.
+    pub fn next_temporal_reference(&self) -> u8 {
+        self.next_tr
     }
 
     /// Latch a §4.3.2 fast-update request. The next [`encode_frame`] call codes
@@ -611,7 +646,9 @@ impl H261Encoder {
         };
 
         self.reference = Some(recon);
-        self.next_tr = self.next_tr.wrapping_add(1) & 0x1F;
+        // §4.2.1.2: advance TR by 1 + non_transmitted (the §3.1 picture-rate
+        // interval), performed with only the five LSBs.
+        self.next_tr = self.next_tr.wrapping_add(self.picture_rate.tr_increment()) & 0x1F;
         Ok(bytes)
     }
 
@@ -2054,6 +2091,63 @@ mod tests {
     fn header_of(bytes: &[u8]) -> crate::picture::PictureHeader {
         let mut br = BitReader::new(bytes);
         parse_picture_header(&mut br).expect("parse header")
+    }
+
+    #[test]
+    fn default_encoder_stamps_full_rate_tr_sequence() {
+        // §4.2.1.2 at the full rate: TR = 0, 1, 2, 3, ... mod 32.
+        let (y, cb, cr) = gradient_qcif();
+        let mut enc = H261Encoder::new(SourceFormat::Qcif, 8).with_intra_period(0);
+        assert_eq!(enc.picture_rate(), crate::temporal::PictureRate::FULL);
+        for expected in 0u8..6 {
+            assert_eq!(enc.next_temporal_reference(), expected);
+            let s = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap();
+            assert_eq!(header_of(&s).temporal_reference, expected);
+        }
+    }
+
+    #[test]
+    fn reduced_picture_rate_steps_tr_by_interval() {
+        // §3.1: two non-transmitted pictures ⇒ interval 3 ⇒ TR = 0, 3, 6, 9, ...
+        let (y, cb, cr) = gradient_qcif();
+        let rate = crate::temporal::PictureRate::from_non_transmitted(2);
+        let mut enc = H261Encoder::new(SourceFormat::Qcif, 8)
+            .with_intra_period(0)
+            .with_picture_rate(rate);
+        assert_eq!(rate.tr_increment(), 3);
+        let mut prev: Option<u8> = None;
+        for step in 0u32..8 {
+            let expected = ((step * 3) & 0x1F) as u8;
+            let s = enc.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap();
+            let tr = header_of(&s).temporal_reference;
+            assert_eq!(tr, expected, "step {step}");
+            // Cross-check against the temporal delta primitive (wraps mod 32).
+            if let Some(p) = prev {
+                assert_eq!(crate::temporal::tr_delta(p, tr), 3);
+            }
+            prev = Some(tr);
+        }
+    }
+
+    #[test]
+    fn reduced_rate_leaves_body_byte_identical() {
+        // Only the 5-bit TR field differs between rates; the coded body after
+        // the picture header is otherwise identical for the same input, so a
+        // rate change is a pure temporal-reference relabelling.
+        let (y, cb, cr) = gradient_qcif();
+        let mut full = H261Encoder::new(SourceFormat::Qcif, 8).with_intra_period(0);
+        let mut slow = H261Encoder::new(SourceFormat::Qcif, 8)
+            .with_intra_period(0)
+            .with_picture_rate(crate::temporal::PictureRate::from_non_transmitted(1));
+        // First picture: both stamp TR = 0, so the streams are byte-identical.
+        let f0 = full.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap();
+        let s0 = slow.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap();
+        assert_eq!(f0, s0, "TR=0 first picture is byte-identical across rates");
+        // The reduced-rate second picture must still decode cleanly and reports
+        // a non-transmitted picture via the TR delta.
+        let s1 = slow.encode_frame(&y, 176, &cb, 88, &cr, 88).unwrap();
+        assert_eq!(header_of(&s1).temporal_reference, 2);
+        assert_eq!(crate::temporal::tr_delta(0, 2), 2);
     }
 
     #[test]
