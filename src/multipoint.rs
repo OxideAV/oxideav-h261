@@ -169,6 +169,25 @@ impl FreezeState {
     /// clock; a picture that triggers the timeout is shown (the freeze has
     /// ended by the time it arrives).
     pub fn on_decoded_picture(&mut self, freeze_release: bool) -> DisplayAction {
+        self.on_decoded_picture_intervals(freeze_release, 1)
+    }
+
+    /// As [`FreezeState::on_decoded_picture`], but advances the §4.3.1 timeout
+    /// clock by `intervals` nominal source-picture intervals rather than one.
+    ///
+    /// A decoder that tracks the §4.2.1.2 temporal reference knows how many
+    /// source-picture periods (`1 + non_transmitted`) actually elapsed between
+    /// two transmitted pictures, so it can advance the six-second freeze clock
+    /// by the true elapsed time instead of one tick per decoded picture. This
+    /// keeps a reduced-picture-rate stream (§3.1) from holding a freeze far
+    /// longer than six real seconds. `intervals` is clamped to at least `1` so a
+    /// decoded picture always advances the clock. The §4.3.3 release-bit check
+    /// still happens first — a set bit releases before the clock is touched.
+    pub fn on_decoded_picture_intervals(
+        &mut self,
+        freeze_release: bool,
+        intervals: u32,
+    ) -> DisplayAction {
         if !self.frozen {
             return DisplayAction::Show;
         }
@@ -179,9 +198,12 @@ impl FreezeState {
             self.elapsed_nanos = 0;
             return DisplayAction::Show;
         }
-        // §4.3.1: advance the timeout clock by one picture interval and check
-        // the ≥ 6 s bound.
-        self.elapsed_nanos = self.elapsed_nanos.saturating_add(PICTURE_INTERVAL_NANOS);
+        // §4.3.1: advance the timeout clock by the elapsed picture intervals and
+        // check the ≥ 6 s bound.
+        let intervals = intervals.max(1) as u64;
+        self.elapsed_nanos = self
+            .elapsed_nanos
+            .saturating_add(PICTURE_INTERVAL_NANOS.saturating_mul(intervals));
         if self.elapsed_nanos >= FREEZE_TIMEOUT_NANOS {
             self.frozen = false;
             self.elapsed_nanos = 0;
@@ -358,6 +380,52 @@ mod tests {
         // 179 * 33_366_666 = 5_972_633_214 ns < 6_000_000_000.
         assert!(fs.elapsed_nanos() < FREEZE_TIMEOUT_NANOS);
         assert!(fs.is_frozen());
+    }
+
+    #[test]
+    fn interval_advance_reaches_timeout_in_fewer_pictures() {
+        // At a reduced picture rate (§3.1) each decoded picture spans several
+        // source-picture intervals, so the six-second freeze reaches timeout in
+        // fewer *decoded* pictures. Interval 3 (two non-transmitted) ⇒ each
+        // decoded picture advances 3 * 33.37 ms ≈ 100 ms; 60 pictures ≈ 6.0 s.
+        let mut fs = FreezeState::new();
+        fs.request_freeze();
+        for _ in 0..59 {
+            assert_eq!(
+                fs.on_decoded_picture_intervals(false, 3),
+                DisplayAction::Freeze
+            );
+        }
+        assert!(fs.is_frozen());
+        assert!(fs.elapsed_nanos() < FREEZE_TIMEOUT_NANOS);
+        // The 60th 3-interval step crosses 6 s.
+        assert_eq!(
+            fs.on_decoded_picture_intervals(false, 3),
+            DisplayAction::Show
+        );
+        assert!(!fs.is_frozen());
+    }
+
+    #[test]
+    fn interval_zero_clamps_to_one() {
+        let mut fs = FreezeState::new();
+        fs.request_freeze();
+        // A degenerate 0-interval still advances by one tick (never stalls).
+        let before = fs.elapsed_nanos();
+        let _ = fs.on_decoded_picture_intervals(false, 0);
+        assert_eq!(fs.elapsed_nanos(), before + PICTURE_INTERVAL_NANOS);
+    }
+
+    #[test]
+    fn interval_release_bit_wins_over_clock() {
+        let mut fs = FreezeState::new();
+        fs.request_freeze();
+        // Release bit ends the freeze regardless of the interval count.
+        assert_eq!(
+            fs.on_decoded_picture_intervals(true, 32),
+            DisplayAction::Show
+        );
+        assert!(!fs.is_frozen());
     }
 
     #[test]

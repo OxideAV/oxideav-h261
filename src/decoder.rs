@@ -97,6 +97,15 @@ pub struct H261Decoder {
     /// Zero on a clean decode; useful for a caller driving loss-feedback
     /// (e.g. an RTCP-triggered fast-update request).
     last_concealed_gobs: usize,
+    /// §4.2.1.2 temporal-reference tracker. Unwraps the 5-bit `TR` field of
+    /// each decoded picture into a monotonic presentation timeline and reports
+    /// the per-picture delta (`1 + non_transmitted`), which feeds the §4.3.1
+    /// freeze-picture timeout so it counts true elapsed source-picture periods.
+    tr_tracker: crate::temporal::TrTracker,
+    /// Number of source-picture periods (§4.2.1.2 `TR` delta) spanned by the
+    /// most recently decoded picture, `1` on the first picture and on a
+    /// full-rate stream. Exposed via [`H261Decoder::last_tr_delta`].
+    last_tr_delta: u32,
     /// DoS-protection caps applied at header-parse and arena-lease time.
     limits: DecoderLimits,
     /// Arena pool sized from `limits`. An arena is leased only when
@@ -145,6 +154,8 @@ impl H261Decoder {
             frozen_display: None,
             conceal_errors: false,
             last_concealed_gobs: 0,
+            tr_tracker: crate::temporal::TrTracker::new(),
+            last_tr_delta: 1,
             limits,
             pool,
         }
@@ -170,6 +181,31 @@ impl H261Decoder {
     /// off a non-zero count.
     pub fn last_concealed_gobs(&self) -> usize {
         self.last_concealed_gobs
+    }
+
+    /// The §4.2.1.2 temporal-reference delta (`1 + non_transmitted`) of the most
+    /// recently decoded picture — the number of source-picture periods that
+    /// elapsed since the previous transmitted picture. `1` on the first decoded
+    /// picture and throughout a full-rate stream; larger when the far end
+    /// restricted its picture rate (§3.1) or pictures were dropped in transit.
+    pub fn last_tr_delta(&self) -> u32 {
+        self.last_tr_delta
+    }
+
+    /// The number of *non-transmitted* pictures immediately before the most
+    /// recently decoded picture ([`Self::last_tr_delta`] minus one). Zero on the
+    /// first picture and on a full-rate stream. A caller can drive presentation
+    /// timing or a loss estimate off a non-zero value.
+    pub fn last_non_transmitted_pictures(&self) -> u32 {
+        self.last_tr_delta.saturating_sub(1)
+    }
+
+    /// The monotonic presentation index of the most recently decoded picture, in
+    /// source-picture periods since the first decoded picture (index 0), unwrapped
+    /// from the mod-32 `TR` field per §4.2.1.2. Useful for deriving a
+    /// presentation timestamp when the container supplies none.
+    pub fn presentation_index(&self) -> u64 {
+        self.tr_tracker.presentation_index()
     }
 
     /// Apply a §4.3.1 external freeze-picture request. While frozen, the
@@ -264,13 +300,24 @@ impl H261Decoder {
             self.last_concealed_gobs = 0;
             decode_picture_body(&mut br, &hdr, bytes, self.reference.as_ref())?
         };
+        // §4.2.1.2: unwrap this picture's temporal reference into the monotonic
+        // presentation timeline and record how many source-picture periods
+        // elapsed since the previous transmitted picture (`1 + non_transmitted`,
+        // `1` on the first picture / a full-rate stream).
+        self.last_tr_delta = self.tr_tracker.observe(hdr.temporal_reference).unwrap_or(1);
         // §4.3.1 / §4.3.3 freeze-picture arbitration. The state machine
         // consumes this picture's freeze-picture-release PTYPE bit and tells
         // us whether the display should advance to it (`Show`) or keep holding
         // the last-shown picture (`Freeze`). Decoding itself is unaffected —
         // the newly decoded picture always becomes the MC reference so that,
         // once the freeze releases, prediction resumes from the correct frame.
-        let display = self.freeze.on_decoded_picture(hdr.freeze_release);
+        // The six-second §4.3.1 timeout is advanced by the true number of
+        // elapsed source-picture periods (§4.2.1.2), not one tick per decoded
+        // picture, so a reduced-rate (§3.1) stream cannot hold a freeze far
+        // longer than six real seconds.
+        let display = self
+            .freeze
+            .on_decoded_picture_intervals(hdr.freeze_release, self.last_tr_delta);
         let to_display = match display {
             crate::multipoint::DisplayAction::Show => {
                 self.frozen_display = Some(pic.clone());
@@ -779,6 +826,8 @@ impl Decoder for H261Decoder {
         self.freeze = crate::multipoint::FreezeState::new();
         self.frozen_display = None;
         self.last_concealed_gobs = 0;
+        self.tr_tracker.reset();
+        self.last_tr_delta = 1;
         Ok(())
     }
 
