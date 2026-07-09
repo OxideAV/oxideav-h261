@@ -26,6 +26,7 @@ oxideav-h261 = "0.0"
 | Picture header (PSC / TR / PTYPE / PEI / PSPARE) | yes    | yes    |
 | GOB layer (GBSC / GN / GQUANT / GEI / GSPARE)    | yes    | yes    |
 | Source formats QCIF (176×144), CIF (352×288)     | yes    | yes    |
+| Temporal reference / picture rate (§3.1/§4.2.1.2) | yes    | yes    |
 | Macroblock layer (MBA / MTYPE / CBP / MVD)       | yes    | yes    |
 | TCOEFF VLC + escape                              | yes    | yes    |
 | 8×8 (I)DCT, (de)quantisation (Table 5/H.261)     | yes    | yes    |
@@ -64,6 +65,40 @@ at MB 11 (or 22) and a motion-compensated MB 12 (or 23) decodes the right
 predictor. The decoder, the encoder's MVD derivation, and the RFC 4587
 §4.2 MB-level fragmentation walker all share one `mb::mvd_predictor`
 implementation of these rules, so they stay bit-for-bit in agreement.
+
+### Temporal reference and picture rate (§3.1 / §4.2.1.2)
+
+The 5-bit picture-header `TR` field is "formed by incrementing its value
+in the previously transmitted picture header by one plus the number of
+non-transmitted pictures (at 29.97 Hz)" (§4.2.1.2), with the arithmetic
+done on the five LSBs only. The `temporal` module turns that into usable
+timing:
+
+* `temporal::tr_delta(prev, cur)` / `non_transmitted(prev, cur)` — the
+  per-step delta (`1 + non_transmitted`, `1..=32`); a field that returns
+  to its previous value is read as a full 32-period wrap.
+* `temporal::TrTracker` — unwraps a stream of `TR` fields into a
+  monotonic **presentation index** measured in source-picture periods,
+  the basis for presentation timing and dropped-picture detection.
+* `temporal::PictureRate` — the §3.1 rate restriction ("at least 0, 1, 2
+  or 3 non-transmitted pictures between transmitted ones"), expressed as
+  the interval between transmitted pictures and its nominal Hz.
+
+The **encoder** exposes `H261Encoder::with_picture_rate`: each emitted
+picture then advances `TR` by the rate's interval (§4.2.1.2), so a caller
+that has already dropped the non-transmitted source pictures still stamps
+a conformant temporal reference. The default is the full 29.97 Hz rate
+(increment 1), which leaves a coded sequence byte-identical to one that
+never modelled a rate restriction — only the `TR` field changes when a
+reduced rate is selected.
+
+The **decoder** tracks `TR` across pictures and exposes
+`last_tr_delta` / `last_non_transmitted_pictures` / `presentation_index`.
+It also feeds the per-picture delta into the §4.3.1 freeze-picture
+timeout (see below), so the "at least six seconds" hold is measured
+against the true number of elapsed source-picture periods rather than one
+tick per decoded picture — a reduced-rate stream can no longer hold a
+freeze far longer than six real seconds.
 
 ### PTYPE display-control flags (§4.2.1.3)
 
