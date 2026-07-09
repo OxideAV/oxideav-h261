@@ -45,6 +45,13 @@ fn drive_one(bytes: &[u8], conceal: bool) {
     }
     // Reading the concealment count must never panic regardless of input.
     let _ = dec.last_concealed_gobs();
+    // §4.2.1.2 temporal-reference accessors must stay coherent on any input:
+    // the delta is at least 1, non-transmitted is delta - 1, and neither
+    // overflows.
+    let delta = dec.last_tr_delta();
+    assert!(delta >= 1, "TR delta must be >= 1, got {delta}");
+    assert_eq!(dec.last_non_transmitted_pictures(), delta - 1);
+    let _ = dec.presentation_index();
 }
 
 /// Drive `bytes` through both the strict decoder and the §2.7 / §2.8

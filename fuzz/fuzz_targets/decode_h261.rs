@@ -197,4 +197,13 @@ fuzz_target!(|plan: Plan| {
     // the next PSC or EOF; flush is what tells it EOF arrived).
     let _ = dec.flush();
     drain(&mut dec, &drains, 32);
+
+    // §4.2.1.2 temporal-reference accessors must stay coherent no matter what
+    // TR values the hostile stream carried: the delta is at least one
+    // source-picture period and the non-transmitted count is exactly delta - 1
+    // (no underflow, no overflow).
+    let delta = dec.last_tr_delta();
+    assert!(delta >= 1);
+    assert_eq!(dec.last_non_transmitted_pictures(), delta - 1);
+    let _ = dec.presentation_index();
 });
