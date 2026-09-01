@@ -114,10 +114,12 @@
 pub mod annex_c;
 pub mod annex_d;
 pub mod bch;
+#[doc(hidden)]
 pub mod block;
 pub mod decoder;
 pub mod encoder;
 pub mod fdct;
+#[doc(hidden)]
 pub mod gob;
 pub mod hrd;
 pub mod idct;
@@ -129,6 +131,7 @@ pub mod rtcp;
 pub mod rtp;
 pub mod sdp;
 pub mod start_code;
+#[doc(hidden)]
 pub mod tables;
 pub mod temporal;
 
