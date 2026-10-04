@@ -557,13 +557,13 @@ packet/octet counts so a conformant SR drops straight out of the session:
 ```rust
 use oxideav_h261::rtcp::{ReceptionReportBlock, parse_report};
 use oxideav_h261::rtp::RtpPacketizer;
+# let frame_bytes: Vec<u8> = vec![];
 
 let mut pk = RtpPacketizer::new(96, 0x1357_9BDF, 0, 1400);
 let _ = pk.pack_frame(&frame_bytes, 0); // tracks packet & octet counts
 let block = ReceptionReportBlock { ssrc: 0x2468_ACE0, fraction_lost: 26, ..Default::default() };
 let sr = pk.sender_report(/* ntp */ 0xB44D_B705_2000_0000, &[block]).unwrap();
 let report = parse_report(&sr).unwrap(); // round-trips the SR fields
-# let frame_bytes: Vec<u8> = vec![];
 ```
 
 The builders only (de)serialise the report wire format; the §6.2
@@ -1118,16 +1118,18 @@ crate workflow.
 ## Quick use
 
 ```rust
-use oxideav_codec::Decoder;
-use oxideav_core::{CodecId, Packet, TimeBase};
+use oxideav_core::{CodecId, Decoder, Packet, TimeBase};
 use oxideav_h261::decoder::H261Decoder;
+# let bitstream_bytes: Vec<u8> = vec![];
 
 let mut dec = H261Decoder::new(CodecId::new(oxideav_h261::CODEC_ID_STR));
 let pkt = Packet::new(0, TimeBase::new(1, 30), bitstream_bytes);
 dec.send_packet(&pkt)?;
 match dec.receive_frame() {
     Ok(oxideav_core::Frame::Video(vf)) => {
-        // vf.format == PixelFormat::Yuv420P
+        // Yuv420P planes (the pixel format lives in the stream's
+        // CodecParameters, not on the frame).
+        let _ = vf;
     }
     Err(oxideav_core::Error::NeedMore) => { /* feed more packets */ }
     Err(e) => return Err(e.into()),
