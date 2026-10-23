@@ -7,11 +7,11 @@
 //! must still accept it.
 
 use oxideav_h261::decoder::H261Decoder;
-use oxideav_h261::encoder::{encode_intra_picture, H261Encoder};
+use oxideav_h261::encoder::{H261Encoder, encode_intra_picture};
 use oxideav_h261::picture::SourceFormat;
 use oxideav_h261::rtp::{
-    depacketize, packetize_gob_aligned, packetize_mb_fragmented, parse_rtp_fixed_header,
-    unpack_header, H261RtpPayload, RtpPacketizer, HEADER_LEN, RTP_FIXED_HEADER_LEN,
+    H261RtpPayload, HEADER_LEN, RTP_FIXED_HEADER_LEN, RtpPacketizer, depacketize,
+    packetize_gob_aligned, packetize_mb_fragmented, parse_rtp_fixed_header, unpack_header,
 };
 
 use oxideav_core::registry::codec::Decoder;
@@ -384,7 +384,7 @@ fn rtp_packetizer_payload_size_fits_under_mtu() {
 
 #[test]
 fn rtcp_sender_report_reflects_packetizer_session_state() {
-    use oxideav_h261::rtcp::{parse_report, ReceptionReportBlock, PT_SR};
+    use oxideav_h261::rtcp::{PT_SR, ReceptionReportBlock, parse_report};
 
     // Encode two QCIF I-pictures and packetize each, then build an RTCP SR
     // from the packetizer's running counters (RFC 3550 §6.4.1).
@@ -431,7 +431,7 @@ fn rtcp_sender_report_reflects_packetizer_session_state() {
 
 #[test]
 fn rtcp_receiver_report_round_trips_pure_receiver_path() {
-    use oxideav_h261::rtcp::{build_receiver_report, parse_report, ReceptionReportBlock, PT_RR};
+    use oxideav_h261::rtcp::{PT_RR, ReceptionReportBlock, build_receiver_report, parse_report};
 
     // A pure receiver (no media transmitted) emits an RR. The canonical
     // empty RR (RC = 0) heads a compound packet when nothing is heard;

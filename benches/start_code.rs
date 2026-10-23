@@ -64,7 +64,7 @@
 //! testsrc, no `docs/` files at bench time. Run with:
 //!     cargo bench -p oxideav-h261 --bench start_code
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_h261::encoder::H261Encoder;
 use oxideav_h261::picture::SourceFormat;

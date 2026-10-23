@@ -35,20 +35,20 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use oxideav_core::Decoder;
 use oxideav_core::arena::sync::{ArenaPool, FrameHeader, FrameInner};
 use oxideav_core::bits::BitReader;
 use oxideav_core::format::PixelFormat;
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::limits::DecoderLimits;
-use oxideav_core::Decoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, Rational, Result, TimeBase, VideoFrame,
 };
 
 use crate::gob::{cif_gob_origin_luma, parse_gob_header, qcif_gob_origin_luma};
-use crate::mb::{decode_macroblock, decode_mba_diff, MbContext, Picture};
-use crate::picture::{parse_picture_header, PictureHeader, SourceFormat};
-use crate::start_code::{find_next_start_code, StartCode, GN_PICTURE};
+use crate::mb::{MbContext, Picture, decode_macroblock, decode_mba_diff};
+use crate::picture::{PictureHeader, SourceFormat, parse_picture_header};
+use crate::start_code::{GN_PICTURE, StartCode, find_next_start_code};
 
 /// Factory for the registry. Honours [`CodecParameters::limits`].
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -493,18 +493,18 @@ fn decode_picture_body_impl(
                     None => {
                         return Err(Error::invalid(format!(
                             "h261: missing GBSC for GN={expected_gn} (no further start codes)"
-                        )))
+                        )));
                     }
                     Some(t) if t.gn == GN_PICTURE => {
                         return Err(Error::invalid(format!(
                             "h261: expected GBSC for GN={expected_gn} but found a PSC first"
-                        )))
+                        )));
                     }
                     Some(t) => {
                         return Err(Error::invalid(format!(
                             "h261: GOB order mismatch — expected GN={expected_gn}, found GN={}",
                             t.gn
-                        )))
+                        )));
                     }
                 }
             }

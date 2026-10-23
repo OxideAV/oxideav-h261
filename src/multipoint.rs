@@ -139,11 +139,7 @@ impl FreezeState {
     /// Nanoseconds accumulated toward the §4.3.1 timeout since the current
     /// freeze request. Zero when not frozen.
     pub fn elapsed_nanos(self) -> u64 {
-        if self.frozen {
-            self.elapsed_nanos
-        } else {
-            0
-        }
+        if self.frozen { self.elapsed_nanos } else { 0 }
     }
 
     /// Apply a §4.3.1 external freeze-picture request. Idempotent while already

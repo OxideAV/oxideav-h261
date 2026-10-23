@@ -22,7 +22,7 @@
 //! Run with:
 //!     cargo bench -p oxideav-h261 --bench transform
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_h261::fdct::{fdct_intra, fdct_signed};
 use oxideav_h261::idct::{idct_intra, idct_signed};
@@ -78,7 +78,7 @@ fn build_intra_coeffs(seed: u32) -> [i32; 64] {
     let mut state = seed;
     let mut out = [0i32; 64];
     out[0] = 1024; // DC, post-dequant
-                   // First eight zigzag positions get small AC terms.
+    // First eight zigzag positions get small AC terms.
     let zz = [1, 8, 16, 9, 2, 3, 10, 17];
     for &pos in &zz {
         let v = ((xorshift32(&mut state) as i32) >> 28).abs(); // 0..7

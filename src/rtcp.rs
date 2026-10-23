@@ -688,7 +688,7 @@ impl SdesChunk {
         // END marker (item type 0) terminates the list, then pad with null
         // octets to the next 32-bit boundary (§6.5).
         buf.push(sdes_type::END);
-        while (buf.len() - start) % 4 != 0 {
+        while !(buf.len() - start).is_multiple_of(4) {
             buf.push(0);
         }
     }
@@ -814,7 +814,7 @@ pub fn parse_sdes(buf: &[u8]) -> Result<SdesPacket, RtcpError> {
             }
         }
         // Advance over null padding to the next 32-bit boundary.
-        while (off - RTCP_HEADER_FIXED_LEN) % 4 != 0 {
+        while !(off - RTCP_HEADER_FIXED_LEN).is_multiple_of(4) {
             if off >= body_end {
                 break;
             }
@@ -862,10 +862,10 @@ pub fn build_bye(sources: &[u32], reason: Option<&str>) -> Result<Vec<u8>, RtcpE
         });
     }
     let reason_bytes = reason.map(str::as_bytes);
-    if let Some(r) = reason_bytes {
-        if r.len() > MAX_TEXT_LEN {
-            return Err(RtcpError::TextTooLong { len: r.len() });
-        }
+    if let Some(r) = reason_bytes
+        && r.len() > MAX_TEXT_LEN
+    {
+        return Err(RtcpError::TextTooLong { len: r.len() });
     }
     // Body so far: SC * 4 (SSRC list) + optional (1 length byte + reason).
     let mut body = sources.len() * 4;
@@ -1005,7 +1005,7 @@ pub fn build_app(subtype: u8, ssrc: u32, name: &[u8], data: &[u8]) -> Result<Vec
     if name.len() != APP_NAME_LEN {
         return Err(RtcpError::AppNameWrongLength { len: name.len() });
     }
-    if data.len() % 4 != 0 {
+    if !data.len().is_multiple_of(4) {
         return Err(RtcpError::AppDataNotAligned { len: data.len() });
     }
     // Header (4) + SSRC (4) + name (4) + data.

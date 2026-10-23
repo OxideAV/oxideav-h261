@@ -26,7 +26,7 @@
 //! Run with:
 //!     cargo bench -p oxideav-h261 --bench filter_mc
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_h261::mb::{apply_loop_filter, copy_block_integer};
 

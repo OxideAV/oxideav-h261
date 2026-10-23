@@ -42,7 +42,7 @@ use oxideav_core::{Error, Result};
 
 use crate::block::decode_inter_block;
 use crate::tables::{
-    decode_vlc, MbaSym, MtypeInfo, MvdSym, Prediction, CBP_TABLE, MBA_TABLE, MTYPE_TABLE, MVD_TABLE,
+    CBP_TABLE, MBA_TABLE, MTYPE_TABLE, MVD_TABLE, MbaSym, MtypeInfo, MvdSym, Prediction, decode_vlc,
 };
 
 /// Reconstructed H.261 picture: three pel planes (Y, Cb, Cr), stride = MB-aligned width.

@@ -85,7 +85,7 @@ impl PointCTracker {
 #[test]
 fn annex_c_delay_measurement_round_trips_through_codec() {
     let levels = MarkLevels::default();
-    let gen = MarkGenerator::new(SourceFormat::Qcif, levels);
+    let r#gen = MarkGenerator::new(SourceFormat::Qcif, levels);
     let det = MarkDetector::new(levels);
 
     let mut enc = H261Encoder::new(SourceFormat::Qcif, 10).with_intra_period(0);
@@ -112,9 +112,9 @@ fn annex_c_delay_measurement_round_trips_through_codec() {
 
         // Point A: stamp the §C mark for this input frame, and record the
         // change instant when the mark toggles.
-        let a_state = gen.state_for_frame(frame);
-        gen.stamp(frame, &mut y, stride);
-        if gen.is_change_frame(frame) {
+        let a_state = r#gen.state_for_frame(frame);
+        r#gen.stamp(frame, &mut y, stride);
+        if r#gen.is_change_frame(frame) {
             meter.record_a(MarkEvent {
                 state: a_state,
                 frame,

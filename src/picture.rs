@@ -181,8 +181,8 @@ mod tests {
         append(&mut bits, 1, 1); // HI_RES off
         append(&mut bits, 0, 1); // spare
         append(&mut bits, 0, 1); // PEI = 0
-                                 // Pad to byte boundary with zeros.
-        while bits.len() % 8 != 0 {
+        // Pad to byte boundary with zeros.
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         let mut out = Vec::new();

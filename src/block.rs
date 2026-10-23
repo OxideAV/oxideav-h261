@@ -31,7 +31,7 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
 use crate::idct::{idct_intra, idct_signed};
-use crate::tables::{decode_tcoeff, TcoeffSym, ZIGZAG};
+use crate::tables::{TcoeffSym, ZIGZAG, decode_tcoeff};
 
 /// Decode the 8-bit INTRA DC fixed-length code and return the IDCT-input DC
 /// level per Table 6/H.261.

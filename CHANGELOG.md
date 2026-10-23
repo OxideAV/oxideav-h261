@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ### Fixed
 
 - `packetize_mb_fragmented` (RFC 4587 §4.2 RECOMMENDED MB-level

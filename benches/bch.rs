@@ -64,11 +64,12 @@
 //! tools. Run with:
 //!     cargo bench -p oxideav-h261 --bench bch
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_h261::bch::{
-    decode_multiframe, decode_multiframe_with_correction, encode_multiframe, locate_single_error,
-    parity18, syndrome18, DATA_BITS, FRAME_BITS, MULTIFRAME_FRAMES, PARITY_BITS,
+    DATA_BITS, FRAME_BITS, MULTIFRAME_FRAMES, PARITY_BITS, decode_multiframe,
+    decode_multiframe_with_correction, encode_multiframe, locate_single_error, parity18,
+    syndrome18,
 };
 
 /// Cheap deterministic xorshift32 — synthesises a "realistic-density"

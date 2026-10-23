@@ -6,11 +6,11 @@
 //! input to [`H261Decoder`]).
 
 use oxideav_core::{CodecId, Packet, TimeBase};
+use oxideav_h261::CODEC_ID_STR;
 use oxideav_h261::bch::{decode_multiframe, decode_multiframe_with_correction, encode_multiframe};
 use oxideav_h261::decoder::H261Decoder;
 use oxideav_h261::encoder::encode_intra_picture;
 use oxideav_h261::picture::SourceFormat;
-use oxideav_h261::CODEC_ID_STR;
 
 use oxideav_core::Decoder;
 
@@ -44,7 +44,7 @@ fn bch_wrap_unwrap_round_trip_qcif_intra() {
     // Wrap with BCH framing.
     let framed = encode_multiframe(&encoded, encoded.len() * 8);
     // Output must be a whole number of multiframes (≥ 1).
-    assert!(framed.len() % 512 == 0);
+    assert!(framed.len().is_multiple_of(512));
 
     // Pad to at least 3 multiframes so the decoder can establish lock.
     let mut padded = framed.clone();

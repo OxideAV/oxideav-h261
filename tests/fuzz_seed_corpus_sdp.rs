@@ -41,8 +41,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_h261::sdp::{
-    negotiate_answer, parse_fmtp, parse_fmtp_strict, parse_rtpmap, parse_rtpmap_strict,
-    H261FmtpParams, SdpError,
+    H261FmtpParams, SdpError, negotiate_answer, parse_fmtp, parse_fmtp_strict, parse_rtpmap,
+    parse_rtpmap_strict,
 };
 
 fn corpus_dir() -> PathBuf {

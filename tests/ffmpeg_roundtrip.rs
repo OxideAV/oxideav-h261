@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use oxideav_core::{CodecId, CodecParameters, Frame, RuntimeContext, VideoFrame, VideoPlane};
-use oxideav_h261::encoder::{encode_intra_picture, H261Encoder};
+use oxideav_h261::encoder::{H261Encoder, encode_intra_picture};
 use oxideav_h261::picture::SourceFormat;
 
 fn psnr(a: &[u8], b: &[u8]) -> f64 {

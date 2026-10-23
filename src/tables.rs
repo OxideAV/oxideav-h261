@@ -540,10 +540,10 @@ pub const ZIGZAG: [usize; 64] = [
 pub fn encode_mba_diff(diff: u8) -> (u8, u32) {
     debug_assert!((1..=33).contains(&diff), "MBA diff out of range: {diff}");
     for e in MBA_TABLE {
-        if let MbaSym::Diff(d) = e.value {
-            if d == diff {
-                return (e.bits, e.code);
-            }
+        if let MbaSym::Diff(d) = e.value
+            && d == diff
+        {
+            return (e.bits, e.code);
         }
     }
     unreachable!("MBA_TABLE missing entry for diff={diff}");

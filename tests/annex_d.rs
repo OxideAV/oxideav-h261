@@ -14,11 +14,11 @@
 
 use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_h261::annex_d::{
-    parse_still_image_tr, reassemble_still_image, still_image_chroma_dimensions,
-    still_image_dimensions, still_image_tr, subsample_still_image, SubImageIndex,
+    SubImageIndex, parse_still_image_tr, reassemble_still_image, still_image_chroma_dimensions,
+    still_image_dimensions, still_image_tr, subsample_still_image,
 };
 use oxideav_h261::encoder::write_picture_header_full;
-use oxideav_h261::picture::{parse_picture_header, SourceFormat};
+use oxideav_h261::picture::{SourceFormat, parse_picture_header};
 
 #[test]
 fn picture_header_round_trip_annex_d_qcif() {

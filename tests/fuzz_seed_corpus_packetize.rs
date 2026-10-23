@@ -35,8 +35,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_h261::rtp::{
-    depacketize, packetize_gob_aligned, packetize_mb_fragmented, RtpError, RtpPacketizer,
-    HEADER_LEN, RTP_FIXED_HEADER_LEN,
+    HEADER_LEN, RTP_FIXED_HEADER_LEN, RtpError, RtpPacketizer, depacketize, packetize_gob_aligned,
+    packetize_mb_fragmented,
 };
 
 fn corpus_dir() -> PathBuf {

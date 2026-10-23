@@ -32,11 +32,11 @@
 //! Run with:
 //!     cargo bench -p oxideav-h261 --bench annex_d
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_h261::annex_d::{
-    reassemble_plane, reassemble_still_image, still_image_chroma_dimensions,
-    still_image_dimensions, subsample_plane, subsample_still_image, SubImagePlanes,
+    SubImagePlanes, reassemble_plane, reassemble_still_image, still_image_chroma_dimensions,
+    still_image_dimensions, subsample_plane, subsample_still_image,
 };
 use oxideav_h261::picture::SourceFormat;
 

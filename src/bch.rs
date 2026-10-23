@@ -413,7 +413,7 @@ pub fn decode_multiframe(framed: &[u8]) -> Option<DecodedMultiframe> {
     let mut data: Vec<u8> = Vec::new();
     let mut data_bits = 0usize;
     let mut put_data_bit = |bit: u8| {
-        if data_bits % 8 == 0 {
+        if data_bits.is_multiple_of(8) {
             data.push(0);
         }
         let byte_idx = data_bits / 8;
@@ -534,7 +534,7 @@ pub fn decode_multiframe_with_correction(framed: &[u8]) -> Option<DecodedMultifr
     let mut data: Vec<u8> = Vec::new();
     let mut data_bits = 0usize;
     let mut put_data_bit = |bit: u8| {
-        if data_bits % 8 == 0 {
+        if data_bits.is_multiple_of(8) {
             data.push(0);
         }
         let byte_idx = data_bits / 8;

@@ -82,12 +82,12 @@
 use oxideav_core::bits::BitReader;
 
 use crate::gob::parse_gob_header;
-use crate::mb::{decode_mba_diff, reconstruct_mv, MbContext};
+use crate::mb::{MbContext, decode_mba_diff, reconstruct_mv};
 use crate::picture::parse_picture_header;
-use crate::start_code::{find_next_start_code_bits, iter_start_codes, GN_PICTURE};
+use crate::start_code::{GN_PICTURE, find_next_start_code_bits, iter_start_codes};
 use crate::tables::{
-    decode_tcoeff, decode_vlc, MtypeInfo, MvdSym, Prediction, TcoeffSym, CBP_TABLE, MTYPE_TABLE,
-    MVD_TABLE,
+    CBP_TABLE, MTYPE_TABLE, MVD_TABLE, MtypeInfo, MvdSym, Prediction, TcoeffSym, decode_tcoeff,
+    decode_vlc,
 };
 
 /// Length of the H.261 RTP payload header in bytes (RFC 4587 §4.1).
@@ -1420,7 +1420,7 @@ impl BitBuf {
 
     fn append_msb_bits(&mut self, src: &[u8], src_skip_bits: usize, count: usize) {
         // Fast path: byte-aligned source, byte-aligned dest.
-        if src_skip_bits == 0 && self.bit_len % 8 == 0 && count == src.len() * 8 {
+        if src_skip_bits == 0 && self.bit_len.is_multiple_of(8) && count == src.len() * 8 {
             self.bytes.extend_from_slice(src);
             self.bit_len += count;
             return;
@@ -1646,7 +1646,7 @@ mod tests {
         // max_payload = 100 (4 header + 96 data), we expect ceil(500/96)
         // = 6 payloads.
         let mut data = vec![0x00, 0x01, 0x1F];
-        data.extend(std::iter::repeat(0xAA).take(500 - 3));
+        data.extend(std::iter::repeat_n(0xAA, 500 - 3));
         let pkts = packetize_gob_aligned(&data, 100, false, true);
         assert_eq!(pkts.len(), 500_usize.div_ceil(96));
         // All but the last carry max-size payloads.
@@ -1661,9 +1661,9 @@ mod tests {
     fn packetize_then_depacketize_round_trip() {
         // Build a synthetic stream: PSC + 10 bytes + GBSC + 10 bytes.
         let mut data = vec![0x00, 0x01, 0x00];
-        data.extend(std::iter::repeat(0xA5).take(10));
+        data.extend(std::iter::repeat_n(0xA5, 10));
         data.extend_from_slice(&[0x00, 0x01, 0x1F]);
-        data.extend(std::iter::repeat(0x5A).take(10));
+        data.extend(std::iter::repeat_n(0x5A, 10));
         let pkts = packetize_gob_aligned(&data, 256, false, false);
         let recovered = depacketize(&pkts).unwrap();
         assert_eq!(recovered, data);
@@ -1673,9 +1673,9 @@ mod tests {
     fn packetize_then_depacketize_round_trip_with_fragmentation() {
         // Force fragmentation by picking a tiny max_payload.
         let mut data = vec![0x00, 0x01, 0x00];
-        data.extend(std::iter::repeat(0xA5).take(50));
+        data.extend(std::iter::repeat_n(0xA5, 50));
         data.extend_from_slice(&[0x00, 0x01, 0x1F]);
-        data.extend(std::iter::repeat(0x5A).take(50));
+        data.extend(std::iter::repeat_n(0x5A, 50));
         let pkts = packetize_gob_aligned(&data, 20, false, false);
         assert!(pkts.len() > 4, "expected fragmentation");
         let recovered = depacketize(&pkts).unwrap();
@@ -1715,9 +1715,9 @@ mod tests {
         // Picture 1: PSC + 5 bytes.
         // Picture 2: PSC + 5 bytes.
         let mut data = vec![0x00, 0x01, 0x00];
-        data.extend(std::iter::repeat(0x11).take(5));
+        data.extend(std::iter::repeat_n(0x11, 5));
         data.extend_from_slice(&[0x00, 0x01, 0x00]);
-        data.extend(std::iter::repeat(0x22).take(5));
+        data.extend(std::iter::repeat_n(0x22, 5));
         let pkts = packetize_gob_aligned(&data, 256, false, false);
         // With max_payload large, each picture is one payload ⇒ two
         // total payloads, both holding a "tail of frame" position.
@@ -1748,15 +1748,15 @@ mod tests {
     fn synthetic_two_picture_stream() -> Vec<u8> {
         // Two pictures back-to-back: PSC + 5 bytes, PSC + 5 bytes.
         let mut data = vec![0x00, 0x01, 0x00];
-        data.extend(std::iter::repeat(0x11).take(5));
+        data.extend(std::iter::repeat_n(0x11, 5));
         data.extend_from_slice(&[0x00, 0x01, 0x00]);
-        data.extend(std::iter::repeat(0x22).take(5));
+        data.extend(std::iter::repeat_n(0x22, 5));
         data
     }
 
     fn synthetic_one_picture_stream() -> Vec<u8> {
         let mut data = vec![0x00, 0x01, 0x00];
-        data.extend(std::iter::repeat(0xA5).take(20));
+        data.extend(std::iter::repeat_n(0xA5, 20));
         data
     }
 
@@ -1934,7 +1934,7 @@ mod tests {
         let mut buf = vec![0u8; RTP_FIXED_HEADER_LEN + 8 + 3];
         buf[0] = 0x82;
         buf[1] = 0x00; // M=0, PT=0
-                       // Fill seq/ts/ssrc with sentinel zeros, then two CSRC ids.
+        // Fill seq/ts/ssrc with sentinel zeros, then two CSRC ids.
         buf[12..16].copy_from_slice(&0xAABB_CCDDu32.to_be_bytes());
         buf[16..20].copy_from_slice(&0x1122_3344u32.to_be_bytes());
         buf[20] = 0xFE; // sentinel tail byte
@@ -1955,7 +1955,7 @@ mod tests {
 
     #[test]
     fn packetizer_tracks_packet_and_octet_counts() {
-        use crate::rtcp::{parse_report, PT_SR};
+        use crate::rtcp::{PT_SR, parse_report};
         let mut pk = RtpPacketizer::new(96, 0xABCD, 0, 1500);
         assert_eq!(pk.packet_count(), 0);
         assert_eq!(pk.octet_count(), 0);
@@ -2024,7 +2024,7 @@ mod tests {
         let mut pk = RtpPacketizer::new(96, 0, 0, RTP_FIXED_HEADER_LEN + HEADER_LEN + 4);
         // Stream: PSC + 30 bytes ⇒ inner budget is 4 ⇒ ≥ 8 chunks.
         let mut frame = vec![0x00, 0x01, 0x00];
-        frame.extend(std::iter::repeat(0xA5).take(30));
+        frame.extend(std::iter::repeat_n(0xA5, 30));
         let pkts = pk.pack_frame(&frame, 0);
         assert!(
             pkts.len() >= 2,
@@ -2100,7 +2100,7 @@ mod tests {
     /// field) would diverge.
     fn decoder_walk_oracle(data: &[u8]) -> Vec<SplitPoint> {
         use crate::gob::{cif_gob_origin_luma, qcif_gob_origin_luma};
-        use crate::mb::{decode_macroblock, Picture};
+        use crate::mb::{Picture, decode_macroblock};
         use crate::picture::SourceFormat;
 
         let mut br = BitReader::new(data);

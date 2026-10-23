@@ -45,7 +45,7 @@ fn minimal_qcif_picture_header() -> Vec<u8> {
     append(&mut bits, 1, 1); // HI_RES off
     append(&mut bits, 0, 1); // spare
     append(&mut bits, 0, 1); // PEI = 0
-    while bits.len() % 8 != 0 {
+    while !bits.len().is_multiple_of(8) {
         bits.push(0);
     }
     let mut out = Vec::new();

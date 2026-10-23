@@ -33,8 +33,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_h261::bch::{
-    decode_multiframe, decode_multiframe_with_correction, encode_multiframe, locate_single_error,
-    parity18, syndrome18, FRAME_BITS, MULTIFRAME_FRAMES,
+    FRAME_BITS, MULTIFRAME_FRAMES, decode_multiframe, decode_multiframe_with_correction,
+    encode_multiframe, locate_single_error, parity18, syndrome18,
 };
 
 fn corpus_dir() -> PathBuf {

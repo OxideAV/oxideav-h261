@@ -203,7 +203,7 @@ impl MarkGenerator {
     ///
     /// Frame 0 is never a change (there is no preceding frame).
     pub fn is_change_frame(&self, frame: u32) -> bool {
-        frame != 0 && frame % MARK_INTERVAL_FRAMES == 0
+        frame != 0 && frame.is_multiple_of(MARK_INTERVAL_FRAMES)
     }
 
     /// Stamp the §C identification mark for input frame `frame` into the

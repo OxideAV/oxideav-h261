@@ -100,10 +100,10 @@ use crate::mb::Picture;
 use crate::picture::SourceFormat;
 use crate::quant::{quant_ac, quant_intra_dc};
 use crate::tables::{
-    encode_cbp, encode_mba_diff, encode_mvd, lookup_tcoeff, MBA_STUFFING, MTYPE_INTER,
-    MTYPE_INTER_MC_CBP, MTYPE_INTER_MC_CBP_MQUANT, MTYPE_INTER_MC_FIL_CBP,
-    MTYPE_INTER_MC_FIL_CBP_MQUANT, MTYPE_INTER_MC_FIL_ONLY, MTYPE_INTER_MC_ONLY,
-    MTYPE_INTER_MQUANT, MTYPE_INTRA, MTYPE_INTRA_MQUANT, ZIGZAG,
+    MBA_STUFFING, MTYPE_INTER, MTYPE_INTER_MC_CBP, MTYPE_INTER_MC_CBP_MQUANT,
+    MTYPE_INTER_MC_FIL_CBP, MTYPE_INTER_MC_FIL_CBP_MQUANT, MTYPE_INTER_MC_FIL_ONLY,
+    MTYPE_INTER_MC_ONLY, MTYPE_INTER_MQUANT, MTYPE_INTRA, MTYPE_INTRA_MQUANT, ZIGZAG, encode_cbp,
+    encode_mba_diff, encode_mvd, lookup_tcoeff,
 };
 
 /// Default GOB-level quantiser. QUANT in `1..=31`. 8 is a balanced
@@ -782,8 +782,8 @@ pub fn write_picture_header_ptype(
 ) {
     bw.write_u32(0x00010, 20); // PSC
     bw.write_u32(tr as u32, 5); // TR
-                                // PTYPE — six single-bit flags, MSB first.
-                                // bit1 split-screen indicator (§4.2.1.3)
+    // PTYPE — six single-bit flags, MSB first.
+    // bit1 split-screen indicator (§4.2.1.3)
     bw.write_u32(ptype.split_screen as u32, 1);
     // bit2 document-camera indicator (§4.2.1.3)
     bw.write_u32(ptype.document_camera as u32, 1);
@@ -1116,13 +1116,7 @@ fn encode_gob_inter(
         let mv_l1 = (mvx.abs() + mvy.abs()) as u32;
         // CBP VLC length is between 3 and 9 bits; treat as an average 6 for
         // the estimator. The real VLC is emitted unconditionally below.
-        let cbp_vlc_bits = |c: u8| -> u32 {
-            if c == 0 {
-                0
-            } else {
-                6
-            }
-        };
+        let cbp_vlc_bits = |c: u8| -> u32 { if c == 0 { 0 } else { 6 } };
         // MVD VLC length grows with |d|; use 2*|d|+1 as a coarse upper bound.
         let mvd_bits = |d: i32| -> u32 { (d.unsigned_abs() * 2).saturating_add(1) };
         let mvd_total = if mv_is_zero {
@@ -1250,7 +1244,7 @@ fn encode_gob_inter(
                     // possible). Stash it via a mutable shadow that the
                     // emit path reads from.
                     let _ = new_cbp; // We reuse the original cbp_nf below;
-                                     // see special handling at emit.
+                // see special handling at emit.
                 } else {
                     q_levels_fil = new_levels;
                     recon_fil = new_recon;
@@ -1960,7 +1954,7 @@ impl Encoder for H261RegistryEncoder {
             _ => {
                 return Err(Error::invalid(
                     "h261 encoder: expected VideoFrame, got audio",
-                ))
+                ));
             }
         };
         if vf.planes.len() < 3 {
@@ -1981,7 +1975,8 @@ impl Encoder for H261RegistryEncoder {
             .encode_frame(y, y_stride, cb, cb_stride, cr, cr_stride)?;
 
         let is_keyframe = self.frame_index == 0
-            || (self.intra_period != 0 && (self.frame_index % self.intra_period as u64) == 0);
+            || (self.intra_period != 0
+                && self.frame_index.is_multiple_of(self.intra_period as u64));
 
         let pts = vf.pts.unwrap_or(self.frame_index as i64);
         let pkt = Packet {
@@ -2027,8 +2022,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         (w, h) => {
             return Err(Error::unsupported(format!(
                 "h261 encoder: unsupported dimensions {}x{}; H.261 supports QCIF (176x144) and CIF (352x288)",
-                w.unwrap_or(0), h.unwrap_or(0)
-            )))
+                w.unwrap_or(0),
+                h.unwrap_or(0)
+            )));
         }
     };
 
@@ -2059,11 +2055,11 @@ fn _unused_refs() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decoder::{decode_picture_body, pic_to_video_frame, H261Decoder};
+    use crate::decoder::{H261Decoder, decode_picture_body, pic_to_video_frame};
     use crate::picture::parse_picture_header;
+    use oxideav_core::Decoder;
     use oxideav_core::bits::BitReader;
     use oxideav_core::packet::PacketFlags;
-    use oxideav_core::Decoder;
     use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 
     fn neutral_qcif() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -2258,7 +2254,7 @@ mod tests {
         // back through the production MBA decoder as `Stuffing`, never as a
         // data-bearing MBA difference.
         use crate::mb::decode_mba_diff;
-        use crate::tables::{decode_vlc, MbaSym, MBA_TABLE};
+        use crate::tables::{MBA_TABLE, MbaSym, decode_vlc};
 
         let mut bw = BitWriter::new();
         write_mba_stuffing(&mut bw, 1);
@@ -3055,9 +3051,11 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_testsrc_psnr_no_fil() {
-        std::env::set_var("OXIDEAV_H261_NO_FIL", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("OXIDEAV_H261_NO_FIL", "1") };
         bench_testsrc_psnr_inner("no-FIL");
-        std::env::remove_var("OXIDEAV_H261_NO_FIL");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("OXIDEAV_H261_NO_FIL") };
     }
 
     #[test]
@@ -3234,14 +3232,16 @@ mod tests {
             with_mq_size += p.len();
         }
         // Without MQUANT.
-        std::env::set_var("OXIDEAV_H261_NO_MQUANT", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("OXIDEAV_H261_NO_MQUANT", "1") };
         let mut enc2 = H261Encoder::new(SourceFormat::Qcif, 8);
         let mut no_mq_size = 0usize;
         for (y, cb, cr) in &frames {
             let p = enc2.encode_frame(y, 176, cb, 88, cr, 88).unwrap();
             no_mq_size += p.len();
         }
-        std::env::remove_var("OXIDEAV_H261_NO_MQUANT");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("OXIDEAV_H261_NO_MQUANT") };
         // Loose bar: MQUANT-on must not be drastically worse than off (a
         // tight bar would flake on small content where the controller
         // doesn't engage). We accept up to +20 bytes of overhead from the

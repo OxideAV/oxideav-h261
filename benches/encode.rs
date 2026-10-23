@@ -40,9 +40,9 @@
 //! Sub-scenario selection:
 //!     cargo bench -p oxideav-h261 --bench encode -- qcif_intra
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use oxideav_h261::encoder::{encode_inter_picture, encode_intra_picture, H261Encoder};
+use oxideav_h261::encoder::{H261Encoder, encode_inter_picture, encode_intra_picture};
 use oxideav_h261::picture::SourceFormat;
 
 fn xorshift32(state: &mut u32) -> u32 {

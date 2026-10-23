@@ -60,11 +60,7 @@ pub fn tr_delta(prev: u8, cur: u8) -> u32 {
     let prev = (prev & 0x1F) as u32;
     let cur = (cur & 0x1F) as u32;
     let raw = (cur + 32 - prev) % 32;
-    if raw == 0 {
-        32
-    } else {
-        raw
-    }
+    if raw == 0 { 32 } else { raw }
 }
 
 /// The number of *non-transmitted* pictures (§3.1 / §4.2.1.2) between two

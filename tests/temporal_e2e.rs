@@ -14,7 +14,7 @@ use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h261::decoder::H261Decoder;
 use oxideav_h261::encoder::H261Encoder;
 use oxideav_h261::picture::SourceFormat;
-use oxideav_h261::temporal::{tr_delta, PictureRate, TrTracker};
+use oxideav_h261::temporal::{PictureRate, TrTracker, tr_delta};
 
 const W: usize = 176;
 const H: usize = 144;

@@ -225,8 +225,14 @@ pub fn subimage_origin(idx: SubImageIndex) -> (u32, u32) {
 /// even (a multiple of the video format size), so the only callers that
 /// can hit those panics have mismatched their own dimensions.
 pub fn subsample_plane(still_plane: &[u8], still_w: u32, still_h: u32) -> [Vec<u8>; 4] {
-    assert!(still_w % 2 == 0, "Annex D still-image width must be even");
-    assert!(still_h % 2 == 0, "Annex D still-image height must be even");
+    assert!(
+        still_w.is_multiple_of(2),
+        "Annex D still-image width must be even"
+    );
+    assert!(
+        still_h.is_multiple_of(2),
+        "Annex D still-image height must be even"
+    );
     let expected = (still_w as usize) * (still_h as usize);
     assert_eq!(
         still_plane.len(),
@@ -338,8 +344,14 @@ pub struct SubImagePlanes {
 ///
 /// Panics on a dimension mismatch (symmetric with [`subsample_plane`]).
 pub fn reassemble_plane(subs: &[Vec<u8>; 4], still_w: u32, still_h: u32) -> Vec<u8> {
-    assert!(still_w % 2 == 0, "Annex D still-image width must be even");
-    assert!(still_h % 2 == 0, "Annex D still-image height must be even");
+    assert!(
+        still_w.is_multiple_of(2),
+        "Annex D still-image width must be even"
+    );
+    assert!(
+        still_h.is_multiple_of(2),
+        "Annex D still-image height must be even"
+    );
     let sub_w = (still_w / 2) as usize;
     let sub_h = (still_h / 2) as usize;
     for (i, p) in subs.iter().enumerate() {

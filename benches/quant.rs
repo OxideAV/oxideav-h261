@@ -34,7 +34,7 @@
 //! Run with:
 //!     cargo bench -p oxideav-h261 --bench quant
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_h261::block::dequant_ac;
 use oxideav_h261::quant::{quant_ac, quant_intra_dc};

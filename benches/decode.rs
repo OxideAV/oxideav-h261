@@ -36,13 +36,13 @@
 //! Sub-scenario selection:
 //!     cargo bench -p oxideav-h261 --bench decode -- qcif_intra
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_core::{CodecId, Decoder, Packet, TimeBase};
-use oxideav_h261::decoder::H261Decoder;
-use oxideav_h261::encoder::{encode_intra_picture, H261Encoder};
-use oxideav_h261::picture::SourceFormat;
 use oxideav_h261::CODEC_ID_STR;
+use oxideav_h261::decoder::H261Decoder;
+use oxideav_h261::encoder::{H261Encoder, encode_intra_picture};
+use oxideav_h261::picture::SourceFormat;
 
 fn xorshift32(state: &mut u32) -> u32 {
     *state ^= *state << 13;

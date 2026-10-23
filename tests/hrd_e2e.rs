@@ -9,7 +9,7 @@
 
 use oxideav_h261::encoder::encode_intra_picture;
 use oxideav_h261::hrd::{
-    check_overflow, check_picture_cap, walk_buffer, HrdParams, PictureCapStatus,
+    HrdParams, PictureCapStatus, check_overflow, check_picture_cap, walk_buffer,
 };
 use oxideav_h261::picture::SourceFormat;
 
