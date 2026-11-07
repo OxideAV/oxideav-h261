@@ -85,6 +85,7 @@ pub fn frame_rate_hz() -> f64 {
 /// `B = 4 * R_max / 29.97` (Annex B.2). The receiving-buffer size is
 /// `B + 256 kbits`. Both are stored in bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HrdParams {
     /// Peak (or sustained, if constant) channel rate `R_max`, in bit/s.
     pub r_max_bps: u32,
@@ -114,6 +115,7 @@ impl HrdParams {
 
 /// Outcome of a per-picture cap check (§5.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PictureCapStatus {
     /// Picture fits the §5.2 cap.
     Ok,
@@ -150,6 +152,7 @@ pub fn check_picture_cap(coded_bits: u32, fmt: SourceFormat) -> PictureCapStatus
 /// removed at time `t_{i+1}`. There is no leading `b_0` (Annex B.3
 /// fixes it at 0). The length equals the number of input pictures.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HrdTrace {
     /// Post-removal occupancy `b_n` for each picture, in bits.
     pub buffer_bits_after_arrival: Vec<u64>,

@@ -151,6 +151,7 @@ impl H261RtpHeader {
 
 /// Encoding / decoding error.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RtpError {
     /// Header buffer is shorter than 4 bytes.
     ShortHeader,
@@ -986,6 +987,7 @@ pub const RTP_FIXED_HEADER_LEN: usize = 12;
 /// fields are exposed for receivers and for unit-test inspection but
 /// they are also already encoded in `bytes`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RtpPacket {
     /// Full wire bytes (fixed header + H.261 payload header + payload).
     pub bytes: Vec<u8>,
@@ -1326,6 +1328,7 @@ impl RtpPacketizer {
 /// is the caller's job; this struct only models the V/P/X/CC/M/PT/seq/
 /// timestamp/SSRC fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RtpFixedHeader {
     /// RTP version (must equal 2 for this codec; the parser rejects
     /// other values).

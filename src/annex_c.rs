@@ -102,6 +102,7 @@ pub const MAX_STUFFING_PERCENT: u32 = 10;
 /// maximises separation against codec ringing. The defaults here use the
 /// full-range pair and expose the mid-level threshold accordingly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MarkLevels {
     /// Luma value written when the mark is in its "low" (e.g. black) state.
     pub low: u8,
@@ -320,6 +321,7 @@ pub struct MarkEvent {
 /// B-change (same target state, in order) and each B-change with the
 /// matching C-change, then averages the per-pair deltas.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct DelayMeter {
     /// Mark changes injected at point A (the video coder input).
     pub point_a: Vec<MarkEvent>,
@@ -336,6 +338,7 @@ pub struct DelayMeter {
 /// [`DelaySummary::encoder_frames`] etc. for an `f64` view or
 /// [`DelaySummary::encoder_seconds`] for seconds at a given frame rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DelaySummary {
     /// Sum of A→B per-change deltas, in frame intervals.
     pub encoder_delta_sum: u64,
@@ -454,6 +457,7 @@ impl DelayMeter {
 
 /// Why an Annex C test sequence fails the §C.1 preconditions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SequenceError {
     /// Fewer input frames than 100 s at the stated frame rate (§C: "more
     /// than 100 seconds").

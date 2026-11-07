@@ -743,6 +743,7 @@ fn validate_inputs(
 ///   update request", allowing a decoder that had frozen its display
 ///   (§4.3.1) to resume normal display.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Ptype {
     /// PTYPE bit 1 — split-screen indicator.
     pub split_screen: bool,

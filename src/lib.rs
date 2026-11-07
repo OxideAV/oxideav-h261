@@ -118,18 +118,23 @@ pub mod bch;
 pub mod block;
 pub mod decoder;
 pub mod encoder;
+#[doc(hidden)]
 pub mod fdct;
 #[doc(hidden)]
 pub mod gob;
 pub mod hrd;
+#[doc(hidden)]
 pub mod idct;
+#[doc(hidden)]
 pub mod mb;
 pub mod multipoint;
 pub mod picture;
+#[doc(hidden)]
 pub mod quant;
 pub mod rtcp;
 pub mod rtp;
 pub mod sdp;
+#[doc(hidden)]
 pub mod start_code;
 #[doc(hidden)]
 pub mod tables;

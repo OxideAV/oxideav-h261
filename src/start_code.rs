@@ -26,6 +26,7 @@ pub const GN_PICTURE: u8 = 0;
 
 /// One detected start-code event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StartCode {
     /// Byte offset of the byte containing the first of the 16 zero bits.
     pub byte_pos: usize,

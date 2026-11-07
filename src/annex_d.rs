@@ -137,6 +137,7 @@ impl SubImageIndex {
 /// Error returned by [`parse_still_image_tr`] when a 5-bit TR field
 /// cannot be interpreted as an Annex D still-image temporal reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AnnexDTrError {
     /// The TR's top 3 bits are non-zero. §D.3 requires the three
     /// higher bits of TR to be set to 0 when `HI_RES = 0`.
@@ -324,6 +325,7 @@ pub fn subsample_still_image(
 /// element type of the [`subsample_still_image`] return value and as
 /// the input to [`reassemble_still_image`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubImagePlanes {
     /// Luma plane, `video_w * video_h` bytes (e.g. 176 × 144 for QCIF).
     pub y: Vec<u8>,

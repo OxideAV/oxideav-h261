@@ -88,6 +88,7 @@ pub const FULL_RATE_DEN: u32 = 100;
 
 /// Errors from parsing or validating H.261 SDP `fmtp` parameters.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SdpError {
     /// A `CIF` or `QCIF` MPI value was outside the §6.1.1 range 1..=4.
     MpiOutOfRange {
@@ -160,6 +161,7 @@ impl std::error::Error for SdpError {}
 /// `D` means Annex D support is unstated (treated as unsupported per
 /// §6.1.1's "SHOULD NOT be used … if not supported").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct H261FmtpParams {
     /// CIF maximum-rate MPI (1..=4), or `None` if CIF is not advertised.
     pub cif: Option<u8>,
@@ -171,6 +173,24 @@ pub struct H261FmtpParams {
 }
 
 impl H261FmtpParams {
+    /// Set the CIF minimum picture interval (`CIF=`).
+    pub fn with_cif(mut self, mpi: u8) -> Self {
+        self.cif = Some(mpi);
+        self
+    }
+
+    /// Set the QCIF minimum picture interval (`QCIF=`).
+    pub fn with_qcif(mut self, mpi: u8) -> Self {
+        self.qcif = Some(mpi);
+        self
+    }
+
+    /// Set the Annex D still-image flag (`D=`).
+    pub fn with_d(mut self, d: bool) -> Self {
+        self.d = Some(d);
+        self
+    }
+
     /// The §6.2.1 RFC-2032 fallback: a peer that sends no picture-size
     /// parameter is assumed to support QCIF at MPI=1.
     ///
@@ -297,7 +317,7 @@ impl H261FmtpParams {
     /// ```
     /// use oxideav_h261::picture::SourceFormat;
     /// use oxideav_h261::sdp::H261FmtpParams;
-    /// let params = H261FmtpParams { cif: Some(2), qcif: Some(1), d: Some(true) };
+    /// let params = H261FmtpParams::default().with_cif(2).with_qcif(1).with_d(true);
     /// // Spec worked-example order (CIF preferred).
     /// assert_eq!(params.format_value_preferred(SourceFormat::Cif), "CIF=2;QCIF=1;D=1");
     /// // QCIF-preferring endpoint leads with QCIF per §6.2.1.
@@ -492,10 +512,10 @@ impl H261FmtpParams {
 /// ```
 /// use oxideav_h261::sdp::{H261FmtpParams, negotiate_answer};
 /// // Peer A offers CIF=2 (≤ 15 fps), QCIF=1 (≤ 29.97 fps), Annex D.
-/// let offer = H261FmtpParams { cif: Some(2), qcif: Some(1), d: Some(true) };
+/// let offer = H261FmtpParams::default().with_cif(2).with_qcif(1).with_d(true);
 /// // We can decode CIF at ≤ 14.985 fps (MPI=2) and QCIF at ≤ 14.985 fps
 /// // (MPI=2). We don't support Annex D.
-/// let ours = H261FmtpParams { cif: Some(2), qcif: Some(2), d: None };
+/// let ours = H261FmtpParams::default().with_cif(2).with_qcif(2);
 /// let answer = negotiate_answer(&offer, &ours).unwrap();
 /// // Both peers can do CIF at MPI=2 → answer CIF=2.
 /// assert_eq!(answer.cif, Some(2));
@@ -614,6 +634,7 @@ pub fn format_fmtp_preferred(
 /// Parsed view of an `a=rtpmap` line, after `parse_rtpmap` validates it as
 /// H.261.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RtpMap {
     /// The dynamic RTP payload type the map binds.
     pub payload_type: u8,

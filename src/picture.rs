@@ -47,6 +47,7 @@ impl SourceFormat {
 
 /// Parsed H.261 picture header.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct PictureHeader {
     pub temporal_reference: u8,
     pub split_screen: bool,

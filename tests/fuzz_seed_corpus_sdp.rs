@@ -339,16 +339,8 @@ fn negotiate_disjoint_advertisement_rejected() {
     // An offer advertising only CIF and our capability advertising
     // only QCIF intersect to empty and must surface as
     // `NoPictureSize`.
-    let offer = H261FmtpParams {
-        cif: Some(2),
-        qcif: None,
-        d: None,
-    };
-    let ours = H261FmtpParams {
-        cif: None,
-        qcif: Some(1),
-        d: None,
-    };
+    let offer = H261FmtpParams::default().with_cif(2);
+    let ours = H261FmtpParams::default().with_qcif(1);
     let err = negotiate_answer(&offer, &ours);
     assert!(matches!(err, Err(SdpError::NoPictureSize)));
 }
@@ -359,11 +351,7 @@ fn negotiate_rfc2032_fallback_applied() {
     // to assume … reception of QCIF resolution with MPI=1". An empty
     // offer + a QCIF-capable our-side must yield QCIF in the answer.
     let offer = H261FmtpParams::default();
-    let ours = H261FmtpParams {
-        cif: None,
-        qcif: Some(2),
-        d: None,
-    };
+    let ours = H261FmtpParams::default().with_qcif(2);
     let answer = negotiate_answer(&offer, &ours).expect("RFC 2032 QCIF=1 fallback");
     // The MPI is max(1, 2) = 2 since the answer must satisfy both
     // peers' frame-rate upper bounds.
@@ -378,16 +366,11 @@ fn negotiate_annex_d_requires_both_sides() {
     // message is able to decode this option". The answer's `D=1`
     // therefore requires both sides advertising it; any other
     // combination drops `D` from the answer.
-    let with_d = H261FmtpParams {
-        cif: Some(2),
-        qcif: Some(1),
-        d: Some(true),
-    };
-    let without_d = H261FmtpParams {
-        cif: Some(2),
-        qcif: Some(1),
-        d: None,
-    };
+    let with_d = H261FmtpParams::default()
+        .with_cif(2)
+        .with_qcif(1)
+        .with_d(true);
+    let without_d = H261FmtpParams::default().with_cif(2).with_qcif(1);
     let answer = negotiate_answer(&with_d, &without_d).expect("picture size intersects");
     assert_eq!(answer.d, None);
     let answer = negotiate_answer(&with_d, &with_d).expect("picture size intersects");
@@ -447,11 +430,10 @@ fn preferred_formatter_expresses_qcif_preference_on_the_wire() {
     // parse-side wire-order accessor must read it back.
     use oxideav_h261::picture::SourceFormat;
     use oxideav_h261::sdp::format_fmtp_preferred;
-    let params = H261FmtpParams {
-        cif: Some(2),
-        qcif: Some(1),
-        d: Some(true),
-    };
+    let params = H261FmtpParams::default()
+        .with_cif(2)
+        .with_qcif(1)
+        .with_d(true);
     let line = format_fmtp_preferred(31, &params, SourceFormat::Qcif).unwrap();
     assert_eq!(line, "a=fmtp:31 QCIF=1;CIF=2;D=1");
     assert_eq!(
@@ -470,11 +452,10 @@ fn round_trip_format_value_against_parse_value() {
     // For every well-formed parameter set, formatter output must
     // round-trip through the parser unchanged. This is the §6.2
     // contract that lets a caller print and re-receive its own SDP.
-    let params = H261FmtpParams {
-        cif: Some(4),
-        qcif: Some(1),
-        d: Some(true),
-    };
+    let params = H261FmtpParams::default()
+        .with_cif(4)
+        .with_qcif(1)
+        .with_d(true);
     let formatted = params.format_value();
     let reparsed = H261FmtpParams::parse_value(&formatted).expect("formatter output reparses");
     assert_eq!(reparsed, params);

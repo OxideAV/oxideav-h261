@@ -108,6 +108,7 @@ pub struct FreezeState {
 /// What the display layer should do with a just-decoded picture, per the
 /// freeze-picture state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DisplayAction {
     /// Not frozen (or just released): display the decoded picture normally.
     Show,
@@ -250,6 +251,7 @@ pub struct FastUpdateState {
 /// The encoder action mandated for the next picture by the fast-update state
 /// machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FastUpdateResponse {
     /// §4.3.2: the next picture MUST be coded INTRA when `true`.
     pub force_intra: bool,

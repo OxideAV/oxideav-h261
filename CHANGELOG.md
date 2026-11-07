@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `H261FmtpParams::with_cif` / `with_qcif` / `with_d` and `SdesChunk::new`.
+
+### Changed
+
+- `#[non_exhaustive]` on the enums `AnnexDTrError`, `DisplayAction`,
+  `PictureCapStatus`, `RtcpError`, `RtcpPacket`, `RtpError`, `SdesItem`,
+  `SdpError` and `SequenceError`, and on the records `AppPacket`,
+  `ByePacket`, `DecodedMultiframe`, `DelayMeter`, `DelaySummary`,
+  `FastUpdateResponse`, `H261FmtpParams`, `HrdParams`, `HrdTrace`,
+  `MarkLevels`, `Picture`, `PictureHeader`, `Ptype`, `RtcpReport`,
+  `RtpFixedHeader`, `RtpMap`, `RtpPacket`, `SdesChunk`, `SdesPacket`,
+  `StartCode` and `SubImagePlanes`. `SourceFormat`, `MarkState` and
+  `SubImageIndex` (fixed bit fields) stay exhaustive, as do the fixed RTP /
+  RTCP wire records callers fill in (`H261RtpHeader`, `H261RtpPayload`,
+  `SenderInfo`, `ReceptionReportBlock`).
+- `#[doc(hidden)]` on the internal `fdct`, `idct`, `quant`, `mb` and
+  `start_code` modules.
+
 ### Changed
 
 - edition 2024, MSRV 1.95

@@ -328,6 +328,7 @@ pub fn encode_multiframe(coded_data: &[u8], coded_data_bits: usize) -> Vec<u8> {
 
 /// Outcome of [`decode_multiframe`] and [`decode_multiframe_with_correction`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedMultiframe {
     /// The recovered inner coded video bitstream, MSB-first packed.
     pub data: Vec<u8>,
